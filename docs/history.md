@@ -191,6 +191,9 @@ The coordinator's durable history lane catches up after restart and indexes
 new commits on the normal polling cadence, independently of source polling and
 jobs. A search never performs document indexing or waits for that lane; query
 embedding remains part of semantic retrieval.
+If interrupted restarts park that lane, `beep-boop jobs status` reports the
+failure. `beep-boop import retry-index` resumes its existing native work and
+retained batches. Pi's restart limit remains in force between explicit retries.
 Cached batches yield to coordinator I/O. Readers retain the previous complete
 publication until its replacement commits atomically.
 Publication retains unchanged chunk and vector rowids. Append-only changes and

@@ -290,6 +290,10 @@ reads and catch up changed conversations. `--host NAME` limits an import to a
 registered host. An unavailable source is reported as partial coverage, not
 silently skipped. [History](history.md) describes storage and retrieval.
 
+Use `beep-boop jobs status` to inspect background work and retained errors.
+If history indexing is parked after interrupted restarts, use
+`beep-boop import retry-index` to resume its checkpoint and staged vectors.
+
 A CLI-only client uses the same `beep-boop init --coordinator ...` command and
 skips the service. The [native iPhone client](../ios/README.md) connects to the
 same main conversation over Tailscale. Use the coordinator's full MagicDNS name

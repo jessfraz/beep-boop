@@ -513,6 +513,7 @@ pub enum RuntimeCommand {
         embedding_host: Option<String>,
     },
     ImportStatus,
+    RetryHistoryIndex,
     TaskInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]

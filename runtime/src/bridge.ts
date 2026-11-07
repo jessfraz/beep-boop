@@ -513,6 +513,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
+      case "retry_history_index": emit(id, { type: "job_status", status: await (await app()).background.retryHistoryIndex() }); break;
       case "notifications": emit(id, { type: "notifications", status: await (await app()).notifications.request(command.request) }); break;
       case "task_input": {
         const application = await app();

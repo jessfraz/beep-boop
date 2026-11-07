@@ -893,3 +893,32 @@ fn retry_jobs_reaches_the_coordinator_without_launching_unparked_work() {
         }
     }
 }
+
+#[test]
+fn history_index_recovery_reports_native_state_without_starting_an_import() {
+    let fixture = Fixture::new();
+    let _server = fixture.start();
+    let before = fixture.status();
+    let events = fixture.events(&["jobs", "status"]);
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEventKind::JobStatus { status } if status.jobs == before.jobs && status.triggers == before.triggers)));
+    let plain = fixture.cli_format(&["jobs", "status"], false);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("Background work:"));
+    let output = fixture.cli(&["import", "retry-index"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_lowercase()
+            .contains("parked"),
+        "Recovery must reach the coordinator's native-state guard: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.tasks().is_empty());
+    assert_eq!(fixture.status().triggers, before.triggers);
+    assert!(!fixture.directory.path().join("external-calls").exists());
+}

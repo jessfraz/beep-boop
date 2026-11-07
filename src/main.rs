@@ -265,6 +265,8 @@ enum ImportAction {
         embedding_host: Option<String>,
     },
     Status,
+    /// Resume existing history indexing parked by the restart limit.
+    RetryIndex,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +344,8 @@ enum JobsAction {
     },
     /// List the applied jobs and their next occurrences.
     List,
+    /// Show coordinator background work and retained errors.
+    Status,
     /// Show an applied job's prompt, model and schedules.
     Get { id: String },
     /// Resume an interrupted run parked by the restart limit.
@@ -677,6 +681,7 @@ async fn main() -> Result<()> {
                 }
             }
             JobsAction::List => RuntimeCommand::ListJobs,
+            JobsAction::Status => RuntimeCommand::JobStatus,
             JobsAction::Get { id } => RuntimeCommand::ReadJob {
                 job_id: jobs::JobId::try_from(id)?,
             },
@@ -732,6 +737,7 @@ async fn main() -> Result<()> {
                 embedding_host,
             },
             ImportAction::Status => RuntimeCommand::ImportStatus,
+            ImportAction::RetryIndex => RuntimeCommand::RetryHistoryIndex,
         },
         Action::History { command } => match command {
             HistoryAction::Search { query, limit, mode } => {
@@ -4081,6 +4087,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             println!("{}", agent_cli::source_view::format(sources));
         }
         event @ (RuntimeEventKind::JobsSynced { .. }
+        | RuntimeEventKind::JobStatus { .. }
         | RuntimeEventKind::JobRun { .. }
         | RuntimeEventKind::ScheduledJobs { .. }
         | RuntimeEventKind::ScheduledJob { .. }) => {

@@ -1,6 +1,9 @@
 //! Shared CLI and slash-command presentation of applied job state.
 use crate::{
-    background::{JobExecutionState, ScheduledJobStatus},
+    background::{
+        BackgroundStatus, BackgroundTriggerKey, BuiltinTrigger, JobExecutionState,
+        ScheduledJobStatus,
+    },
     jobs::UtcMillis,
     protocol::RuntimeEventKind,
 };
@@ -160,6 +163,7 @@ pub fn get(status: &ScheduledJobStatus) -> String {
 
 pub fn event(event: &RuntimeEventKind) -> Option<String> {
     match event {
+        RuntimeEventKind::JobStatus { status } => Some(background_status(status)),
         RuntimeEventKind::JobRun { run } => Some(format!(
             "Queued job {} (schedule {}). Task: {}",
             run.job_id, run.schedule_id, run.task_id
@@ -172,4 +176,27 @@ pub fn event(event: &RuntimeEventKind) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+fn background_status(status: &BackgroundStatus) -> String {
+    let mut lines = vec![format!(
+        "Background work: {} jobs, {} timers, {} pending",
+        status.jobs, status.triggers, status.pending
+    )];
+    for error in &status.errors {
+        let label = match &error.key {
+            BackgroundTriggerKey::Builtin { name } => match name {
+                BuiltinTrigger::Sources => "Source refresh".into(),
+                BuiltinTrigger::SourceTriage => "Source review".into(),
+                BuiltinTrigger::Resources => "Worktree cleanup".into(),
+                BuiltinTrigger::History => "History index".into(),
+            },
+            BackgroundTriggerKey::Job {
+                job_id,
+                schedule_id,
+            } => format!("{job_id}/{schedule_id}"),
+        };
+        lines.push(format!("{label}: {}", error.message));
+    }
+    lines.join("\n")
 }
