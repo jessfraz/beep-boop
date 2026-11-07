@@ -67,7 +67,7 @@ function observe(app: Awaited<ReturnType<typeof open>>, id: number, conversation
   }, async detach() { app.views.detach(id); await running; } };
 }
 
-test("main views show live source outages once, clear on recovery and never store status in history", { timeout: 10_000 }, async () => {
+test("main views refresh source status without repeating history or notices", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-status-view-"));
   const app = await open(directory);
   const source = { provider: "google", account: "google.fixture" };
@@ -81,13 +81,32 @@ test("main views show live source outages once, clear on recovery and never stor
     await view.until(() => view?.frames.some((frame) => frame.type === "sources") === true);
     const snapshots = () => view?.frames.filter((frame) => frame.type === "sources") ?? [];
     assert.equal(snapshots().length, 1);
-    await app.sources.admit(failed, null);
+    const history = () => view?.frames.filter((frame) => frame.type === "history") ?? [];
+    const initialHistory = history();
+    const repeated = await app.sources.admit(failed, null);
+    await view.until(() => snapshots().some((frame) => frame.sources.some((state) =>
+      state.source.account === source.account && state.checked_at === repeated.state.checked_at && state.coverage.status === "unavailable")));
     await app.sources.admit({ source, events: [], checkpoint: { value: "caught-up" }, coverage: { status: "complete" } }, null);
     await view.until(() => snapshots().some((frame) => frame.sources.some((state) => state.source.account === source.account && state.coverage.status === "complete")));
-    assert.equal(snapshots().length, 2, "Repeated failed polls must not repeat the warning");
+    const progress: NonNullable<SourceBatch["progress"]> = { window_start: 1_800_000_000, window_end: 1_800_100_000,
+      phase: "reading", unit: "messages", completed: 1, total: 2 };
+    await app.sources.admit({ source, events: [], checkpoint: { value: "refreshing" },
+      coverage: { status: "more" }, progress }, { value: "caught-up" });
+    await view.until(() => snapshots().some((frame) => frame.sources.some((state) =>
+      state.source.account === source.account && state.progress?.completed === 1 && state.coverage.status === "more")));
+    const refreshing = await app.sources.admit({ source, events: [], checkpoint: { value: "next-page" },
+      coverage: { status: "more" }, progress: { ...progress, completed: 2 } }, { value: "refreshing" });
+    await view.until(() => snapshots().some((frame) => frame.sources.some((state) =>
+      state.source.account === source.account && state.progress?.completed === 2 && state.coverage.status === "more")));
+    const latest = snapshots().at(-1)?.sources.find((state) => state.source.account === source.account);
+    assert.deepEqual(latest, refreshing.state, "Live status must retain the latest check time, progress and completed scan");
+    assert.deepEqual(history(), initialHistory, "Source refresh must not replay conversation history");
+    assert.equal(view.frames.filter((frame) => ["notice", "message", "text_delta", "answer"].includes(frame.type)).length, 0,
+      "Source snapshots must not become transcript notices or messages");
     await view.detach();
-    await app.sources.admit(failed, { value: "caught-up" });
-    assert.equal(snapshots().length, 2, "Detached views must release their coverage subscription");
+    const detachedSnapshots = snapshots().length;
+    await app.sources.admit(failed, { value: "next-page" });
+    assert.equal(snapshots().length, detachedSnapshots, "Detached views must release their coverage subscription");
     view = observe(app, 2, ROOT_CONVERSATION_ID.toString());
     await view.until(() => snapshots().some((frame) => frame.sources.some((state) => state.coverage.status === "unavailable")));
     const root = await app.harness.root(BACKGROUND_CONTEXT);

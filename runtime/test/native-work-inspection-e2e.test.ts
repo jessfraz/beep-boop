@@ -13,6 +13,7 @@ import { createRegistry, GenerationTask, Harness, LiveDoc, UserEntry, type TaskI
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { SavedConversation } from "../src/generated/SavedConversation.js";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import { TaskStore } from "../src/tasks.js";
@@ -74,14 +75,16 @@ test("native job and saved-work inspection uses the production coordinator witho
   let stderr = ""; child.stderr.setEncoding("utf8").on("data", (value: string) => { stderr += value; }); child.stdout.resume();
   const closed = new Promise<number | null>((resolve, reject) => { child.once("close", resolve); child.once("error", reject); });
   void closed.catch(() => {});
-  async function control(command: RuntimeCommand): Promise<RuntimeEventKind[]> {
+  async function control(command: RuntimeCommand,
+    complete: (event: RuntimeEventKind) => boolean = event => event.type === "done"): Promise<RuntimeEventKind[]> {
     const channel = createConnection({ path: socket, signal: t.signal }), result: RuntimeEventKind[] = [];
     try {
       channel.write(JSON.stringify(command) + "\n");
       for await (const line of protocolLines(channel)) {
         const event: unknown = JSON.parse(line), frame = { version: 1, id: 1, event }; assert.ok(validEvent(frame));
         result.push(frame.event); assert.notEqual(frame.event.type, "failure", JSON.stringify(frame.event));
-        if (frame.event.type === "done") return result;
+        assert.notEqual(frame.event.type, "host_call", "Read-only inspection must not execute host effects");
+        if (complete(frame.event)) return result;
       }
       assert.fail("The production coordinator ended before its control receipt");
     } finally { channel.destroy(); }
@@ -99,17 +102,52 @@ test("native job and saved-work inspection uses the production coordinator witho
       cwd: directory, timezone: "Etc/UTC", model: DEFAULT_MODEL, schedules: [{ id: "daily",
         recurrence: "DTSTART:20270101T090000Z\nRRULE:FREQ=DAILY", focus: null, prompt: null }] }] });
     await control({ type: "run_job", job_id: jobID, schedule_id: null, request_id: "existing-job-admission" });
-    const project = fileURLToPath(new URL("../../../ios", import.meta.url));
-    const scratch = process.env.AGENT_NATIVE_SWIFT_SCRATCH ?? fileURLToPath(new URL("../../../target/native-work-integration", import.meta.url));
-    const swift = spawn("/usr/bin/xcrun", ["swift", "test", "--package-path", project, "--scratch-path",
-      scratch, "--filter", "nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork"], {
-      signal: t.signal, env: { ...process.env, AGENT_WORK_E2E_SOCKET: socket, AGENT_WORK_E2E_DIRECTORY: directory, AGENT_WORK_E2E_JOB: jobID,
-        AGENT_WORK_E2E_PARENT: parentID, AGENT_WORK_E2E_CHILD: childID }, stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = ""; swift.stdout.setEncoding("utf8").on("data", (value: string) => { output += value; });
-    swift.stderr.setEncoding("utf8").on("data", (value: string) => { output += value; });
-    const swiftExit = await new Promise<number | null>((resolve, reject) => { swift.once("close", resolve); swift.once("error", reject); });
-    assert.equal(swiftExit, 0, output); assert.match(output, /1 test passed|1 tests? passed|with 1 test/);
+    // Exercise the production inspection wire on every platform. Closing each
+    // observer must leave the same native generations and controls available.
+    const listing = (await control({ type: "list_jobs" })).find(event => event.type === "scheduled_jobs");
+    assert.ok(listing);
+    const listed = listing.jobs.find(job => job.job.id === jobID); assert.ok(listed);
+    const taskID = scheduledTaskId("job:" + jobID); assert.equal(listed.task_id, taskID);
+    const detail = (await control({ type: "read_job", job_id: jobID })).find(event => event.type === "scheduled_job");
+    assert.ok(detail); assert.equal(detail.job.task_id, taskID); assert.ok(detail.job.last_run);
+    const page = (await control({ type: "list_conversations", query: taskID, cursor: null, limit: 50 }))
+      .find(event => event.type === "conversations"); assert.ok(page);
+    for (const { conversationID, agentID } of [{ conversationID: parentID, agentID: null }, { conversationID: childID, agentID: "review" }]) {
+      const saved: SavedConversation | undefined = page.items.find(item => item.conversation_id === conversationID); assert.ok(saved);
+      assert.equal(saved.task_id, taskID); assert.equal(saved.agent_id, agentID);
+      const attached = (await control({ type: "attach_conversation", conversation_id: conversationID, input_ids: [] },
+        event => event.type === "conversation_ready")).find(event => event.type === "conversation_ready");
+      assert.ok(attached); assert.deepEqual(attached.conversation, saved);
+      const history = (await control({ type: "read_conversation", conversation_id: conversationID, cursor: null }))
+        .filter(event => event.type === "history");
+      assert.ok(history.length > 0); assert.ok(history.every(event => event.conversation_id === conversationID));
+      assert.ok(history.some(event => event.messages.some(message => message.text === `Retained ${conversationID} request`)));
+      if (conversationID === parentID) {
+        const cursor = history.find(event => event.page_complete)?.next_cursor; assert.ok(cursor);
+        const earlier = (await control({ type: "read_conversation", conversation_id: conversationID, cursor }))
+          .filter(event => event.type === "history");
+        assert.ok(earlier.every(event => event.conversation_id === conversationID));
+        const messages = earlier.flatMap(event => event.messages); assert.ok(messages.length > 0);
+        assert.ok(messages.every(message => message.text.startsWith("Earlier parent evidence ")));
+      }
+    }
+    const retained = (await control({ type: "list_conversations", query: taskID, cursor: null, limit: 50 }))
+      .find(event => event.type === "conversations"); assert.ok(retained); assert.deepEqual(retained.items, page.items);
+    // macOS also exercises the actual Swift session, outbox and reducer against
+    // this coordinator. Linux retains all production wire and Pi checks above.
+    if (process.platform === "darwin") {
+      const project = fileURLToPath(new URL("../../../ios", import.meta.url));
+      const scratch = process.env.AGENT_NATIVE_SWIFT_SCRATCH ?? fileURLToPath(new URL("../../../target/native-work-integration", import.meta.url));
+      const swift = spawn("/usr/bin/xcrun", ["swift", "test", "--package-path", project, "--scratch-path",
+        scratch, "--filter", "nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork"], {
+        signal: t.signal, env: { ...process.env, AGENT_WORK_E2E_SOCKET: socket, AGENT_WORK_E2E_DIRECTORY: directory, AGENT_WORK_E2E_JOB: jobID,
+          AGENT_WORK_E2E_PARENT: parentID, AGENT_WORK_E2E_CHILD: childID }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; swift.stdout.setEncoding("utf8").on("data", (value: string) => { output += value; });
+      swift.stderr.setEncoding("utf8").on("data", (value: string) => { output += value; });
+      const swiftExit = await new Promise<number | null>((resolve, reject) => { swift.once("close", resolve); swift.once("error", reject); });
+      assert.equal(swiftExit, 0, output); assert.match(output, /1 test passed|1 tests? passed|with 1 test/);
+    }
     child.kill("SIGINT"); assert.equal(await closed, 0, stderr);
     const reopened = await open();
     try {
