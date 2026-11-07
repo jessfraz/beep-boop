@@ -50,6 +50,8 @@ jobs:
         run: nix develop .#ci --command node runtime/dist/test/fixtures/prepare-browser.js "$RUNNER_TEMP"
       - name: Check Rust and runtime
         run: nix develop .#ci --command make check
+      - name: Check native Codex history
+        run: nix develop .#ci --command cargo test --locked --lib history::codex::tests::installed_codex_ -- --ignored
       - name: Check generated bindings
         run: git diff --exit-code
       - name: Evaluate flake

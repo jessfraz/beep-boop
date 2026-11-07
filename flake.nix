@@ -121,7 +121,10 @@
           AGENT_LLAMA_SERVER = "${self.packages.${system}.embeddingRuntime}/bin/llama-server";
           AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
         });
-      ci = pkgs.mkShell tools;
+      ci = pkgs.mkShell (tools
+        // {
+          packages = tools.packages ++ [pkgs.codex];
+        });
     });
   };
 }

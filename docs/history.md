@@ -77,7 +77,11 @@ progress and unavailable hosts; no copied host inventory or model run is needed.
 Use the installed Codex app-server's read-only APIs. Page `thread/list` for
 active and archived threads with `modelProviders: []` and every native
 `sourceKinds` value explicitly selected. Omitted filters select the configured
-provider and interactive sources. Read metadata with `thread/read` , then use
+provider and interactive sources. Each inventory walk repairs legacy metadata
+once, then pages native state with `useStateDbOnly` and its tie-safe cursors.
+The initial repair can still be slow; later pages avoid repeated rollout scans.
+CI exercises this path with the Codex package from the locked Nixpkgs input.
+Read metadata with `thread/read`, then use
 full turn/item pagination where supported, or the installed full-history read.
 Thread IDs establish identity; filenames and directories are locators, not
 thread IDs or assumptions about which threads are roots. Read metadata once when

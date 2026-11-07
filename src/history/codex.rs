@@ -95,20 +95,23 @@ impl CodexHistory {
     }
 
     async fn list(&self, archived: bool, cursor: Option<String>) -> Result<HistoryResponse> {
-        let page: NativeList = self
-            .rpc(
-                "thread/list",
-                ListParams {
-                    archived,
-                    cursor: cursor.clone(),
-                    limit: 50,
-                    sort_key: "created_at",
-                    sort_direction: "asc",
-                    source_kinds: SOURCES,
-                    model_providers: &[],
-                },
-            )
-            .await?;
+        let mut params = ListParams {
+            archived,
+            cursor: cursor.clone(),
+            use_state_db_only: cursor.is_some(),
+            limit: 50,
+            sort_key: "created_at",
+            sort_direction: "asc",
+            source_kinds: SOURCES,
+            model_providers: &[],
+        };
+        if cursor.is_none() {
+            // Repair legacy metadata once per walk, then page native state.
+            // The repair scan's timestamp-only cursor cannot preserve ties.
+            let _: NativeList = self.rpc("thread/list", &params).await?;
+            params.use_state_db_only = true;
+        }
+        let page: NativeList = self.rpc("thread/list", params).await?;
         ensure!(
             page.next_cursor
                 .as_ref()
@@ -1186,6 +1189,7 @@ fn media_blocks(blocks: &[Value], paths: &mut Vec<MediaReference>) {
 struct ListParams {
     archived: bool,
     cursor: Option<String>,
+    use_state_db_only: bool,
     limit: u32,
     sort_key: &'static str,
     sort_direction: &'static str,
@@ -3543,6 +3547,137 @@ try{
             assert_eq!(metadata.parent_thread_id, None);
             assert_eq!(metadata.forked_from_id.as_deref(), Some("fork-parent"));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed Codex CLI; uses only isolated synthetic rollouts and native state"]
+    async fn installed_codex_repairs_inventory_once_before_paging_native_state() {
+        #[derive(serde::Serialize)]
+        struct Line<T> {
+            timestamp: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            payload: T,
+        }
+        #[derive(serde::Serialize)]
+        struct Meta<'a> {
+            id: &'a str,
+            timestamp: &'static str,
+            cwd: &'static str,
+            originator: &'static str,
+            cli_version: &'static str,
+            source: &'static str,
+            model_provider: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct User {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            message: &'static str,
+            images: Vec<String>,
+            local_images: Vec<String>,
+            text_elements: Vec<Value>,
+        }
+        fn rollout(home: &Path, id: &str, timestamp: &'static str) {
+            let folder = home.join("sessions/2026/01/02");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut line = serde_json::to_vec(&Line {
+                timestamp,
+                kind: "session_meta",
+                payload: Meta {
+                    id,
+                    timestamp,
+                    cwd: "/",
+                    originator: "synthetic-inventory-test",
+                    cli_version: "0.0.0",
+                    source: "cli",
+                    model_provider: "openai",
+                },
+            })
+            .unwrap();
+            line.push(b'\n');
+            line.extend(
+                serde_json::to_vec(&Line {
+                    timestamp,
+                    kind: "event_msg",
+                    payload: User {
+                        kind: "user_message",
+                        message: "Read the invented native inventory evidence.",
+                        images: vec![],
+                        local_images: vec![],
+                        text_elements: vec![],
+                    },
+                })
+                .unwrap(),
+            );
+            line.push(b'\n');
+            std::fs::write(
+                folder.join(format!("rollout-2026-01-02T12-00-00-{id}.jsonl")),
+                line,
+            )
+            .unwrap();
+        }
+        async fn page(
+            source: &CodexHistory,
+            cursor: Option<String>,
+        ) -> (Vec<crate::history::HistoryThread>, Option<String>) {
+            let HistoryResponse::List {
+                threads,
+                next_cursor,
+            } = source
+                .request(HistoryRequest::List {
+                    archived: false,
+                    cursor,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("Expected native inventory")
+            };
+            (threads, next_cursor)
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        for _ in 0..52 {
+            let id = uuid::Uuid::new_v4().to_string();
+            rollout(directory.path(), &id, "2026-01-02T12:00:00Z");
+            expected.insert(id);
+        }
+        let mut source = history(directory.path(), "codex".into());
+        source.codex_home = Some(directory.path().to_owned());
+        // The first page must discover legacy rollouts absent from native state.
+        let (first, cursor) = page(&source, None).await;
+        assert_eq!(first.len(), 50);
+        assert!(cursor.is_some());
+        let later = uuid::Uuid::new_v4().to_string();
+        rollout(directory.path(), &later, "2026-01-03T12:00:00Z");
+        let (rest, cursor) = page(&source, cursor).await;
+        assert!(cursor.is_none());
+        assert_eq!(rest.len(), 2, "Continuation must not repeat rollout repair");
+        let imported: std::collections::BTreeSet<_> = first
+            .into_iter()
+            .chain(rest)
+            .map(|thread| thread.id)
+            .collect();
+        assert_eq!(imported, expected);
+        // A new walk performs repair again, preserving newly discovered sources.
+        expected.insert(later);
+        let mut imported = std::collections::BTreeSet::new();
+        let mut cursor = None;
+        loop {
+            let (threads, next) = page(&source, cursor).await;
+            for thread in threads {
+                assert!(imported.insert(thread.id));
+            }
+            let Some(next) = next else { break };
+            cursor = Some(next);
+        }
+        assert_eq!(imported, expected);
     }
 
     #[tokio::test]
