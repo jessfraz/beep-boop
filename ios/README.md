@@ -123,7 +123,15 @@ required for sharing on a phone; an unsigned build does not establish that.
 - Failed or partial source checks show one current coverage warning above the
   conversation. Tap it for per-account status, full safe errors and local check
   times, including healthy sources. The same view is in Connection → Sources.
+  The view separates the last completed scan from the last check and shows
+  available scan progress and its window. **Refreshing** means an earlier scan
+  completed; **Catching up** means completion has not yet been recorded.
   Live recovery clears old errors; repeated polls add no history or alerts.
+- Connection → **Jobs and work** lists applied schedules and saved work. Open a
+  job for last/next execution, errors, its exact reply and the owning chat.
+  **Retry interrupted run** resumes an execution parked at the restart limit,
+  preserving its identity. Conversation inspection includes sub-agents and live
+  updates, uses the shared history renderer and never sends or stops work.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

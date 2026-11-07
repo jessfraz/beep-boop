@@ -471,7 +471,162 @@ public enum InputWorkState: Codable, Sendable, Equatable {
     }
 }
 
+public struct JobExecution: Codable, Sendable, Equatable {
+    public var `finishedAt`: UtcMillis?
+    public var `output`: String?
+    public var `outputTruncated`: Bool
+    public var `revision`: String
+    public var `scheduleId`: ScheduleId
+    public var `scheduledAt`: UtcMillis
+    public var `startedAt`: UtcMillis?
+    public var `state`: JobExecutionState
+    public var `taskId`: TaskId?
+    public init(`finishedAt`: UtcMillis? = nil, `output`: String? = nil, `outputTruncated`: Bool, `revision`: String, `scheduleId`: ScheduleId, `scheduledAt`: UtcMillis, `startedAt`: UtcMillis? = nil, `state`: JobExecutionState, `taskId`: TaskId? = nil) {
+        self.`finishedAt` = `finishedAt`
+        self.`output` = `output`
+        self.`outputTruncated` = `outputTruncated`
+        self.`revision` = `revision`
+        self.`scheduleId` = `scheduleId`
+        self.`scheduledAt` = `scheduledAt`
+        self.`startedAt` = `startedAt`
+        self.`state` = `state`
+        self.`taskId` = `taskId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `finishedAt` = "finished_at"
+        case `output` = "output"
+        case `outputTruncated` = "output_truncated"
+        case `revision` = "revision"
+        case `scheduleId` = "schedule_id"
+        case `scheduledAt` = "scheduled_at"
+        case `startedAt` = "started_at"
+        case `state` = "state"
+        case `taskId` = "task_id"
+    }
+}
+
+public struct JobExecutionStateRetrying: Codable, Sendable, Equatable {
+    public var `at`: UtcMillis
+    public var `message`: String?
+    public init(`at`: UtcMillis, `message`: String? = nil) {
+        self.`at` = `at`
+        self.`message` = `message`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `at` = "at"
+        case `message` = "message"
+    }
+}
+
+public struct JobExecutionStateBlocked: Codable, Sendable, Equatable {
+    public var `message`: String
+    public init(`message`: String) {
+        self.`message` = `message`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `message` = "message"
+    }
+}
+
+public struct JobExecutionStateFailed: Codable, Sendable, Equatable {
+    public var `message`: String
+    public init(`message`: String) {
+        self.`message` = `message`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `message` = "message"
+    }
+}
+
+public enum JobExecutionState: Codable, Sendable, Equatable {
+    case `queued`
+    case `running`
+    case `waiting`
+    case `retrying`(JobExecutionStateRetrying)
+    case `blocked`(JobExecutionStateBlocked)
+    case `completed`
+    case `failed`(JobExecutionStateFailed)
+    case `stopped`
+    enum CodingKeys: String, CodingKey { case status }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .status)
+        switch tag {
+        case "queued": self = .`queued`
+        case "running": self = .`running`
+        case "waiting": self = .`waiting`
+        case "retrying": self = .`retrying`(try JobExecutionStateRetrying(from: decoder))
+        case "blocked": self = .`blocked`(try JobExecutionStateBlocked(from: decoder))
+        case "completed": self = .`completed`
+        case "failed": self = .`failed`(try JobExecutionStateFailed(from: decoder))
+        case "stopped": self = .`stopped`
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`queued`:
+            try tag.encode("queued", forKey: .status)
+        case .`running`:
+            try tag.encode("running", forKey: .status)
+        case .`waiting`:
+            try tag.encode("waiting", forKey: .status)
+        case .`retrying`(let value):
+            try tag.encode("retrying", forKey: .status)
+            try value.encode(to: encoder)
+        case .`blocked`(let value):
+            try tag.encode("blocked", forKey: .status)
+            try value.encode(to: encoder)
+        case .`completed`:
+            try tag.encode("completed", forKey: .status)
+        case .`failed`(let value):
+            try tag.encode("failed", forKey: .status)
+            try value.encode(to: encoder)
+        case .`stopped`:
+            try tag.encode("stopped", forKey: .status)
+        }
+    }
+}
+
 public typealias JobId = String
+
+public struct JobSchedule: Codable, Sendable, Equatable {
+    public var `focus`: String?
+    public var `id`: ScheduleId
+    public var `prompt`: String?
+    public var `recurrence`: Recurrence
+    public init(`focus`: String? = nil, `id`: ScheduleId, `prompt`: String? = nil, `recurrence`: Recurrence) {
+        self.`focus` = `focus`
+        self.`id` = `id`
+        self.`prompt` = `prompt`
+        self.`recurrence` = `recurrence`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `focus` = "focus"
+        case `id` = "id"
+        case `prompt` = "prompt"
+        case `recurrence` = "recurrence"
+    }
+}
+
+public struct JobScheduleStatus: Codable, Sendable, Equatable {
+    public var `error`: String?
+    public var `lastAt`: UtcMillis?
+    public var `nextAt`: UtcMillis?
+    public var `scheduleId`: ScheduleId
+    public init(`error`: String? = nil, `lastAt`: UtcMillis? = nil, `nextAt`: UtcMillis? = nil, `scheduleId`: ScheduleId) {
+        self.`error` = `error`
+        self.`lastAt` = `lastAt`
+        self.`nextAt` = `nextAt`
+        self.`scheduleId` = `scheduleId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `error` = "error"
+        case `lastAt` = "last_at"
+        case `nextAt` = "next_at"
+        case `scheduleId` = "schedule_id"
+    }
+}
 
 public enum MediaOperation: String, Codable, Sendable, Equatable {
     case `view` = "view"
@@ -939,17 +1094,23 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
     public var `conversationSettings`: Bool?
     public var `inputOrigins`: Bool?
     public var `model`: String
-    public init(`conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String) {
+    public var `workInspection`: Bool?
+    public var `working`: Bool?
+    public init(`conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
         self.`conversationId` = `conversationId`
         self.`conversationSettings` = `conversationSettings`
         self.`inputOrigins` = `inputOrigins`
         self.`model` = `model`
+        self.`workInspection` = `workInspection`
+        self.`working` = `working`
     }
     enum CodingKeys: String, CodingKey {
         case `conversationId` = "conversation_id"
         case `conversationSettings` = "conversation_settings"
         case `inputOrigins` = "input_origins"
         case `model` = "model"
+        case `workInspection` = "work_inspection"
+        case `working` = "working"
     }
 }
 
@@ -976,6 +1137,29 @@ public struct NativeEventSources: Codable, Sendable, Equatable {
     }
     enum CodingKeys: String, CodingKey {
         case `sources` = "sources"
+    }
+}
+
+public struct NativeEventConversations: Codable, Sendable, Equatable {
+    public var `items`: [SavedConversation]
+    public var `nextCursor`: String?
+    public init(`items`: [SavedConversation], `nextCursor`: String? = nil) {
+        self.`items` = `items`
+        self.`nextCursor` = `nextCursor`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `items` = "items"
+        case `nextCursor` = "next_cursor"
+    }
+}
+
+public struct NativeEventWorking: Codable, Sendable, Equatable {
+    public var `working`: Bool
+    public init(`working`: Bool) {
+        self.`working` = `working`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `working` = "working"
     }
 }
 
@@ -1072,13 +1256,16 @@ public struct NativeEventRejected: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventNotice: Codable, Sendable, Equatable {
+    public var `jobStatus`: NativeJobStatus?
     public var `settings`: NativeSettingsSnapshot?
     public var `text`: String
-    public init(`settings`: NativeSettingsSnapshot? = nil, `text`: String) {
+    public init(`jobStatus`: NativeJobStatus? = nil, `settings`: NativeSettingsSnapshot? = nil, `text`: String) {
+        self.`jobStatus` = `jobStatus`
         self.`settings` = `settings`
         self.`text` = `text`
     }
     enum CodingKeys: String, CodingKey {
+        case `jobStatus` = "job_status"
         case `settings` = "settings"
         case `text` = "text"
     }
@@ -1111,6 +1298,8 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `ready`(NativeEventReady)
     case `history`(NativeEventHistory)
     case `sources`(NativeEventSources)
+    case `conversations`(NativeEventConversations)
+    case `working`(NativeEventWorking)
     case `toolDetails`(NativeEventToolDetails)
     case `message`(NativeEventMessage)
     case `answer`(NativeEventAnswer)
@@ -1135,6 +1324,8 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "ready": self = .`ready`(try NativeEventReady(from: decoder))
         case "history": self = .`history`(try NativeEventHistory(from: decoder))
         case "sources": self = .`sources`(try NativeEventSources(from: decoder))
+        case "conversations": self = .`conversations`(try NativeEventConversations(from: decoder))
+        case "working": self = .`working`(try NativeEventWorking(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeEventToolDetails(from: decoder))
         case "message": self = .`message`(try NativeEventMessage(from: decoder))
         case "answer": self = .`answer`(try NativeEventAnswer(from: decoder))
@@ -1172,6 +1363,12 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`sources`(let value):
             try tag.encode("sources", forKey: .type)
+            try value.encode(to: encoder)
+        case .`conversations`(let value):
+            try tag.encode("conversations", forKey: .type)
+            try value.encode(to: encoder)
+        case .`working`(let value):
+            try tag.encode("working", forKey: .type)
             try value.encode(to: encoder)
         case .`toolDetails`(let value):
             try tag.encode("tool_details", forKey: .type)
@@ -1212,6 +1409,51 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`done`:
             try tag.encode("done", forKey: .type)
+        }
+    }
+}
+
+public struct NativeJobStatusList: Codable, Sendable, Equatable {
+    public var `jobs`: [ScheduledJobStatus]
+    public init(`jobs`: [ScheduledJobStatus]) {
+        self.`jobs` = `jobs`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `jobs` = "jobs"
+    }
+}
+
+public struct NativeJobStatusDetail: Codable, Sendable, Equatable {
+    public var `job`: ScheduledJobStatus
+    public init(`job`: ScheduledJobStatus) {
+        self.`job` = `job`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `job` = "job"
+    }
+}
+
+public enum NativeJobStatus: Codable, Sendable, Equatable {
+    case `list`(NativeJobStatusList)
+    case `detail`(NativeJobStatusDetail)
+    enum CodingKeys: String, CodingKey { case type }
+    public init(from decoder: any Decoder) throws {
+        let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
+        switch tag {
+        case "list": self = .`list`(try NativeJobStatusList(from: decoder))
+        case "detail": self = .`detail`(try NativeJobStatusDetail(from: decoder))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
+        }
+    }
+    public func encode(to encoder: any Encoder) throws {
+        var tag = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .`list`(let value):
+            try tag.encode("list", forKey: .type)
+            try value.encode(to: encoder)
+        case .`detail`(let value):
+            try tag.encode("detail", forKey: .type)
+            try value.encode(to: encoder)
         }
     }
 }
@@ -1262,12 +1504,58 @@ public struct NativeRequestSubmit: Codable, Sendable, Equatable {
 }
 
 public struct NativeRequestHistory: Codable, Sendable, Equatable {
+    public var `conversationId`: String?
     public var `cursor`: String?
-    public init(`cursor`: String? = nil) {
+    public init(`conversationId`: String? = nil, `cursor`: String? = nil) {
+        self.`conversationId` = `conversationId`
         self.`cursor` = `cursor`
     }
     enum CodingKeys: String, CodingKey {
+        case `conversationId` = "conversation_id"
         case `cursor` = "cursor"
+    }
+}
+
+public struct NativeRequestJobs: Codable, Sendable, Equatable {
+    public var `jobId`: JobId?
+    public init(`jobId`: JobId? = nil) {
+        self.`jobId` = `jobId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `jobId` = "job_id"
+    }
+}
+
+public struct NativeRequestRetryJob: Codable, Sendable, Equatable {
+    public var `jobId`: JobId
+    public init(`jobId`: JobId) {
+        self.`jobId` = `jobId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `jobId` = "job_id"
+    }
+}
+
+public struct NativeRequestConversations: Codable, Sendable, Equatable {
+    public var `cursor`: String?
+    public var `query`: String
+    public init(`cursor`: String? = nil, `query`: String) {
+        self.`cursor` = `cursor`
+        self.`query` = `query`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `cursor` = "cursor"
+        case `query` = "query"
+    }
+}
+
+public struct NativeRequestInspect: Codable, Sendable, Equatable {
+    public var `conversationId`: String
+    public init(`conversationId`: String) {
+        self.`conversationId` = `conversationId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `conversationId` = "conversation_id"
     }
 }
 
@@ -1285,15 +1573,21 @@ public struct NativeRequestSettings: Codable, Sendable, Equatable {
 }
 
 public struct NativeRequestToolDetails: Codable, Sendable, Equatable {
+    public var `agentId`: String?
     public var `callId`: String
     public var `entryId`: String
-    public init(`callId`: String, `entryId`: String) {
+    public var `taskId`: TaskId?
+    public init(`agentId`: String? = nil, `callId`: String, `entryId`: String, `taskId`: TaskId? = nil) {
+        self.`agentId` = `agentId`
         self.`callId` = `callId`
         self.`entryId` = `entryId`
+        self.`taskId` = `taskId`
     }
     enum CodingKeys: String, CodingKey {
+        case `agentId` = "agent_id"
         case `callId` = "call_id"
         case `entryId` = "entry_id"
+        case `taskId` = "task_id"
     }
 }
 
@@ -1312,6 +1606,10 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `observe`(NativeRequestObserve)
     case `submit`(NativeRequestSubmit)
     case `history`(NativeRequestHistory)
+    case `jobs`(NativeRequestJobs)
+    case `retryJob`(NativeRequestRetryJob)
+    case `conversations`(NativeRequestConversations)
+    case `inspect`(NativeRequestInspect)
     case `settings`(NativeRequestSettings)
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
@@ -1324,6 +1622,10 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "observe": self = .`observe`(try NativeRequestObserve(from: decoder))
         case "submit": self = .`submit`(try NativeRequestSubmit(from: decoder))
         case "history": self = .`history`(try NativeRequestHistory(from: decoder))
+        case "jobs": self = .`jobs`(try NativeRequestJobs(from: decoder))
+        case "retry_job": self = .`retryJob`(try NativeRequestRetryJob(from: decoder))
+        case "conversations": self = .`conversations`(try NativeRequestConversations(from: decoder))
+        case "inspect": self = .`inspect`(try NativeRequestInspect(from: decoder))
         case "settings": self = .`settings`(try NativeRequestSettings(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
@@ -1345,6 +1647,18 @@ public enum NativeRequest: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`history`(let value):
             try tag.encode("history", forKey: .type)
+            try value.encode(to: encoder)
+        case .`jobs`(let value):
+            try tag.encode("jobs", forKey: .type)
+            try value.encode(to: encoder)
+        case .`retryJob`(let value):
+            try tag.encode("retry_job", forKey: .type)
+            try value.encode(to: encoder)
+        case .`conversations`(let value):
+            try tag.encode("conversations", forKey: .type)
+            try value.encode(to: encoder)
+        case .`inspect`(let value):
+            try tag.encode("inspect", forKey: .type)
             try value.encode(to: encoder)
         case .`settings`(let value):
             try tag.encode("settings", forKey: .type)
@@ -1486,9 +1800,91 @@ public enum Reasoning: String, Codable, Sendable, Equatable {
     case `max` = "max"
 }
 
+public typealias Recurrence = String
+
 public enum ReviewStage: String, Codable, Sendable, Equatable {
     case `started` = "started"
     case `finished` = "finished"
+}
+
+public struct SavedConversation: Codable, Sendable, Equatable {
+    public var `agentId`: String?
+    public var `conversationId`: String
+    public var `host`: String?
+    public var `sourceThreadId`: String?
+    public var `taskId`: TaskId?
+    public var `title`: String
+    public var `updatedAt`: Int?
+    public init(`agentId`: String? = nil, `conversationId`: String, `host`: String? = nil, `sourceThreadId`: String? = nil, `taskId`: TaskId? = nil, `title`: String, `updatedAt`: Int? = nil) {
+        self.`agentId` = `agentId`
+        self.`conversationId` = `conversationId`
+        self.`host` = `host`
+        self.`sourceThreadId` = `sourceThreadId`
+        self.`taskId` = `taskId`
+        self.`title` = `title`
+        self.`updatedAt` = `updatedAt`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `agentId` = "agent_id"
+        case `conversationId` = "conversation_id"
+        case `host` = "host"
+        case `sourceThreadId` = "source_thread_id"
+        case `taskId` = "task_id"
+        case `title` = "title"
+        case `updatedAt` = "updated_at"
+    }
+}
+
+public typealias ScheduleId = String
+
+public struct ScheduledJob: Codable, Sendable, Equatable {
+    public var `cwd`: String
+    public var `id`: JobId
+    public var `model`: ModelSelection
+    public var `prompt`: String
+    public var `revision`: String
+    public var `schedules`: [JobSchedule]
+    public var `timezone`: TimezoneId
+    public var `title`: String
+    public init(`cwd`: String, `id`: JobId, `model`: ModelSelection, `prompt`: String, `revision`: String, `schedules`: [JobSchedule], `timezone`: TimezoneId, `title`: String) {
+        self.`cwd` = `cwd`
+        self.`id` = `id`
+        self.`model` = `model`
+        self.`prompt` = `prompt`
+        self.`revision` = `revision`
+        self.`schedules` = `schedules`
+        self.`timezone` = `timezone`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `cwd` = "cwd"
+        case `id` = "id"
+        case `model` = "model"
+        case `prompt` = "prompt"
+        case `revision` = "revision"
+        case `schedules` = "schedules"
+        case `timezone` = "timezone"
+        case `title` = "title"
+    }
+}
+
+public struct ScheduledJobStatus: Codable, Sendable, Equatable {
+    public var `job`: ScheduledJob
+    public var `lastRun`: JobExecution?
+    public var `schedules`: [JobScheduleStatus]
+    public var `taskId`: TaskId?
+    public init(`job`: ScheduledJob, `lastRun`: JobExecution? = nil, `schedules`: [JobScheduleStatus], `taskId`: TaskId? = nil) {
+        self.`job` = `job`
+        self.`lastRun` = `lastRun`
+        self.`schedules` = `schedules`
+        self.`taskId` = `taskId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `job` = "job"
+        case `lastRun` = "last_run"
+        case `schedules` = "schedules"
+        case `taskId` = "task_id"
+    }
 }
 
 public struct SlashCommand: Codable, Sendable, Equatable {
@@ -1580,26 +1976,70 @@ public struct SourceKey: Codable, Sendable, Equatable {
     }
 }
 
+public enum SourceScanPhase: String, Codable, Sendable, Equatable {
+    case `discovering` = "discovering"
+    case `reading` = "reading"
+}
+
+public struct SourceScanProgress: Codable, Sendable, Equatable {
+    public var `completed`: Int?
+    public var `phase`: SourceScanPhase
+    public var `total`: Int?
+    public var `unit`: SourceScanUnit
+    public var `windowEnd`: Int
+    public var `windowStart`: Int
+    public init(`completed`: Int? = nil, `phase`: SourceScanPhase, `total`: Int? = nil, `unit`: SourceScanUnit, `windowEnd`: Int, `windowStart`: Int) {
+        self.`completed` = `completed`
+        self.`phase` = `phase`
+        self.`total` = `total`
+        self.`unit` = `unit`
+        self.`windowEnd` = `windowEnd`
+        self.`windowStart` = `windowStart`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `completed` = "completed"
+        case `phase` = "phase"
+        case `total` = "total"
+        case `unit` = "unit"
+        case `windowEnd` = "window_end"
+        case `windowStart` = "window_start"
+    }
+}
+
+public enum SourceScanUnit: String, Codable, Sendable, Equatable {
+    case `calendars` = "calendars"
+    case `chats` = "chats"
+    case `messages` = "messages"
+}
+
 public struct SourceState: Codable, Sendable, Equatable {
     public var `checkedAt`: Int
     public var `checkpoint`: SourceCheckpoint?
     public var `coverage`: SourceCoverage
+    public var `lastCompletedAt`: Int?
+    public var `progress`: SourceScanProgress?
     public var `source`: SourceKey
-    public init(`checkedAt`: Int, `checkpoint`: SourceCheckpoint? = nil, `coverage`: SourceCoverage, `source`: SourceKey) {
+    public init(`checkedAt`: Int, `checkpoint`: SourceCheckpoint? = nil, `coverage`: SourceCoverage, `lastCompletedAt`: Int? = nil, `progress`: SourceScanProgress? = nil, `source`: SourceKey) {
         self.`checkedAt` = `checkedAt`
         self.`checkpoint` = `checkpoint`
         self.`coverage` = `coverage`
+        self.`lastCompletedAt` = `lastCompletedAt`
+        self.`progress` = `progress`
         self.`source` = `source`
     }
     enum CodingKeys: String, CodingKey {
         case `checkedAt` = "checked_at"
         case `checkpoint` = "checkpoint"
         case `coverage` = "coverage"
+        case `lastCompletedAt` = "last_completed_at"
+        case `progress` = "progress"
         case `source` = "source"
     }
 }
 
 public typealias TaskId = String
+
+public typealias TimezoneId = String
 
 public struct ToolDetailContentText: Codable, Sendable, Equatable {
     public var `text`: String
@@ -1737,6 +2177,8 @@ public enum ToolStatus: String, Codable, Sendable, Equatable {
     case `interrupted` = "interrupted"
     case `unknown` = "unknown"
 }
+
+public typealias UtcMillis = Int
 
 public enum WebSearchAction: String, Codable, Sendable, Equatable {
     case `search` = "search"

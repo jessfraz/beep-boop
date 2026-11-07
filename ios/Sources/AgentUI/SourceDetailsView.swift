@@ -16,12 +16,27 @@ struct SourceDetailsView: View {
           LabeledContent("Account") {
             Text(verbatim: state.source.account).textSelection(.enabled)
           }
-          LabeledContent("Status", value: state.coverage.label)
+          LabeledContent("Status", value: state.statusLabel)
           LabeledContent("Last checked") {
             if let checked = state.lastChecked {
               Text(checked.formatted(date: .abbreviated, time: .standard))
             } else {
               Text("Not checked")
+            }
+          }
+          LabeledContent("Last completed scan") {
+            if let completed = state.lastCompleted {
+              Text(completed.formatted(date: .abbreviated, time: .standard))
+            } else {
+              Text("Not recorded")
+            }
+          }
+          if let progress = state.progress {
+            LabeledContent("Scan progress", value: progress.summary)
+            LabeledContent("Scan window") {
+              Text(
+                "\(progress.scanStart.formatted(date: .abbreviated, time: .omitted)) to \(progress.scanEnd.formatted(date: .abbreviated, time: .omitted))"
+              )
             }
           }
           if let diagnostic = state.coverage.diagnostic {

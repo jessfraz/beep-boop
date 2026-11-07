@@ -21,7 +21,7 @@ public struct ChatSnapshot: Sendable {
   public var rows: [ChatRow] = []
   public var connection: ConnectionState = .disconnected
   public var conversationID: String?
-  public var model = "Main conversation"
+  public var model = "Unknown"
   public var busy = false
   public var commands: [SlashCommand] = []
   public var olderCursor: String?
@@ -30,6 +30,7 @@ public struct ChatSnapshot: Sendable {
   public var sourceWarning: String?
   public var sources: [SourceState] = []
   public var settingsSupported = false
+  public var workInspectionSupported = false
   public var settings: NativeSettingsSnapshot?
   public var error: String?
 }
@@ -102,21 +103,25 @@ public actor CoordinatorSession {
   private let outboxURL: URL
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
+  private let inspectedConversation: SavedConversation?
   private let connectTransport: @Sendable (CoordinatorAddress) async throws -> LineConnection
 
-  public init(outboxURL: URL) {
+  public init(outboxURL: URL, inspecting conversation: SavedConversation? = nil) {
     self.init(
       outboxURL: outboxURL,
       previewDirectory: URL.cachesDirectory.appending(
         path: "Agent/Previews/\(outboxURL.deletingLastPathComponent().lastPathComponent)"),
+      inspecting: conversation,
       connectTransport: { try await LineConnection(address: $0) })
   }
   init(
     outboxURL: URL,
     previewDirectory: URL? = nil,
+    inspecting conversation: SavedConversation? = nil,
     connectTransport: @escaping @Sendable (CoordinatorAddress) async throws -> LineConnection
   ) {
     self.outboxURL = outboxURL
+    inspectedConversation = conversation
     attachments = AttachmentStore(
       directory: outboxURL.deletingLastPathComponent().appending(path: "Attachments"))
     previews = AttachmentStore(
@@ -133,7 +138,7 @@ public actor CoordinatorSession {
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
     self.address = address
-    if !outboxLoaded {
+    if inspectedConversation == nil, !outboxLoaded {
       do {
         pending = try JSONDecoder().decode(
           [PendingInput].self, from: Data(contentsOf: outboxURL))
@@ -179,7 +184,7 @@ public actor CoordinatorSession {
   @discardableResult public func submit(
     _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = []
   ) async -> Bool {
-    guard actions.count < 32, snapshot.connection == .connected,
+    guard inspectedConversation == nil, actions.count < 32, snapshot.connection == .connected,
       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
     else { return false }
     guard text.utf8.count <= 65536 else {
@@ -340,7 +345,9 @@ public actor CoordinatorSession {
     case .latest:
       transcript.beginLatestHistory(id)
       await exchange(
-        id: id, address: address, request: .history(.init(cursor: nil)),
+        id: id, address: address,
+        request: .history(
+          .init(conversationId: inspectedConversation?.conversationId, cursor: nil)),
         inputID: nil, generation: generation)
     }
   }
@@ -365,7 +372,10 @@ public actor CoordinatorSession {
       }
       guard
         let page = await exchange(
-          id: id, address: address, request: .history(.init(cursor: cursor)), inputID: nil,
+          id: id, address: address,
+          request: .history(
+            .init(conversationId: inspectedConversation?.conversationId, cursor: cursor)),
+          inputID: nil,
           generation: generation)
       else { return }
       rows += page.rows
@@ -382,7 +392,9 @@ public actor CoordinatorSession {
     }
   }
   public func interrupt() {
-    if actions.count < 32, snapshot.connection == .connected { perform(.interrupt) }
+    if inspectedConversation == nil, actions.count < 32, snapshot.connection == .connected {
+      perform(.interrupt)
+    }
   }
 
   private func observe(_ address: CoordinatorAddress, generation: UUID) async {
@@ -403,8 +415,13 @@ public actor CoordinatorSession {
         connection = opened
         let stream = opened
         var ready = false
-        try await timedSend(
-          stream, .observe(.init(inputIds: pending.map(\.request.inputId), sourceStatus: true)))
+        let request: NativeRequest =
+          if let inspectedConversation {
+            .inspect(.init(conversationId: inspectedConversation.conversationId))
+          } else {
+            .observe(.init(inputIds: pending.map(\.request.inputId), sourceStatus: true))
+          }
+        try await timedSend(stream, request)
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
@@ -418,7 +435,32 @@ public actor CoordinatorSession {
             await disconnect()
             return
           }
-          if case .ready = event { ready = true }
+          if case .ready(let value) = event {
+            ready = true
+            if let inspectedConversation {
+              guard value.conversationId == inspectedConversation.conversationId else {
+                throw ConnectionError.incompleteFrame
+              }
+              consume(event)
+              // AttachConversation observes live events. History uses its existing
+              // separate reader; neither request claims or resumes execution.
+              let historyID = UUID()
+              historyAction = HistoryAction(id: historyID, window: .latest)
+              transcript.beginLatestHistory(historyID)
+              let page = await exchange(
+                id: historyID, address: address,
+                request: .history(
+                  .init(conversationId: inspectedConversation.conversationId, cursor: nil)),
+                inputID: nil, generation: generation)
+              if historyAction?.id == historyID { historyAction = nil }
+              guard page?.complete == true else { throw ConnectionError.incompleteFrame }
+              attempt = 0
+              snapshot.connection = .connected
+              snapshot.error = nil
+              schedulePublish()
+              continue
+            }
+          }
           if case .history(let frame) = event, frame.pageComplete, ready {
             attempt = 0
             snapshot.connection = .connected
@@ -617,12 +659,93 @@ public actor CoordinatorSession {
     capabilityGeneration = UUID()
     inputOrigins = false
     snapshot.settingsSupported = false
+    snapshot.workInspectionSupported = false
     snapshot.settings = nil
   }
 
   private func validMainSettings(_ value: NativeSettingsSnapshot) -> Bool {
     value.configured.conversationId == snapshot.conversationID
       && value.configured.taskId == nil && value.configured.agentId == nil
+  }
+
+  public func jobs(_ jobID: String? = nil) async throws -> NativeJobStatus {
+    let event = try await workControl(.jobs(.init(jobId: jobID)))
+    guard case .notice(let notice) = event, let jobs = notice.jobStatus else {
+      throw ConnectionError.incompleteFrame
+    }
+    switch (jobID, jobs) {
+    case (nil, .list): return jobs
+    case (.some(let id), .detail(let detail)) where detail.job.job.id == id: return jobs
+    default: throw ConnectionError.incompleteFrame
+    }
+  }
+
+  public func retryJob(_ id: String) async throws -> ScheduledJobStatus {
+    let event = try await workControl(.retryJob(.init(jobId: id)))
+    guard case .notice(let notice) = event, let status = notice.jobStatus,
+      case .detail(let detail) = status,
+      detail.job.job.id == id
+    else { throw ConnectionError.incompleteFrame }
+    return detail.job
+  }
+
+  public func conversations(query: String = "", cursor: String? = nil) async throws
+    -> NativeEventConversations
+  {
+    let event = try await workControl(.conversations(.init(cursor: cursor, query: query)))
+    guard case .conversations(let page) = event else { throw ConnectionError.incompleteFrame }
+    return page
+  }
+
+  /// Each control owns a short-lived socket. It never enters the composer outbox
+  /// or publishes control responses into the observed conversation.
+  private func workControl(_ request: NativeRequest) async throws -> NativeEvent {
+    guard snapshot.connection == .connected, let address,
+      actions.count + previewRequests.count < 32
+    else { throw ConnectionError.closed }
+    guard snapshot.workInspectionSupported else {
+      throw CoordinatorRejection(
+        message: "Update the coordinator to inspect scheduled jobs and saved work.")
+    }
+    let id = UUID()
+    let generation = generation
+    previewRequests.insert(id)
+    defer { previewRequests.remove(id) }
+    let stream = try await connectTransport(address)
+    guard self.generation == generation, !Task.isCancelled else {
+      await stream.close()
+      throw CancellationError()
+    }
+    actionConnections[id] = stream
+    return try await withTaskCancellationHandler {
+      do {
+        try await timedSend(stream, request)
+        var result: NativeEvent?
+        while true {
+          let event = try await timedNext(stream)
+          guard self.generation == generation, !Task.isCancelled else { throw CancellationError() }
+          switch event {
+          case .notice(let notice) where notice.jobStatus != nil:
+            guard result == nil else { throw ConnectionError.incompleteFrame }
+            result = event
+          case .conversations:
+            guard result == nil else { throw ConnectionError.incompleteFrame }
+            result = event
+          case .done:
+            guard let result else { throw ConnectionError.incompleteFrame }
+            await actionConnections.removeValue(forKey: id)?.close()
+            return result
+          case .failure(let failure): throw CoordinatorRejection(message: failure.message)
+          default: throw ConnectionError.incompleteFrame
+          }
+        }
+      } catch {
+        await actionConnections.removeValue(forKey: id)?.close()
+        throw error
+      }
+    } onCancel: {
+      Task { await stream.close() }
+    }
   }
 
   /// Main-conversation control traffic. Never a composer input or task selector.
@@ -738,7 +861,12 @@ public actor CoordinatorSession {
     }
     actionConnections[id] = stream
     do {
-      try await timedSend(stream, .toolDetails(.init(callId: callID, entryId: entryID)))
+      try await timedSend(
+        stream,
+        .toolDetails(
+          .init(
+            agentId: inspectedConversation?.agentId,
+            callId: callID, entryId: entryID, taskId: inspectedConversation?.taskId)))
       var details: ToolDetails?
       while true {
         let event = try await timedNext(stream)
@@ -867,8 +995,12 @@ public actor CoordinatorSession {
       snapshot.conversationID = value.conversationId
       inputOrigins = value.inputOrigins == true
       snapshot.settingsSupported = value.conversationSettings == true
+      snapshot.workInspectionSupported = value.workInspection == true
       snapshot.model = value.model
-      snapshot.busy = true
+      snapshot.busy = value.working ?? true
+    case .working(let value):
+      snapshot.busy = value.working
+      if !value.working { transcript.idle() }
     case .history(let value):
       let earlier: Bool
       let anchorID: String?
@@ -928,7 +1060,7 @@ public actor CoordinatorSession {
     case .idle:
       snapshot.busy = false
       transcript.idle()
-    case .attachment, .toolDetails, .notifications, .disconnect, .done: break
+    case .attachment, .toolDetails, .conversations, .notifications, .disconnect, .done: break
     }
     switch event {
     case .message, .answer, .textDelta, .activity, .notice, .placed:

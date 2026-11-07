@@ -237,6 +237,11 @@ polls bounded pages, with separate cursors and coverage per account.
 Main-chat clients show unavailable or partial coverage as current status,
 outside conversation history. Repeated polls do not repeat notices; a healthy
 snapshot clears the warning.
+Source status keeps the last completed scan separately from the last check.
+An unfinished initial scan is catching up; a later scan is refreshing. Typed
+progress reports the frozen scan window and provider-specific units without
+claiming completion from a successful page. Missing older completion data stays
+unknown.
 Source review reclaims parked native work only after binding its execution
 context. Pi handles tool recovery: interrupted unsafe effects are recorded as
 interrupted, not replayed. Existing submissions and source decisions remain
@@ -262,6 +267,14 @@ retains originals, decisions and the checkpoint while other sources continue.
 Slack revisions include normalized content because search results can omit edit
 metadata. An unchanged legacy snapshot reuses its admitted identity and decision;
 changed content receives a new revision.
+Slack intake covers roughly the past day with date-boundary overlap, not a
+workspace archive. Older polling windows retire only after a successful recent
+read; admitted events, decisions and tasks remain intact. Within the retained
+window, Slack alternates a recent page with a page from its backfill cursor.
+Both reads are bounded. Recent reads preserve that cursor and never mark its
+scan complete; a busy recent page may still leave newer messages for the
+following scan. Provider timestamps keep later backfill admissions from
+outranking current messages in triage.
 
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.
@@ -443,6 +456,11 @@ An unanswered input retains its native status. A successful recovery can link
 `record_task.reconciles_input` to the original request ID so that occurrence
 settles after the linked recovery inputs finish and execution is idle, even
 while the task waits for external work.
+
+Explicit job recovery uses Pi's retry operation on the existing parked native
+task. It does not create another occurrence or change a timer. Native job and
+conversation inspection use the same runtime records and history projection as
+the CLI; inspection detaches without aborting the worker.
 
 ### Cross-host recovery
 

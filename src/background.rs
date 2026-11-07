@@ -217,6 +217,9 @@ pub struct ScheduledJobStatus {
     pub schedules: Vec<JobScheduleStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub task_id: Option<crate::protocol::TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub last_run: Option<JobExecution>,
 }
 

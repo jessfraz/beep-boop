@@ -2,5 +2,6 @@
 import type { JobExecution } from "./JobExecution.js";
 import type { JobScheduleStatus } from "./JobScheduleStatus.js";
 import type { ScheduledJob } from "./ScheduledJob.js";
+import type { TaskId } from "./TaskId.js";
 
-export type ScheduledJobStatus = { job: ScheduledJob, schedules: Array<JobScheduleStatus>, last_run?: JobExecution, };
+export type ScheduledJobStatus = { job: ScheduledJob, schedules: Array<JobScheduleStatus>, task_id?: TaskId, last_run?: JobExecution, };

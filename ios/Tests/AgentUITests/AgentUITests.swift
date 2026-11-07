@@ -88,7 +88,11 @@ final class AgentUITests: XCTestCase {
     if text.isEmpty {
       XCTAssertTrue(value == nil || value == "" || value == field.placeholderValue)
     } else {
-      XCTAssertEqual(value, text)
+      let entered = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@", text), object: field)
+      XCTAssertEqual(
+        XCTWaiter.wait(for: [entered], timeout: 5), .completed,
+        "The complete typed value was not published: \(String(describing: field.value))")
     }
   }
 

@@ -218,6 +218,7 @@ impl GoogleSource {
             })
             .collect();
         let mut batch = SourceBatch {
+            progress: None,
             source: key,
             events,
             checkpoint: None,

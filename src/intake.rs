@@ -47,6 +47,7 @@ pub async fn poll(
         .poll(expected_checkpoint.as_ref())
         .await
         .unwrap_or_else(|_| SourceBatch {
+            progress: None,
             source: key.clone(),
             events: Vec::new(),
             checkpoint: None,

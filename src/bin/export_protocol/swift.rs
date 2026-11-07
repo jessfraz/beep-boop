@@ -250,6 +250,17 @@ pub fn generate(schemas: &[Value]) -> Result<String> {
 /// Values are decoded and reserialized by Rust before Swift consumes them.
 pub fn samples(schema: &Value, root: &Value) -> Result<Vec<Value>> {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        // These owned strings validate on Rust decode, beyond their JSON
+        // string shape. Keep generated native fixtures valid at that boundary.
+        match reference.rsplit('/').next() {
+            Some("Recurrence") => {
+                return Ok(vec![Value::from(
+                    "DTSTART:20270101T090000Z\nRRULE:FREQ=DAILY",
+                )]);
+            }
+            Some("TimezoneId") => return Ok(vec![Value::from("Etc/UTC")]),
+            _ => {}
+        }
         return samples(
             root.pointer(reference.trim_start_matches('#'))
                 .context("Unknown sample reference")?,

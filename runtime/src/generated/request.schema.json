@@ -1864,6 +1864,12 @@
         {
           "type": "object",
           "properties": {
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cursor": {
               "type": [
                 "string",
@@ -1878,6 +1884,87 @@
           "additionalProperties": false,
           "required": [
             "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JobId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "jobs"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "type": {
+              "type": "string",
+              "const": "retry_job"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "job_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversations"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "query"
+          ]
+        },
+        {
+          "description": "Closing this observation detaches the view, not its executor.",
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "inspect"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conversation_id"
           ]
         },
         {
@@ -1911,11 +1998,27 @@
         {
           "type": "object",
           "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "call_id": {
               "type": "string"
             },
             "entry_id": {
               "type": "string"
+            },
+            "task_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -2505,6 +2608,22 @@
             "type": {
               "type": "string",
               "const": "read_job"
+            }
+          },
+          "required": [
+            "type",
+            "job_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "type": {
+              "type": "string",
+              "const": "retry_job"
             }
           },
           "required": [
@@ -3826,6 +3945,16 @@
             "$ref": "#/$defs/SourceEvent"
           }
         },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceScanProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "source": {
           "$ref": "#/$defs/SourceKey"
         }
@@ -4160,6 +4289,65 @@
         "provider",
         "account",
         "thread_id"
+      ]
+    },
+    "SourceScanPhase": {
+      "type": "string",
+      "enum": [
+        "discovering",
+        "reading"
+      ]
+    },
+    "SourceScanProgress": {
+      "description": "Safe progress for the frozen provider window, without calendar/chat IDs or\nopaque cursors. Window bounds are Unix seconds; unknown counts stay unknown.",
+      "type": "object",
+      "properties": {
+        "completed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "phase": {
+          "$ref": "#/$defs/SourceScanPhase"
+        },
+        "total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "unit": {
+          "$ref": "#/$defs/SourceScanUnit"
+        },
+        "window_end": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "window_start": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "window_start",
+        "window_end",
+        "phase",
+        "unit"
+      ]
+    },
+    "SourceScanUnit": {
+      "type": "string",
+      "enum": [
+        "calendars",
+        "chats",
+        "messages"
       ]
     },
     "TaskId": {

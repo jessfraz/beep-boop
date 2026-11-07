@@ -25,9 +25,11 @@ final class ChatModel {
   }
   private(set) var transcriptItems: [TranscriptItem] = []
   var connection: ConnectionState = .disconnected
-  var model = "Main conversation"
+  var model = "Unknown"
   var commands: [SlashCommand] = []
   private(set) var settingsSupported = false
+  private(set) var workInspectionSupported = false
+  let inspectedConversation: SavedConversation?
   private(set) var conversationSettings: NativeSettingsSnapshot?
   private(set) var settingsBusy = false
   var settingsError: String?
@@ -68,12 +70,14 @@ final class ChatModel {
   @ObservationIgnored private var feedbackScreenshotID: String? { didSet { scheduleDraftSave() } }
 
   init(
+    inspecting conversation: SavedConversation? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
     sharedInbox: SharedDraftInbox? = nil,
     admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
       false
     }
   ) {
+    inspectedConversation = conversation
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
@@ -211,7 +215,8 @@ final class ChatModel {
       let directory = try FileManager.default.url(
         for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
       let session = CoordinatorSession(
-        outboxURL: directory.appending(path: "Agent/Outbox/\(key)/pending.json"))
+        outboxURL: directory.appending(path: "Agent/Outbox/\(key)/pending.json"),
+        inspecting: inspectedConversation)
       guard self.generation == generation else { return }
       await connect(session: session, address: address)
     } catch { self.error = error.localizedDescription }
@@ -230,6 +235,27 @@ final class ChatModel {
     }
     if active { await session.connect(address) }
   }
+  func connectInspection(using owner: ChatModel) async {
+    guard inspectedConversation != nil, let address = owner.address else {
+      error = ConnectionError.closed.localizedDescription
+      return
+    }
+    await connect(host: address.host, port: String(address.port))
+  }
+  func jobs(_ id: String? = nil) async throws -> NativeJobStatus {
+    guard let session else { throw ConnectionError.closed }
+    return try await session.jobs(id)
+  }
+  func retryJob(_ id: String) async throws -> ScheduledJobStatus {
+    guard let session else { throw ConnectionError.closed }
+    return try await session.retryJob(id)
+  }
+  func conversations(query: String = "", cursor: String? = nil) async throws
+    -> NativeEventConversations
+  {
+    guard let session else { throw ConnectionError.closed }
+    return try await session.conversations(query: query, cursor: cursor)
+  }
   func runUntilCancelled() async {
     let lifetime = AsyncStream<Void> { _ in }
     for await _ in lifetime {}
@@ -244,6 +270,7 @@ final class ChatModel {
     session = nil
     connection = .disconnected
     settingsSupported = false
+    workInspectionSupported = false
     conversationSettings = nil
     settingsRequest = nil
     settingsBusy = false
@@ -475,6 +502,7 @@ final class ChatModel {
     busy = update.busy
     commands = update.commands
     settingsSupported = update.settingsSupported
+    workInspectionSupported = update.workInspectionSupported
     conversationSettings = update.settings
     canLoadEarlier = update.olderCursor != nil
     loadingHistory = update.loadingHistory

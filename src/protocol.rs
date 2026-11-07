@@ -5,7 +5,9 @@ use crate::instructions::{GuidanceSnapshot, GuidanceSource};
 use crate::machines::MachineSnapshot;
 use crate::models::{ModelProvider, ModelSelection, Reasoning};
 use crate::resources::{CleanupPlan, ResourceRecord, ResourceReport, WorktreeAllocation};
-use crate::sources::{SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey};
+use crate::sources::{
+    SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey, SourceScanProgress,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -327,6 +329,9 @@ pub enum RuntimeCommand {
     JobStatus,
     ListJobs,
     ReadJob {
+        job_id: crate::jobs::JobId,
+    },
+    RetryJob {
         job_id: crate::jobs::JobId,
     },
     RunJob {
@@ -855,6 +860,14 @@ pub struct SourceState {
     pub coverage: SourceCoverage,
     #[ts(type = "number")]
     pub checked_at: u64,
+    /// Last fully admitted scan, in Unix milliseconds. Older journals cannot
+    /// infer this from a successful page read and leave it unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub last_completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub progress: Option<SourceScanProgress>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

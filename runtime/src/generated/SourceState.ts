@@ -2,5 +2,11 @@
 import type { SourceCheckpoint } from "./SourceCheckpoint.js";
 import type { SourceCoverage } from "./SourceCoverage.js";
 import type { SourceKey } from "./SourceKey.js";
+import type { SourceScanProgress } from "./SourceScanProgress.js";
 
-export type SourceState = { source: SourceKey, checkpoint: SourceCheckpoint | null, coverage: SourceCoverage, checked_at: number, };
+export type SourceState = { source: SourceKey, checkpoint: SourceCheckpoint | null, coverage: SourceCoverage, checked_at: number,
+/**
+ * Last fully admitted scan, in Unix milliseconds. Older journals cannot
+ * infer this from a successful page read and leave it unknown.
+ */
+last_completed_at?: number, progress?: SourceScanProgress, };

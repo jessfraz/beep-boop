@@ -340,6 +340,7 @@ beep-boop jobs check --next 5
 beep-boop jobs sync
 beep-boop jobs list
 beep-boop jobs get daily-review
+beep-boop jobs retry daily-review
 beep-boop jobs run daily-review
 beep-boop jobs run daily-review --schedule morning
 ```
@@ -357,6 +358,17 @@ and exact completed reply. Pi owns these records; inspecting them starts no
 work. Older runs without a retained execution reference show unavailable
 timing rather than treating admission as completion. `--json` retains the
 typed result for scripts.
+
+`retry` resumes an existing execution parked after Pi's restart limit. It keeps
+the same task, occurrence and checkpoints, and does not admit another run or
+move recurring timers. Unknown jobs and jobs without a parked execution are
+rejected. Use `run` when a separate new pass is intended.
+
+On iOS, Connection → Jobs and work lists applied jobs and saved conversations.
+A job's detail shows its schedules, execution state, retained timing, errors and
+reply. **Retry interrupted run** uses the same recovery path. Open its owning
+conversation or a sub-agent to inspect live activity and earlier history.
+Inspection is read-only; closing it detaches the viewer and leaves work running.
 
 `run` queues the applied job now with its saved prompt and model. A job with one
 schedule selects it automatically; a job with several requires `--schedule ID` .

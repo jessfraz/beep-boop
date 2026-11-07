@@ -85,7 +85,10 @@ impl Fixture {
     }
 
     fn command_format(&self, args: &[&str], json: bool) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_beep-boop"));
+        // Qualify the packaged binary with the same real coordinator lifecycle tests.
+        let binary = std::env::var_os("AGENT_CLI_PATH")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
+        let mut command = Command::new(binary);
         let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -372,6 +375,7 @@ fn real_cli_source_diagnostics_keep_account_errors_and_check_times_visible() {
     ] {
         let events = fixture.rpc(RuntimeCommand::IngestSource {
             batch: SourceBatch {
+                progress: None,
                 source: SourceKey {
                     provider: "example".into(),
                     account: account.into(),
@@ -855,4 +859,37 @@ fn remote_sync_rejects_client_paths_before_connecting() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn retry_jobs_reaches_the_coordinator_without_launching_unparked_work() {
+    let fixture = Fixture::new();
+    let _server = fixture.start();
+    fs::write(
+        fixture.jobs.join("review.toml"),
+        definition("Review existing evidence without contacting providers.", 9),
+    )
+    .unwrap();
+    fixture.sync();
+    let before = fixture.planned();
+    let triggers = fixture.status().triggers;
+    for (id, reason) in [(JOB_ID, "parked"), ("missing", "unknown scheduled job")] {
+        let output = fixture.cli(&["jobs", "retry", id]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .to_lowercase()
+                .contains(reason),
+            "Retry must report the coordinator's recovery decision: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fixture.tasks().is_empty(), "Retry must not admit a new run");
+        assert_eq!(fixture.status().triggers, triggers);
+        let after = fixture.get();
+        for (before, after) in before.schedules.iter().zip(&after.schedules) {
+            assert_eq!(before.schedule_id, after.schedule_id);
+            assert_eq!(before.next_at, after.next_at);
+            assert_eq!(before.last_at, after.last_at);
+        }
+    }
 }

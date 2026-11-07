@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { SourceJournal } from "../src/sources.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
-import { DAY, START, exampleJob, FakeClock, openBackground, planned, pump } from "./fixtures/background-runtime.js";
+import type { ScheduledJobStatus } from "../src/generated/ScheduledJobStatus.js";
+import { DAY, START, exampleJob, FakeClock, openBackground, planned, pump, Receipts } from "./fixtures/background-runtime.js";
 
 function gate() {
   let release = () => {};
@@ -376,4 +377,64 @@ test("repeated interrupted restarts expose Pi parking without replacing the dura
     assert.deepEqual(await app.scheduler.syncJobs([exampleJob()]), { added: 0, updated: 0, removed: 0, unchanged: 1 });
     assert.match((await app.scheduler.getJob("example-review")).schedules[0]?.error ?? "", /parked/);
   } finally { await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("parked job retry resumes its exact native work once while another job stays running", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-retry-")), held = gate();
+  let app: Awaited<ReturnType<typeof openBackground>> | undefined;
+  let started = () => {}; const running = new Promise<void>(resolve => { started = resolve; });
+  const matches = (input: unknown, id: string): boolean => {
+    if (input === null || typeof input !== "object" || !("type" in input) || input.type !== "work" || !("key" in input)) return false;
+    const key = input.key;
+    return key !== null && typeof key === "object" && "job_id" in key && key.job_id === id;
+  };
+  const retryable = (value: object): value is { retryJob(id: string): Promise<ScheduledJobStatus> } =>
+    "retryJob" in value && typeof value.retryJob === "function";
+  try {
+    for (let restart = 0; restart < 5; restart += 1) await killAt(directory, "after");
+    app = await openBackground(directory, new FakeClock(START + DAY), {
+      runJob: async (occurrence, signal) => {
+        if (occurrence.job.id === "unrelated") { started(); await untilReleased(held.promise, signal); }
+        if (app === undefined) throw new Error("Missing native fixture owner");
+        await app.session.commit(async tx => { (await tx.doc(Receipts)).jobs.push(occurrence); }, BACKGROUND_CONTEXT);
+      },
+    });
+    const other = { ...exampleJob(), id: "unrelated", title: "Unrelated review" };
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob(), other] });
+    await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "normal-running-job" });
+    await running;
+    const before = await app.scheduler.getJob("example-review"), inspection = await app.session.inspect(BACKGROUND_CONTEXT);
+    const parked = inspection.tasks.find(task => matches(task.record.input, "example-review") && task.state.kind === "blocked" && task.state.reason === "restart_limit");
+    const normal = inspection.tasks.find(task => matches(task.record.input, other.id));
+    assert.ok(parked); assert.ok(normal); assert.equal(normal.record.state.status, "running");
+    assert.ok(retryable(app.scheduler), "Parked jobs need an explicit retry of their retained native task");
+    await assert.rejects(app.scheduler.retryJob("missing"), /Unknown scheduled job/);
+    await assert.rejects(app.scheduler.retryJob(other.id), /parked/);
+    const resumed = await app.scheduler.retryJob("example-review");
+    assert.equal(resumed.job.id, "example-review");
+    const current = app;
+    await pump(async () => (await current.session.getTask(parked.record.id, BACKGROUND_CONTEXT))?.state.status === "terminal");
+    const after = await app.session.getTask(parked.record.id, BACKGROUND_CONTEXT); assert.ok(after);
+    assert.deepEqual(after.input, parked.record.input, "The captured occurrence and request identity must survive retry");
+    assert.equal(after.id, parked.record.id);
+    assert.equal(after.state.status, "terminal");
+    if (after.state.status === "terminal") assert.equal(after.state.outcome.status, "completed");
+    assert.deepEqual(await app.session.getTask(normal.record.id, BACKGROUND_CONTEXT), normal.record,
+      "Retrying another job cannot reset or replace normal running work");
+    const status = await app.scheduler.getJob("example-review");
+    assert.equal(status.schedules[0]?.next_at, before.schedules[0]?.next_at);
+    assert.equal(status.schedules[0]?.last_at, before.schedules[0]?.last_at);
+    assert.ok("task_id" in status && typeof status.task_id === "string",
+      "Job diagnostics must retain their owning task independently of run timing");
+    assert.equal(status.task_id, status.last_run?.task_id);
+    const listed = (await app.scheduler.listJobs()).find(job => job.job.id === "example-review");
+    assert.ok(listed !== undefined && "task_id" in listed);
+    assert.equal(listed.task_id, status.task_id);
+    assert.equal((await app.receipts())?.jobs.filter(job => job.job.id === "example-review").length, 1);
+    await assert.rejects(app.scheduler.retryJob("example-review"), /parked/);
+    assert.equal((await app.receipts())?.jobs.filter(job => job.job.id === "example-review").length, 1);
+  } finally {
+    held.release(); await app?.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
 });

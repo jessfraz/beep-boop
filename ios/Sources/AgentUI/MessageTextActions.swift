@@ -7,6 +7,17 @@ import SwiftUI
 #endif
 
 extension View {
+  @ViewBuilder
+  func messageTextSelection() -> some View {
+    #if os(iOS)
+      // The inline system menu otherwise competes with the message menu and
+      // hides Select text. Range selection belongs to the stable native sheet.
+      textSelection(.disabled)
+    #else
+      textSelection(.enabled)
+    #endif
+  }
+
   func messageTextActions(_ text: String) -> some View {
     modifier(MessageTextActions(text: text))
   }

@@ -344,6 +344,8 @@ enum JobsAction {
     List,
     /// Show an applied job's prompt, model and schedules.
     Get { id: String },
+    /// Resume an interrupted run parked by the restart limit.
+    Retry { id: String },
 }
 
 #[derive(Subcommand)]
@@ -676,6 +678,9 @@ async fn main() -> Result<()> {
             }
             JobsAction::List => RuntimeCommand::ListJobs,
             JobsAction::Get { id } => RuntimeCommand::ReadJob {
+                job_id: jobs::JobId::try_from(id)?,
+            },
+            JobsAction::Retry { id } => RuntimeCommand::RetryJob {
                 job_id: jobs::JobId::try_from(id)?,
             },
             JobsAction::Check { .. } => bail!("Job checks must run locally"),

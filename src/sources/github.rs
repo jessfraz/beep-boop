@@ -234,6 +234,7 @@ impl GitHubSource {
             })
             .collect();
         let mut batch = SourceBatch {
+            progress: None,
             source: key,
             events,
             checkpoint: None,
@@ -280,6 +281,7 @@ impl Source for GitHubSource {
                     .value,
             )?;
             return Ok(SourceBatch {
+                progress: None,
                 source: self.key(),
                 events: Vec::new(),
                 checkpoint: checkpoint.cloned(),

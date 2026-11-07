@@ -406,6 +406,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "job_status": emit(id, { type: "job_status", status: await (await app()).background.status() }); break;
       case "list_jobs": emit(id, { type: "scheduled_jobs", jobs: await (await app()).background.listJobs() }); break;
       case "read_job": emit(id, { type: "scheduled_job", job: await (await app()).background.getJob(command.job_id) }); break;
+      case "retry_job": emit(id, { type: "scheduled_job", job: await (await app()).background.retryJob(command.job_id) }); break;
       case "run_job": emit(id, { type: "job_run", run: await (await app()).background.runJob(command) }); break;
       case "configure_coordinator": {
         const application = await app();

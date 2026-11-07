@@ -14,7 +14,11 @@ public struct MainChatView: View {
   private let detailLoader: ToolDetailsLoader?
   private let initialScrollTarget: String?
   private let notifications: AppNotifications?
+  private let relatedWork: [SavedConversation]
+  private let inspectRelated: ((SavedConversation) -> Void)?
+  @Environment(\.dismiss) private var dismiss
   @State private var settings = false
+  @FocusState private var composerFocused: Bool
   @State private var sourceDetails = false
   @State private var followsLatest = true
   @State private var userScrolling = false
@@ -46,12 +50,15 @@ public struct MainChatView: View {
     detailLoader = nil
     initialScrollTarget = nil
     self.notifications = notifications
+    relatedWork = []
+    inspectRelated = nil
   }
   // Previews and hosted rendering use the real screen with a seeded model,
   // without taking ownership of a live connection or the user's saved address.
   init(
     model: ChatModel, expansion: ActivityExpansion = ActivityExpansion(),
-    details: ToolDetailsLoader? = nil, initialScrollTarget: String? = nil
+    details: ToolDetailsLoader? = nil, initialScrollTarget: String? = nil,
+    relatedWork: [SavedConversation] = [], inspectRelated: ((SavedConversation) -> Void)? = nil
   ) {
     _model = State(initialValue: model)
     _activityExpansion = State(initialValue: expansion)
@@ -59,6 +66,8 @@ public struct MainChatView: View {
     detailLoader = details
     self.initialScrollTarget = initialScrollTarget
     notifications = nil
+    self.relatedWork = relatedWork
+    self.inspectRelated = inspectRelated
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
@@ -92,6 +101,18 @@ public struct MainChatView: View {
           .accessibilityIdentifier("sourceCoverageWarning")
           .accessibilityHint("Show source accounts and errors")
         }
+        if inspecting, !relatedWork.isEmpty, let inspectRelated {
+          Menu("Related work", systemImage: "point.3.connected.trianglepath.dotted") {
+            ForEach(relatedWork, id: \.conversationId) { item in
+              Button("\(item.agentId == nil ? "Parent" : "Sub-agent"): \(item.title)") {
+                inspectRelated(item)
+              }
+            }
+          }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(
+            .vertical, 8
+          )
+          .accessibilityIdentifier("relatedWork")
+        }
         transcript
         if let error = model.draftError {
           VStack(alignment: .leading) {
@@ -118,7 +139,7 @@ public struct MainChatView: View {
         }
       }
       .background(.background)
-      .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+      .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
       .navigationTitle("Beep Boop")
       #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -128,14 +149,21 @@ public struct MainChatView: View {
       .toolbar {
         ToolbarItem(placement: .principal) {
           VStack(spacing: 1) {
-            Text("Beep Boop").font(.headline)
+            Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
             Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
               .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
           }.accessibilityElement(children: .combine)
         }
         ToolbarItem(placement: .primaryAction) {
-          Button("Connection", systemImage: "slider.horizontal.3") { settings = true }
+          if inspecting {
+            Button("Done") { dismiss() }.accessibilityIdentifier("closeWorkInspection")
+          } else {
+            Button("Connection", systemImage: "slider.horizontal.3") {
+              composerFocused = false
+              settings = true
+            }
             .tint(.primary)
+          }
         }
       }
       .sheet(isPresented: $settings) {
@@ -160,7 +188,7 @@ public struct MainChatView: View {
         }
       }
       .dropDestination(for: URL.self) { urls, _ in
-        guard model.draftReady, !urls.isEmpty else { return false }
+        guard !inspecting, model.draftReady, !urls.isEmpty else { return false }
         Task { await model.attach(urls: urls) }
         return true
       }
@@ -220,6 +248,7 @@ public struct MainChatView: View {
     .preferredColorScheme(appearance.colorScheme)
   }
   private var mainVisible: Bool { scenePhase == .active && !settings && !sourceDetails }
+  private var inspecting: Bool { model.inspectedConversation != nil }
   private var transcript: some View {
     let items = model.transcriptItems
     return ScrollViewReader { scroll in
@@ -435,6 +464,7 @@ public struct MainChatView: View {
           axis: .vertical
         )
         .disabled(!model.draftReady)
+        .focused($composerFocused)
         .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
         .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
           "Message the coordinator")
@@ -484,6 +514,11 @@ public struct MainChatView: View {
           LabeledContent("Status", value: model.connection.label)
           LabeledContent("Model", value: model.model)
           NavigationLink("Sources") { SourceDetailsView(model: model) }
+          if model.workInspectionSupported {
+            NavigationLink("Jobs and work") { WorkView(model: model) }
+          } else if model.connection == .connected {
+            Text("Update the coordinator to inspect scheduled jobs and saved work.").font(.footnote)
+          }
           if model.settingsSupported {
             NavigationLink("Conversation settings") { ConversationSettingsView(model: model) }
           } else if model.connection == .connected {
@@ -763,14 +798,14 @@ struct RichMessage: View {
       ForEach(blocks.indices, id: \.self) { index in
         switch blocks[index] {
         case .prose(let text):
-          Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
+          Text(text).font(textStyle).lineSpacing(leading).messageTextSelection()
             .fixedSize(horizontal: false, vertical: true)
         case .heading(let text, let level):
           Text(text).font(compact ? textStyle : level <= 2 ? .title3 : .headline)
             .accessibilityAddTraits(.isHeader)
-            .textSelection(.enabled)
+            .messageTextSelection()
         case .quote(let text):
-          Text(text).font(textStyle).lineSpacing(leading).textSelection(.enabled)
+          Text(text).font(textStyle).lineSpacing(leading).messageTextSelection()
             .fixedSize(horizontal: false, vertical: true).padding(.leading, 12)
             .overlay(alignment: .leading) {
               RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
@@ -778,7 +813,7 @@ struct RichMessage: View {
         case .listItem(let text, let marker, let depth):
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(marker).frame(minWidth: listMarkerWidth, alignment: .trailing)
-            Text(text).lineSpacing(leading).textSelection(.enabled)
+            Text(text).lineSpacing(leading).messageTextSelection()
               .fixedSize(horizontal: false, vertical: true)
           }
           .font(textStyle).padding(.leading, CGFloat(depth) * listIndent)
@@ -788,7 +823,7 @@ struct RichMessage: View {
           VStack(alignment: .leading, spacing: 8) {
             if !language.isEmpty { Text(language).font(.caption).foregroundStyle(.secondary) }
             ScrollView(.horizontal) {
-              Text(code).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+              Text(code).font(.system(.callout, design: .monospaced)).messageTextSelection()
                 .fixedSize(horizontal: true, vertical: false)
             }
           }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
@@ -799,7 +834,7 @@ struct RichMessage: View {
                 GridRow {
                   ForEach(rows[row].indices, id: \.self) { column in
                     Text(rows[row][column]).fontWeight(row == 0 ? .semibold : .regular)
-                      .fixedSize(horizontal: true, vertical: false).textSelection(.enabled)
+                      .fixedSize(horizontal: true, vertical: false).messageTextSelection()
                   }
                 }
                 if row == 0 {

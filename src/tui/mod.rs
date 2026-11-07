@@ -3361,6 +3361,8 @@ mod tests {
             checkpoint: None,
             coverage,
             checked_at,
+            last_completed_at: None,
+            progress: None,
         };
         for checked_at in 1..=2 {
             view.event(RuntimeEventKind::Sources {

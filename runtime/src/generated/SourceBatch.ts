@@ -3,5 +3,6 @@ import type { SourceCheckpoint } from "./SourceCheckpoint.js";
 import type { SourceCoverage } from "./SourceCoverage.js";
 import type { SourceEvent } from "./SourceEvent.js";
 import type { SourceKey } from "./SourceKey.js";
+import type { SourceScanProgress } from "./SourceScanProgress.js";
 
-export type SourceBatch = { source: SourceKey, events: Array<SourceEvent>, checkpoint: SourceCheckpoint | null, coverage: SourceCoverage, };
+export type SourceBatch = { source: SourceKey, events: Array<SourceEvent>, checkpoint: SourceCheckpoint | null, coverage: SourceCoverage, progress?: SourceScanProgress, };

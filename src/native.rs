@@ -2,7 +2,8 @@
 use crate::{
     chat_commands::ChatCommand,
     protocol::{
-        HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind, SourceState,
+        HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind,
+        SavedConversation, SourceState,
     },
 };
 use anyhow::{Result, ensure};
@@ -41,6 +42,23 @@ pub enum NativeRequest {
     },
     History {
         cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_id: Option<String>,
+    },
+    Jobs {
+        job_id: Option<crate::jobs::JobId>,
+    },
+    RetryJob {
+        job_id: crate::jobs::JobId,
+    },
+    Conversations {
+        query: String,
+        cursor: Option<String>,
+    },
+    /// Closing this observation detaches the view, not its executor.
+    Inspect {
+        conversation_id: String,
     },
     /// Main-only local controls. Never submits a composer input.
     Settings {
@@ -51,6 +69,12 @@ pub enum NativeRequest {
     ToolDetails {
         entry_id: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        task_id: Option<crate::protocol::TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        agent_id: Option<String>,
     },
     Interrupt,
     Notifications {
@@ -108,6 +132,17 @@ pub struct NativeSettingsSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum NativeJobStatus {
+    List {
+        jobs: Vec<crate::background::ScheduledJobStatus>,
+    },
+    Detail {
+        job: Box<crate::background::ScheduledJobStatus>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum NativeEvent {
     FeedbackReady {
         input_id: String,
@@ -126,6 +161,12 @@ pub enum NativeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         conversation_settings: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        work_inspection: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        working: Option<bool>,
         conversation_id: String,
         model: String,
     },
@@ -136,6 +177,13 @@ pub enum NativeEvent {
     },
     Sources {
         sources: Vec<SourceState>,
+    },
+    Conversations {
+        items: Vec<SavedConversation>,
+        next_cursor: Option<String>,
+    },
+    Working {
+        working: bool,
     },
     ToolDetails {
         details: ToolDetails,
@@ -173,6 +221,9 @@ pub enum NativeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         settings: Option<NativeSettingsSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        job_status: Option<NativeJobStatus>,
     },
     Failure {
         message: String,
@@ -215,12 +266,49 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             change,
             catalog,
         },
-        NativeRequest::History { cursor } => RuntimeCommand::ReadHistory {
-            task_id: None,
-            agent_id: None,
+        NativeRequest::History {
             cursor,
+            conversation_id,
+        } => match conversation_id {
+            Some(conversation_id) => RuntimeCommand::ReadConversation {
+                conversation_id,
+                cursor,
+            },
+            None => RuntimeCommand::ReadHistory {
+                task_id: None,
+                agent_id: None,
+                cursor,
+            },
         },
-        NativeRequest::ToolDetails { entry_id, call_id } => {
+        NativeRequest::Jobs { job_id } => match job_id {
+            Some(job_id) => RuntimeCommand::ReadJob { job_id },
+            None => RuntimeCommand::ListJobs,
+        },
+        NativeRequest::RetryJob { job_id } => RuntimeCommand::RetryJob { job_id },
+        NativeRequest::Conversations { query, cursor } => {
+            ensure!(query.len() <= 512, "Choose a bounded conversation search");
+            RuntimeCommand::ListConversations {
+                query,
+                cursor,
+                limit: 50,
+            }
+        }
+        NativeRequest::Inspect { conversation_id } => {
+            ensure!(
+                !conversation_id.is_empty() && conversation_id.len() <= 128,
+                "Choose a saved conversation"
+            );
+            RuntimeCommand::AttachConversation {
+                conversation_id,
+                input_ids: vec![],
+            }
+        }
+        NativeRequest::ToolDetails {
+            entry_id,
+            call_id,
+            task_id,
+            agent_id,
+        } => {
             let id = entry_id.parse::<u64>()?;
             ensure!(
                 id > 0 && id <= 9_007_199_254_740_991 && id.to_string() == entry_id,
@@ -233,8 +321,8 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             RuntimeCommand::ReadToolDetails {
                 entry_id,
                 call_id,
-                task_id: None,
-                agent_id: None,
+                task_id,
+                agent_id,
             }
         }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
@@ -289,6 +377,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     ChatCommand::Help => {
                         return Ok(Operation::Local(NativeEvent::Notice {
                             settings: None,
+            job_status: None,
                             text: commands().into_iter().map(|command| format!("{}  {}", command.usage, command.description)).collect::<Vec<_>>().join("\n"),
                         }));
                     }
@@ -349,6 +438,15 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         return Some(NativeEvent::Notice {
             text,
             settings: None,
+            job_status: match event {
+                RuntimeEventKind::ScheduledJobs { jobs } => {
+                    Some(NativeJobStatus::List { jobs: jobs.clone() })
+                }
+                RuntimeEventKind::ScheduledJob { job } => Some(NativeJobStatus::Detail {
+                    job: Box::new(job.clone()),
+                }),
+                _ => None,
+            },
         });
     }
     Some(match event {
@@ -364,8 +462,30 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         } => NativeEvent::Ready {
             input_origins: *input_origins,
             conversation_settings: *conversation_settings,
+            work_inspection: Some(true),
+            working: None,
             conversation_id: conversation_id.clone(),
             model: model_label(model),
+        },
+        RuntimeEventKind::ConversationReady {
+            conversation,
+            model,
+            working,
+            ..
+        } => NativeEvent::Ready {
+            input_origins: None,
+            conversation_settings: None,
+            work_inspection: None,
+            working: Some(*working),
+            conversation_id: conversation.conversation_id.clone(),
+            model: model_label(model),
+        },
+        RuntimeEventKind::ConversationState { working } => {
+            NativeEvent::Working { working: *working }
+        }
+        RuntimeEventKind::Conversations { items, next_cursor } => NativeEvent::Conversations {
+            items: items.clone(),
+            next_cursor: next_cursor.clone(),
         },
         RuntimeEventKind::History {
             messages,
@@ -414,11 +534,13 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         },
         RuntimeEventKind::Notice { text, .. } => NativeEvent::Notice {
             settings: None,
+            job_status: None,
             text: text.clone(),
         },
         RuntimeEventKind::Interrupted | RuntimeEventKind::WorkerIdle => NativeEvent::Idle,
         RuntimeEventKind::Done => NativeEvent::Done,
         RuntimeEventKind::ConversationSettings { settings } => NativeEvent::Notice {
+            job_status: None,
             settings: Some(NativeSettingsSnapshot {
                 configured: settings.clone(),
                 effective: None,
@@ -442,6 +564,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             ..
         } => NativeEvent::Notice {
             settings: None,
+            job_status: None,
             text: crate::machines::MachineInventory {
                 nodes: nodes.clone(),
                 online_host_ids: online_host_ids.clone(),
@@ -451,6 +574,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         },
         RuntimeEventKind::Resources { resources } => NativeEvent::Notice {
             settings: None,
+            job_status: None,
             text: crate::resources::format_inventory(resources),
         },
         RuntimeEventKind::FeedbackReady {
@@ -465,6 +589,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             input_id: None,
         } => NativeEvent::Notice {
             settings: None,
+            job_status: None,
             text: format!("Feedback saved. Repair task: {}", receipt.task_id),
         },
         _ => return None,
@@ -627,6 +752,7 @@ mod tests {
         let NativeEvent::Notice {
             ref text,
             settings: Some(ref current),
+            ..
         } = event
         else {
             panic!("Settings must retain the legacy notice shape")
@@ -651,7 +777,14 @@ mod tests {
         assert_eq!(old.text, *text);
         let old: NativeEvent =
             serde_json::from_str(r#"{"type":"notice","text":"Legacy notice"}"#).unwrap();
-        assert!(matches!(old, NativeEvent::Notice { settings: None, .. }));
+        assert!(matches!(
+            old,
+            NativeEvent::Notice {
+                settings: None,
+                job_status: None,
+                ..
+            }
+        ));
         let old: NativeEvent = serde_json::from_str(
             r#"{"type":"ready","conversation_id":"1","model":"Legacy model"}"#,
         )
@@ -682,6 +815,8 @@ mod tests {
                     message: "Provider read failed".into(),
                 },
                 checked_at: 1,
+                last_completed_at: None,
+                progress: None,
             }],
         };
         let native =
@@ -810,6 +945,141 @@ mod tests {
     }
 
     #[test]
+    fn native_job_inspection_is_a_read_only_control() {
+        for (job_id, expected) in [
+            (None, None),
+            (Some("example-review"), Some("example-review")),
+        ] {
+            #[derive(serde::Serialize)]
+            struct Request<'a> {
+                r#type: &'static str,
+                job_id: Option<&'a str>,
+            }
+            #[derive(serde::Serialize)]
+            struct Envelope<'a> {
+                r#type: &'static str,
+                request: Request<'a>,
+            }
+            let wire = serde_json::to_vec(&Envelope {
+                r#type: "native",
+                request: Request {
+                    r#type: "jobs",
+                    job_id,
+                },
+            })
+            .unwrap();
+            let request = serde_json::from_slice::<crate::native::NativeCommand>(&wire);
+            assert!(
+                request.is_ok(),
+                "Native clients need a read-only job inspection request"
+            );
+            let crate::native::NativeCommand::Native { request } = request.unwrap();
+            let Operation::Runtime(command) = prepare(request).unwrap() else {
+                panic!("Job inspection must use the existing runtime reader");
+            };
+            match (expected, *command) {
+                (None, RuntimeCommand::ListJobs) => {}
+                (Some(expected), RuntimeCommand::ReadJob { job_id }) => {
+                    assert_eq!(job_id.as_str(), expected)
+                }
+                _ => panic!("Job inspection must not submit or run a job"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_job_notices_retain_typed_run_diagnostics_and_legacy_text() {
+        use crate::{
+            background::{JobExecution, JobExecutionState, ScheduledJobStatus},
+            jobs::{JobSchedule, ScheduledJob, UtcMillis},
+            protocol::RuntimeEventKind,
+        };
+        #[derive(serde::Deserialize)]
+        struct NoticeContract {
+            text: String,
+            job_status: Option<JobContract>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum JobContract {
+            List { jobs: Vec<ScheduledJobStatus> },
+            Detail { job: Box<ScheduledJobStatus> },
+        }
+        let mut job = ScheduledJobStatus {
+            job: ScheduledJob {
+                id: "example-review".to_string().try_into().unwrap(),
+                title: "Example review".into(),
+                prompt: "Review existing evidence".into(),
+                model: crate::models::ModelSelection::default(),
+                timezone: "Etc/UTC".to_string().try_into().unwrap(),
+                cwd: "/workspace/example".into(),
+                revision: "original".into(),
+                schedules: vec![JobSchedule {
+                    id: "daily".to_string().try_into().unwrap(),
+                    recurrence: "DTSTART:20270101T090000Z\nRRULE:FREQ=DAILY"
+                        .to_string()
+                        .try_into()
+                        .unwrap(),
+                    focus: None,
+                    prompt: None,
+                }],
+            },
+            schedules: vec![],
+            task_id: Some(crate::protocol::TaskId::new()),
+            last_run: None,
+        };
+        let decode = |event| {
+            let projected = crate::native::project(&event).unwrap();
+            serde_json::from_slice::<NoticeContract>(&serde_json::to_vec(&projected).unwrap())
+                .unwrap()
+        };
+        let listing = decode(RuntimeEventKind::ScheduledJobs {
+            jobs: vec![job.clone()],
+        });
+        assert!(!listing.text.is_empty());
+        let Some(JobContract::List { jobs }) = listing.job_status else {
+            panic!("Job notices must retain typed diagnostics for native navigation");
+        };
+        assert_eq!(jobs.len(), 1);
+        assert!(
+            jobs[0].task_id.is_some(),
+            "The owner must remain visible when legacy run timing is absent"
+        );
+        assert!(jobs[0].last_run.is_none(), "Old timing must remain unknown");
+        job.last_run = Some(JobExecution {
+            schedule_id: "daily".to_string().try_into().unwrap(),
+            scheduled_at: UtcMillis::new(1).unwrap(),
+            started_at: Some(UtcMillis::new(2).unwrap()),
+            finished_at: None,
+            revision: "captured".into(),
+            state: JobExecutionState::Blocked {
+                message: "Retained native task needs inspection".into(),
+            },
+            task_id: Some(crate::protocol::TaskId::new()),
+            output: Some("Complete retained output\nwith another line".into()),
+            output_truncated: false,
+        });
+        let detail = decode(RuntimeEventKind::ScheduledJob { job });
+        assert!(
+            detail
+                .text
+                .contains("Retained native task needs inspection")
+        );
+        let Some(JobContract::Detail { job }) = detail.job_status else {
+            panic!("Job details must retain their typed execution");
+        };
+        let run = job.last_run.unwrap();
+        assert!(
+            matches!(run.state, JobExecutionState::Blocked { message } if message == "Retained native task needs inspection")
+        );
+        assert_eq!(
+            run.output.as_deref(),
+            Some("Complete retained output\nwith another line")
+        );
+        assert!(run.finished_at.is_none());
+    }
+
+    #[test]
     fn native_envelope_is_consumed_by_the_real_transport_and_bounds_are_enforced() {
         let id = uuid::Uuid::new_v4().to_string();
         let command = crate::native::NativeCommand::Native {
@@ -859,6 +1129,8 @@ mod tests {
     #[test]
     fn tool_details_keep_the_durable_anchor_and_never_become_model_input() {
         let Operation::Runtime(command) = prepare(NativeRequest::ToolDetails {
+            task_id: None,
+            agent_id: None,
             entry_id: "42".into(),
             call_id: "provider-call".into(),
         })
@@ -872,6 +1144,8 @@ mod tests {
         for entry_id in ["", "0", "-1", "01", "1.0", "9007199254740992"] {
             assert!(
                 prepare(NativeRequest::ToolDetails {
+                    task_id: None,
+                    agent_id: None,
                     entry_id: entry_id.into(),
                     call_id: "provider-call".into(),
                 })
@@ -881,6 +1155,8 @@ mod tests {
         for call_id in [String::new(), "🦀".repeat(257)] {
             assert!(
                 prepare(NativeRequest::ToolDetails {
+                    task_id: None,
+                    agent_id: None,
                     entry_id: "42".into(),
                     call_id,
                 })

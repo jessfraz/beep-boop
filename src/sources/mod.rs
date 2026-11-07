@@ -65,12 +65,46 @@ pub enum SourceCoverage {
     Unavailable { message: String },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceScanPhase {
+    Discovering,
+    Reading,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceScanUnit {
+    Calendars,
+    Chats,
+    Messages,
+}
+
+/// Safe progress for the frozen provider window, without calendar/chat IDs or
+/// opaque cursors. Window bounds are Unix seconds; unknown counts stay unknown.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct SourceScanProgress {
+    #[ts(type = "number")]
+    pub window_start: u64,
+    #[ts(type = "number")]
+    pub window_end: u64,
+    pub phase: SourceScanPhase,
+    pub unit: SourceScanUnit,
+    #[ts(type = "number | null")]
+    pub completed: Option<u64>,
+    #[ts(type = "number | null")]
+    pub total: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SourceBatch {
     pub source: SourceKey,
     pub events: Vec<SourceEvent>,
     pub checkpoint: Option<SourceCheckpoint>,
     pub coverage: SourceCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub progress: Option<SourceScanProgress>,
 }
 
 impl SourceBatch {
@@ -79,6 +113,7 @@ impl SourceBatch {
             source,
             events: Vec::new(),
             checkpoint: None,
+            progress: None,
             coverage: SourceCoverage::Unavailable {
                 message: message.into(),
             },

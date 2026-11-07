@@ -80,11 +80,15 @@
         A00000000000000000000019 = {isa = PBXBuildFile; fileRef = A00000000000000000000018; };
         A0000000000000000000001A = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderingTests.swift; sourceTree = "<group>"; };
         A0000000000000000000001B = {isa = PBXBuildFile; fileRef = A0000000000000000000001A; };
+        C00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkInspectionTests.swift; sourceTree = "<group>"; };
+        C00000000000000000000002 = {isa = PBXBuildFile; fileRef = C00000000000000000000001; };
+        C00000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoordinatorFixture.swift; sourceTree = "<group>"; };
+        C00000000000000000000004 = {isa = PBXBuildFile; fileRef = C00000000000000000000003; };
         A0000000000000000000001C = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = AgentRenderingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
         A0000000000000000000001D = {isa = PBXBuildFile; productRef = A0000000000000000000001E; };
         A0000000000000000000001E = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000006; productName = AgentUI; };
-        A0000000000000000000001F = {isa = PBXGroup; children = (A0000000000000000000001A, B00000000000000000000018); name = AgentRenderingTests; path = Tests/AgentCoreTests; sourceTree = "<group>"; };
-        A00000000000000000000020 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000001B, B00000000000000000000019); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000001F = {isa = PBXGroup; children = (A0000000000000000000001A, B00000000000000000000018, C00000000000000000000001, C00000000000000000000003); name = AgentRenderingTests; path = Tests/AgentCoreTests; sourceTree = "<group>"; };
+        A00000000000000000000020 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000001B, B00000000000000000000019, C00000000000000000000002, C00000000000000000000004); runOnlyForDeploymentPostprocessing = 0; };
         A00000000000000000000021 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000001D); runOnlyForDeploymentPostprocessing = 0; };
         A00000000000000000000022 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
         A00000000000000000000023 = {isa = PBXContainerItemProxy; containerPortal = A0000000000000000000000E; proxyType = 1; remoteGlobalIDString = A0000000000000000000000D; remoteInfo = Agent; };
@@ -114,9 +118,11 @@
         };
         A00000000000000000000029 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentUITests.swift; sourceTree = "<group>"; };
         A0000000000000000000002A = {isa = PBXBuildFile; fileRef = A00000000000000000000029; };
+        C00000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkNavigationTests.swift; sourceTree = "<group>"; };
+        C00000000000000000000006 = {isa = PBXBuildFile; fileRef = C00000000000000000000005; };
         A0000000000000000000002B = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = AgentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-        A0000000000000000000002C = {isa = PBXGroup; children = (A00000000000000000000029, A00000000000000000000045); path = Tests/AgentUITests; sourceTree = "<group>"; };
-        A0000000000000000000002D = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000002A, A00000000000000000000046); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000002C = {isa = PBXGroup; children = (A00000000000000000000029, A00000000000000000000045, C00000000000000000000005); path = Tests/AgentUITests; sourceTree = "<group>"; };
+        A0000000000000000000002D = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A0000000000000000000002A, A00000000000000000000046, C00000000000000000000006); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000002E = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000043); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000002F = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
         A00000000000000000000030 = {

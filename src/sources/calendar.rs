@@ -10,7 +10,8 @@ use crate::{
     protocol::SourceRef,
     sources::{
         ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        google::GoogleSource, now_seconds, read_command,
+        SourceScanPhase, SourceScanProgress, SourceScanUnit, google::GoogleSource, now_seconds,
+        read_command,
     },
 };
 
@@ -46,6 +47,34 @@ enum Phase {
         cursor: Option<String>,
     },
     Settled,
+}
+
+impl Window {
+    fn progress(&self) -> SourceScanProgress {
+        let (phase, completed, total) = match &self.phase {
+            Phase::Calendars { calendars, .. } => (
+                SourceScanPhase::Discovering,
+                Some(calendars.len() as u64),
+                None,
+            ),
+            Phase::Events {
+                calendars, index, ..
+            } => (
+                SourceScanPhase::Reading,
+                Some(*index as u64),
+                Some(calendars.len() as u64),
+            ),
+            Phase::Settled => (SourceScanPhase::Reading, None, None),
+        };
+        SourceScanProgress {
+            window_start: self.since,
+            window_end: self.until,
+            phase,
+            unit: SourceScanUnit::Calendars,
+            completed,
+            total,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +306,7 @@ impl CalendarSource {
 
     fn partial(&self, events: Vec<SourceEvent>) -> SourceBatch {
         SourceBatch {
+            progress: None,
             source: self.key(),
             events,
             checkpoint: None,
@@ -293,6 +323,7 @@ impl CalendarSource {
             SourceCoverage::More
         };
         Ok(SourceBatch {
+            progress: Some(window.progress()),
             source: self.key(),
             events,
             coverage,
@@ -526,6 +557,12 @@ mod tests {
         let saved = source
             .window(Some(checkpoint(&listed)), NOW + 20_000)
             .unwrap();
+        let progress = listed.progress.as_ref().unwrap();
+        assert_eq!((progress.completed, progress.total), (Some(0), Some(2)));
+        assert_eq!(
+            (progress.window_start, progress.window_end),
+            (NOW - 86_400, NOW + 30 * 86_400)
+        );
         let first_params = params(&source, &saved);
         assert_eq!(first_params.calendar_id, "first");
         assert!(first_params.single_events && first_params.show_deleted);
@@ -544,6 +581,13 @@ mod tests {
         let saved = source
             .window(Some(checkpoint(&end_first)), NOW + 40_000)
             .unwrap();
+        assert_eq!(
+            (
+                end_first.progress.as_ref().unwrap().completed,
+                end_first.progress.as_ref().unwrap().total
+            ),
+            (Some(1), Some(2))
+        );
         assert_eq!(params(&source, &saved).calendar_id, "second");
         let finished = source
             .normalize(output(r#"{"kind":"calendar#events","items":[]}"#), saved)

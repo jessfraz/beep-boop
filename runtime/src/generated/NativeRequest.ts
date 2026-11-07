@@ -4,6 +4,8 @@ import type { AttachmentRequest } from "./AttachmentRequest.js";
 import type { ConversationChange } from "./ConversationChange.js";
 import type { InputMode } from "./InputMode.js";
 import type { InputOrigin } from "./InputOrigin.js";
+import type { JobId } from "./JobId.js";
 import type { NotificationRequest } from "./NotificationRequest.js";
+import type { TaskId } from "./TaskId.js";
 
-export type NativeRequest = { "type": "attachment", request: AttachmentRequest, } | { "type": "observe", input_ids: Array<string>, source_status?: boolean, } | { "type": "submit", origin?: InputOrigin, input_id: string, text: string, mode: InputMode, attachments?: Array<AttachmentRef>, } | { "type": "history", cursor: string | null, } | { "type": "settings", change: ConversationChange | null, catalog: boolean, } | { "type": "tool_details", entry_id: string, call_id: string, } | { "type": "interrupt" } | { "type": "notifications", request: NotificationRequest, };
+export type NativeRequest = { "type": "attachment", request: AttachmentRequest, } | { "type": "observe", input_ids: Array<string>, source_status?: boolean, } | { "type": "submit", origin?: InputOrigin, input_id: string, text: string, mode: InputMode, attachments?: Array<AttachmentRef>, } | { "type": "history", cursor: string | null, conversation_id?: string, } | { "type": "jobs", job_id: JobId | null, } | { "type": "retry_job", job_id: JobId, } | { "type": "conversations", query: string, cursor: string | null, } | { "type": "inspect", conversation_id: string, } | { "type": "settings", change: ConversationChange | null, catalog: boolean, } | { "type": "tool_details", entry_id: string, call_id: string, task_id?: TaskId, agent_id?: string, } | { "type": "interrupt" } | { "type": "notifications", request: NotificationRequest, };

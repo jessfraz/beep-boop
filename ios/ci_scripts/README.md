@@ -18,9 +18,9 @@ Configure one release workflow:
 | Scheme | `Agent` |
 | Start condition | Branch Changes, exact branch `main`, any file in `/ios` |
 | Superseded builds | Auto-cancel enabled |
-| Environment | Xcode 27.1 (27A9275), macOS 27.0.1 (26A434) |
+| Environment | Xcode 26.6 (17F113), macOS 26.5.1 (25F80) |
 | Test action | iOS, `Agent`, Use Scheme Settings, **Required To Pass** |
-| Test destination | A supported iPhone simulator |
+| Test destination | iPhone 17 Pro, iOS 26.5 |
 | Archive action | iOS, `Agent`, **TestFlight (Internal Testing Only)** |
 | Post-action | Successful build, TestFlight Internal Testing, intended private group |
 

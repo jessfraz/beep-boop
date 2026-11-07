@@ -50,10 +50,11 @@ final class HistoryInteractionTests: XCTestCase {
       XCTAssertTrue(destination.waitForExistence(timeout: 5), app.debugDescription)
       destination.tap()
       let save = app.buttons["Save draft"]
-      XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+      // This launches a separate extension process. Wait for its usable view,
+      // rather than imposing a five-second cold-launch performance threshold.
       let ready = XCTNSPredicateExpectation(
-        predicate: NSPredicate(format: "enabled == true"), object: save)
-      XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed, app.debugDescription)
+        predicate: NSPredicate(format: "exists == true AND enabled == true"), object: save)
+      XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 15), .completed, app.debugDescription)
       return save
     }
     let cancelled = presentShare()

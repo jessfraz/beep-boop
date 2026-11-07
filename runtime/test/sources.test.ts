@@ -19,6 +19,8 @@ import { createAppTools, Executions } from "../src/tools.js";
 import { createSourceTools, SourceJournal } from "../src/sources.js";
 import type { SourceBatch } from "../src/generated/SourceBatch.js";
 import type { SourceEvent } from "../src/generated/SourceEvent.js";
+import type { SourceScanProgress } from "../src/generated/SourceScanProgress.js";
+import type { SourceState } from "../src/generated/SourceState.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 
 function event(id: string, account = "alpha", version = "v1"): SourceEvent {
@@ -28,6 +30,60 @@ function event(id: string, account = "alpha", version = "v1"): SourceEvent {
 function batch(events: SourceEvent[], cursor: string, account = "alpha"): SourceBatch {
   return { source: { provider: "mail", account }, events, checkpoint: { value: cursor }, coverage: { status: "complete" } };
 }
+
+test("source scan completion survives refreshing, failures, stale cursors and reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-progress-")); let app = await open(directory);
+  const progress: SourceScanProgress = { window_start: 1_800_000_000, window_end: 1_800_600_000,
+    phase: "reading", unit: "chats", completed: 11, total: 25 };
+  try {
+    const initial = await app.sources.admit({ ...batch([event("original")], "one"), coverage: { status: "more" }, progress }, null);
+    assert.equal(initial.state.last_completed_at, undefined, "A successful page is not a completed scan");
+    assert.deepEqual(initial.state.progress, progress);
+    const finished = await app.sources.admit({ ...batch([event("original")], "two"), progress }, { value: "one" });
+    const completedAt = finished.state.last_completed_at; assert.ok(completedAt !== undefined);
+    assert.equal(completedAt, finished.state.checked_at); assert.equal(finished.new_events, 0);
+    const [original] = await app.sources.events(); assert.ok(original);
+    await app.sources.decide([original.key], { type: "dismissed", reason: "Already handled" });
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const published: SourceState[][] = [];
+    const stop = await app.sources.watchStates((states) => published.push(states), (error) => { throw error; });
+    const nextProgress = { ...progress, completed: 12 };
+    const refreshing = await app.sources.admit({ ...batch([event("current")], "three"), coverage: { status: "more" }, progress: nextProgress }, { value: "two" });
+    assert.equal(refreshing.state.last_completed_at, completedAt);
+    const partial = await app.sources.admit({ ...batch([], "unsafe"), coverage: { status: "partial", message: "Incomplete provider page" },
+      progress: { ...progress, completed: 99 } }, { value: "three" });
+    assert.equal(partial.state.last_completed_at, completedAt); assert.deepEqual(partial.state.progress, nextProgress);
+    const unavailable = await app.sources.admit({ ...batch([], "unsafe"), coverage: { status: "unavailable", message: "Provider is unavailable" } }, { value: "three" });
+    assert.equal(unavailable.state.last_completed_at, completedAt); assert.deepEqual(unavailable.state.progress, nextProgress);
+    const stale = await app.sources.admit(batch([], "stale"), { value: "two" });
+    assert.equal(stale.checkpoint_advanced, false); assert.deepEqual(stale.state, unavailable.state);
+    await stop();
+    assert.ok(published.some((states) => states.some((state) => state.progress?.completed === 12 && state.coverage.status === "more")),
+      "Live observers must see progress even when coverage stays More");
+    assert.equal((await app.sources.events({ keys: [original.key] }))[0]?.decision?.type, "dismissed");
+    assert.equal((await app.sources.events()).length, 2);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    assert.deepEqual((await app.sources.states()).find((state) => state.source.provider === "mail"), unavailable.state);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("recent Slack observations stay selectable when older backfill arrives afterward", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-slack-recency-")); const app = await open(directory);
+  const source = { provider: "slack", account: "fixture" };
+  const recent = { ...event("current", source.account), source: { ...source, thread_id: "current-thread" }, occurred_at: 1_800_000_000_000 };
+  const slackBatch = (events: SourceEvent[], cursor: string): SourceBatch => ({ source, events, checkpoint: { value: cursor }, coverage: { status: "more" } });
+  try {
+    await app.sources.admit(slackBatch([recent], "recent"), null);
+    const prior = Array.from({ length: 100 }, (_, index) => ({ ...event(String(index), source.account),
+      source: { ...source, thread_id: "older-" + index }, occurred_at: 1_700_000_000_000 + index }));
+    const backfill = await app.sources.admit(slackBatch([...prior, recent], "backfill"), { value: "recent" });
+    assert.equal(backfill.new_events, 100, "Recent/backfill overlap retains one immutable original");
+    const records = await claimedRecords(app, await accountForBatch(app));
+    assert.ok(records.some((record) => record.event.id === "current"), "Current signals must not be ranked below the later-admitted old page");
+    assert.ok(records.some((record) => record.event.id === "0"), "The same batch still handles old pending work");
+    assert.equal((await app.sources.events({ query: "current", limit: 100 })).length, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 const command: Extract<RuntimeCommand, { type: "triage_sources" }> = {
   type: "triage_sources", instructions: "Be brief and act on authorized work.", model: fixtureModel, cwd: "/workspace/example", hosts: [],
 };

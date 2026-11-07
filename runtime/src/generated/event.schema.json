@@ -5066,6 +5066,16 @@
           "items": {
             "$ref": "#/$defs/JobScheduleStatus"
           }
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -5358,6 +5368,65 @@
         "thread_id"
       ]
     },
+    "SourceScanPhase": {
+      "type": "string",
+      "enum": [
+        "discovering",
+        "reading"
+      ]
+    },
+    "SourceScanProgress": {
+      "description": "Safe progress for the frozen provider window, without calendar/chat IDs or\nopaque cursors. Window bounds are Unix seconds; unknown counts stay unknown.",
+      "type": "object",
+      "properties": {
+        "completed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "phase": {
+          "$ref": "#/$defs/SourceScanPhase"
+        },
+        "total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "unit": {
+          "$ref": "#/$defs/SourceScanUnit"
+        },
+        "window_end": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "window_start": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "window_start",
+        "window_end",
+        "phase",
+        "unit"
+      ]
+    },
+    "SourceScanUnit": {
+      "type": "string",
+      "enum": [
+        "calendars",
+        "chats",
+        "messages"
+      ]
+    },
     "SourceState": {
       "type": "object",
       "properties": {
@@ -5378,6 +5447,25 @@
         },
         "coverage": {
           "$ref": "#/$defs/SourceCoverage"
+        },
+        "last_completed_at": {
+          "description": "Last fully admitted scan, in Unix milliseconds. Older journals cannot\ninfer this from a successful page read and leave it unknown.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceScanProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "source": {
           "$ref": "#/$defs/SourceKey"

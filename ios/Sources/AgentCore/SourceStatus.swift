@@ -22,6 +22,39 @@ extension SourceState {
   public var lastChecked: Date? {
     checkedAt > 0 ? Date(timeIntervalSince1970: Double(checkedAt) / 1000) : nil
   }
+  public var lastCompleted: Date? {
+    lastCompletedAt.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+  }
+  public var statusLabel: String {
+    if case .more = coverage {
+      return lastCompletedAt == nil ? "Catching up" : "Refreshing"
+    }
+    return coverage.label
+  }
+}
+
+extension SourceScanProgress {
+  public var summary: String {
+    let noun: String =
+      switch unit {
+      case .calendars: "calendars"
+      case .chats: "chats"
+      case .messages: "messages"
+      }
+    let action = phase == .discovering ? "Discovering" : "Reading"
+    switch (completed, total) {
+    case (.some(let completed), .some(let total)):
+      let qualifier = unit == .messages ? "about " : ""
+      return "\(action) \(noun): \(completed) of \(qualifier)\(total)"
+    case (.some(let completed), .none):
+      return "\(action) \(noun): \(completed)"
+    case (.none, .some(let total)):
+      return "\(action) \(noun): about \(total) matches"
+    case (.none, .none): return "\(action) \(noun)"
+    }
+  }
+  public var scanStart: Date { Date(timeIntervalSince1970: Double(windowStart)) }
+  public var scanEnd: Date { Date(timeIntervalSince1970: Double(windowEnd)) }
 }
 
 extension SourceCoverage {

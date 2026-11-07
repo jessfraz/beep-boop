@@ -399,11 +399,15 @@ export class BackgroundScheduler {
   async listJobs(inspected?: HarnessInspection): Promise<ScheduledJobStatus[]> {
     const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
     const errors = await this.errors(state, inspected);
-    return (state?.jobs ?? []).map((job) => ({ job: structuredClone(job), schedules: job.schedules.map((schedule) => {
+    return (state?.jobs ?? []).map((job) => {
+      const task_id = state?.lanes.find((lane) => lane.id === JSON.stringify(["job", job.id]))?.actor_task_id;
+      return { job: structuredClone(job), ...(task_id === null || task_id === undefined ? {} : { task_id }),
+      schedules: job.schedules.map((schedule) => {
       const trigger = state?.triggers.find((item) => item.key.type === "job" && item.key.job_id === job.id && item.key.schedule_id === schedule.id);
       return { schedule_id: schedule.id, next_at: trigger?.next ?? null, last_at: trigger?.last ?? null,
         error: trigger === undefined ? null : errors.get(key(trigger.key)) ?? null };
-    }) }));
+    }) };
+    });
   }
   async getJob(id: string): Promise<ScheduledJobStatus> {
     const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
@@ -457,5 +461,23 @@ export class BackgroundScheduler {
       state: execution, task_id: actor?.id ?? null, output: output === null ? null : characters.slice(0, 16000).join(""),
       output_truncated: characters.length > 16000 };
     return { ...job, last_run };
+  }
+  /** Retry only this applied job's interrupted native timer/work. Pi retains
+   * its existing occurrence, checkpoint and durable request identity. */
+  async retryJob(id: string): Promise<ScheduledJobStatus> {
+    const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
+    if (!state?.jobs.some(job => job.id === id)) throw new TaskError("Unknown scheduled job");
+    const candidates = new Set<NativeTaskId>();
+    for (const trigger of state.triggers) {
+      if (trigger.enabled && trigger.key.type === "job" && trigger.key.job_id === id && trigger.task !== null) candidates.add(trigger.task);
+    }
+    const active = state.lanes.find(lane => lane.id === JSON.stringify(["job", id]))?.active;
+    if (active !== null && active !== undefined) candidates.add(active);
+    const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
+    const parked = inspection.tasks.filter(task => candidates.has(task.record.id) && task.record.kind === "agent.background" &&
+      task.state.kind === "blocked" && task.state.reason === "restart_limit");
+    if (parked.length === 0) throw new TaskError("This job has no parked interrupted run or timer to retry");
+    for (const task of parked) await this.session.retryTask(task.record.id, BACKGROUND_CONTEXT);
+    return this.getJob(id);
   }
 }

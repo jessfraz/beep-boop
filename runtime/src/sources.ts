@@ -154,7 +154,8 @@ export class SourceJournal {
     let pending = Promise.resolve();
     const publish = async () => {
       const states = await this.states();
-      const identity = JSON.stringify(states.map(({ source, coverage }) => ({ source, coverage })));
+      const identity = JSON.stringify(states.map(({ source, coverage, checked_at, last_completed_at, progress }) =>
+        ({ source, coverage, checked_at, last_completed_at, progress })));
       if (closed || identity === previous) return;
       previous = identity; emit(states);
     };
@@ -255,7 +256,12 @@ export class SourceJournal {
         : batch.coverage;
       const complete = coverage.status === "complete" || coverage.status === "more";
       const next = complete ? batch.checkpoint ?? previous?.checkpoint ?? null : previous?.checkpoint ?? null;
-      const state: SourceState = { source: batch.source, checkpoint: next, coverage, checked_at: Date.now() };
+      const checkedAt = Date.now();
+      const lastCompletedAt = coverage.status === "complete" ? checkedAt : previous?.last_completed_at;
+      const progress = complete ? batch.progress : previous?.progress;
+      const state: SourceState = { source: batch.source, checkpoint: next, coverage, checked_at: checkedAt,
+        ...(lastCompletedAt === undefined ? {} : { last_completed_at: lastCompletedAt }),
+        ...(progress === undefined ? {} : { progress }) };
       if (previous === undefined) journal.sources.push(state);
       else Object.assign(previous, state);
       return { new_events, checkpoint_advanced: checkpoint(next) !== previousValue };

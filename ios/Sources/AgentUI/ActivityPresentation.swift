@@ -409,7 +409,7 @@ struct ActivityItemView: View {
       Text("Shell").font(.callout.weight(.medium)).foregroundStyle(.primary.opacity(0.65))
       if let command = commandPreview ?? commandInput?.display {
         Text("$ " + command).font(.system(.callout, design: .monospaced))
-          .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true).messageTextSelection()
           .messageTextActions(command)
       } else {
         Text("Command not recorded.").font(.callout).foregroundStyle(.secondary)
@@ -667,7 +667,7 @@ private struct ShellOutput: View {
       Text(text).font(.system(.callout, design: .monospaced)).foregroundStyle(
         .primary.opacity(0.75)
       )
-      .fixedSize(horizontal: true, vertical: true).textSelection(.enabled)
+      .fixedSize(horizontal: true, vertical: true).messageTextSelection()
     }
     .frame(height: CGFloat(visibleLines) * lineHeight + 4)
     .frame(maxWidth: .infinity, alignment: .leading)
@@ -688,7 +688,7 @@ private struct ToolText: View {
         Text(title).font(.caption).foregroundStyle(.secondary)
       }
       ScrollView(.horizontal) {
-        Text(text).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        Text(text).font(.system(.caption, design: .monospaced)).messageTextSelection()
           .fixedSize(horizontal: true, vertical: false)
       }
     }.frame(maxWidth: .infinity, alignment: .leading)

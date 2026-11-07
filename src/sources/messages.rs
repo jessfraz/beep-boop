@@ -14,7 +14,7 @@ use crate::{
     protocol::SourceRef,
     sources::{
         ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        now_seconds, read_command,
+        SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds, read_command,
     },
 };
 
@@ -93,6 +93,30 @@ enum Phase {
         page: u16,
     },
     Settled,
+}
+
+impl Window {
+    fn progress(&self) -> SourceScanProgress {
+        let (phase, completed, total) = match &self.phase {
+            Phase::Chats { chats, .. } => {
+                (SourceScanPhase::Discovering, Some(chats.len() as u64), None)
+            }
+            Phase::Messages { chats, index, .. } => (
+                SourceScanPhase::Reading,
+                Some(*index as u64),
+                Some(chats.len() as u64),
+            ),
+            Phase::Settled => (SourceScanPhase::Reading, None, None),
+        };
+        SourceScanProgress {
+            window_start: self.since,
+            window_end: self.until,
+            phase,
+            unit: SourceScanUnit::Chats,
+            completed,
+            total,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -434,6 +458,7 @@ impl MessagesSource {
                     page: 1,
                 };
                 Ok(SourceBatch {
+                    progress: Some(window.progress()),
                     source: self.key(),
                     events: Vec::new(),
                     checkpoint: Some(SourceCheckpoint {
@@ -580,6 +605,7 @@ impl MessagesSource {
             })
         };
         Ok(SourceBatch {
+            progress: (!partial).then(|| window.progress()),
             source: self.key(),
             events,
             checkpoint,
@@ -793,6 +819,12 @@ mod tests {
         let read = source
             .window(discovered.checkpoint.as_ref(), NOW + 600)
             .unwrap();
+        let progress = discovered.progress.as_ref().unwrap();
+        assert_eq!((progress.completed, progress.total), (Some(0), Some(1)));
+        assert_eq!(
+            (progress.window_start, progress.window_end),
+            (NOW - 7 * 86_400, NOW + 1)
+        );
         let argv = source.argv(&read).unwrap();
         assert!(argv.iter().any(|argument| argument.starts_with("--until=")));
         assert_eq!(argv.last().unwrap(), "chat-example");

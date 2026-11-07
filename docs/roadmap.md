@@ -53,7 +53,7 @@ recovery; [history](history.md) describes import and retrieval.
   retained the task, conversation and allocation; `/worktrees` displayed real
   inventory with ready, held and removed states.
 - [ ] Release the qualified native copy, selection, clipboard-image and input
-  updates through protected CI and a matching coordinator deployment. Verify
+  updates through CI and a matching coordinator deployment. Verify
   the signed TestFlight build's source; local simulator checks alone do not
   establish delivery.
 - [x] Show native input and scheduled-notice provenance and main-conversation
@@ -114,6 +114,9 @@ recovery; [history](history.md) describes import and retrieval.
   manual runs, preserving each admitted run's prompt, model and identity.
 - [x] Release CLI account diagnostics and scheduled-run timing, outcome and
   exact reply inspection. Keep unavailable historical timing explicit.
+- [ ] Release native scheduled-job diagnostics, retained-run recovery and
+  read-only navigation into live job and sub-agent conversations. Verify source
+  scan completion and progress remain distinct from routine refreshes.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
 

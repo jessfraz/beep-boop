@@ -112,6 +112,7 @@ async fn real_source_pages_cross_the_transport_individually_and_retain_account_c
     let mut cursor = None;
     let mut total_bytes = 0;
     let mut pages = 0;
+    let mut seen = std::collections::BTreeSet::new();
     loop {
         let response = background::execute(BackgroundRequest::PollSources {
             sources: config.clone(),
@@ -135,22 +136,20 @@ async fn real_source_pages_cross_the_transport_individually_and_retain_account_c
         };
         assert_eq!(reads.len(), 1);
         let read = reads.into_iter().next().unwrap();
-        let page = pages % 3;
-        assert_eq!(read.batch.source.account, accounts[pages / 3]);
+        assert_eq!(
+            read.batch.source.account,
+            accounts[if pages < 8 {
+                pages / 4
+            } else {
+                (pages - 8) / 2
+            }]
+        );
         assert_eq!(read.batch.events.len(), 1);
         assert_eq!(read.batch.events[0].text.len(), 1_500_000);
-        assert_eq!(
-            read.batch.events[0].id,
-            format!("CEXAMPLE:1700000000.{page:06}")
-        );
-        assert_eq!(
-            read.batch.coverage,
-            if page == 2 {
-                SourceCoverage::Complete
-            } else {
-                SourceCoverage::More
-            }
-        );
+        seen.insert((
+            read.batch.source.account.clone(),
+            read.batch.events[0].id.clone(),
+        ));
         let previous = states
             .iter_mut()
             .find(|state| state.source == read.batch.source);
@@ -160,6 +159,8 @@ async fn real_source_pages_cross_the_transport_individually_and_retain_account_c
         );
         assert!(read.batch.checkpoint.is_some());
         let admitted = SourceState {
+            last_completed_at: None,
+            progress: read.batch.progress,
             source: read.batch.source,
             checkpoint: read.batch.checkpoint,
             coverage: read.batch.coverage,
@@ -171,15 +172,28 @@ async fn real_source_pages_cross_the_transport_individually_and_retain_account_c
         }
         pages += 1;
         cursor = next;
-        if cursor.is_none() {
+        if cursor.is_none()
+            && states.len() == 2
+            && states
+                .iter()
+                .all(|state| state.coverage == SourceCoverage::Complete)
+        {
             break;
         }
         assert!(
-            pages < 6,
+            pages < 12,
             "The source cursor did not finish the account scan"
         );
     }
-    assert_eq!(pages, 6);
+    assert_eq!(
+        pages, 12,
+        "Recent observations alternate with all three retained backfill pages, without starving the second account"
+    );
+    for account in accounts {
+        for page in 0..3 {
+            assert!(seen.contains(&(account.to_owned(), format!("CEXAMPLE:1700000000.{page:06}"))));
+        }
+    }
     assert!(total_bytes > MAX_FRAME_BYTES);
     assert_eq!(states.len(), 2);
     assert!(
@@ -201,10 +215,16 @@ async fn normalization_that_exceeds_the_page_budget_preserves_the_supplied_check
     let source = SlackSource::new(command.clone(), account.clone()).unwrap();
     let first = source.poll(None).await.unwrap();
     assert_eq!(first.coverage, SourceCoverage::More);
-    let checkpoint = first.checkpoint.unwrap();
+    let backfill = source.poll(first.checkpoint.as_ref()).await.unwrap();
+    let recent = source.poll(backfill.checkpoint.as_ref()).await.unwrap();
+    let checkpoint = recent.checkpoint.unwrap();
     let normalized = source.poll(Some(&checkpoint)).await.unwrap();
-    assert_eq!(normalized.coverage, SourceCoverage::Complete);
-    assert!(serde_json::to_vec(&normalized).unwrap().len() > MAX_FRAME_BYTES / 2);
+    assert!(matches!(
+        normalized.coverage,
+        SourceCoverage::Unavailable { .. }
+    ));
+    assert!(normalized.checkpoint.is_none());
+    assert!(serde_json::to_vec(&normalized).unwrap().len() <= MAX_FRAME_BYTES / 2);
     let response = background::execute(BackgroundRequest::PollSources {
         sources: vec![SourceConfig::Slack {
             enabled: true,
@@ -212,6 +232,8 @@ async fn normalization_that_exceeds_the_page_budget_preserves_the_supplied_check
             account,
         }],
         states: vec![SourceState {
+            last_completed_at: None,
+            progress: None,
             source: source.key(),
             checkpoint: Some(checkpoint.clone()),
             coverage: SourceCoverage::More,
@@ -235,7 +257,7 @@ async fn normalization_that_exceeds_the_page_budget_preserves_the_supplied_check
     assert_eq!(read.expected_checkpoint, Some(checkpoint));
     assert!(matches!(
         read.batch.coverage,
-        SourceCoverage::Partial { .. }
+        SourceCoverage::Unavailable { .. }
     ));
     assert!(read.batch.events.is_empty());
     assert!(read.batch.checkpoint.is_none());
@@ -252,7 +274,7 @@ async fn local_helper_can_run_while_its_script_is_open_for_writing() {
         .unwrap();
     let source = SlackSource::new(command, "workspace-fixture".into()).unwrap();
     let batch = source.poll(None).await.unwrap();
-    assert_eq!(batch.coverage, SourceCoverage::Complete);
+    assert_eq!(batch.coverage, SourceCoverage::More);
     assert_eq!(batch.events.len(), 1);
     assert_eq!(batch.events[0].text.len(), 32);
 }
