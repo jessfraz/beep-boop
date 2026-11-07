@@ -138,9 +138,11 @@ test("native job and saved-work inspection uses the production coordinator witho
     if (process.platform === "darwin") {
       const project = fileURLToPath(new URL("../../../ios", import.meta.url));
       const scratch = process.env.AGENT_NATIVE_SWIFT_SCRATCH ?? fileURLToPath(new URL("../../../target/native-work-integration", import.meta.url));
-      const swift = spawn("/usr/bin/xcrun", ["swift", "test", "--package-path", project, "--scratch-path",
+      // Apple's Swift toolchain must use its own SDK, without Nix's overrides.
+      const swift = spawn("/usr/bin/xcrun", ["--sdk", "macosx", "swift", "test", "--package-path", project, "--scratch-path",
         scratch, "--filter", "nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork"], {
-        signal: t.signal, env: { ...process.env, AGENT_WORK_E2E_SOCKET: socket, AGENT_WORK_E2E_DIRECTORY: directory, AGENT_WORK_E2E_JOB: jobID,
+        signal: t.signal, env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: directory, TMPDIR: directory,
+          AGENT_WORK_E2E_SOCKET: socket, AGENT_WORK_E2E_DIRECTORY: directory, AGENT_WORK_E2E_JOB: jobID,
           AGENT_WORK_E2E_PARENT: parentID, AGENT_WORK_E2E_CHILD: childID }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = ""; swift.stdout.setEncoding("utf8").on("data", (value: string) => { output += value; });

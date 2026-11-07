@@ -52,16 +52,15 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Verify chat reuse and native worktree inventory display live. Reopening
   retained the task, conversation and allocation; `/worktrees` displayed real
   inventory with ready, held and removed states.
-- [ ] Release the qualified native copy, selection, clipboard-image and input
-  updates through CI and a matching coordinator deployment. Verify
-  the signed TestFlight build's source; local simulator checks alone do not
-  establish delivery.
+- [x] Release the qualified native copy, selection, clipboard-image and input
+  updates. Signed private TestFlight build 106 matches the deployed coordinator's
+  production source; native UI, host and simulator CI checks pass.
 - [x] Show native input and scheduled-notice provenance and main-conversation
   model settings; retain unsent drafts across reopen. Native consumer and UI
   checks pass, including the matched production-coordinator restart check.
-- [ ] Provision and ship an iOS Share target backed by the shared-draft queue.
-  Extension and unsent-draft handoff are locally verified; phone provisioning
-  and signed delivery remain.
+- [x] Provision and ship an iOS Share target backed by the shared-draft queue.
+  Signed private TestFlight build 106 includes matching host and extension App
+  Groups; native UI checks verify the unsent-draft handoff.
 - [x] Verify native rendering against the original visual references.
   Typed action rows and the shared Shell card passed native rendering,
   copy/selection and Light/Dark checks. Unknown shell intent remains explicit.
@@ -114,9 +113,10 @@ recovery; [history](history.md) describes import and retrieval.
   manual runs, preserving each admitted run's prompt, model and identity.
 - [x] Release CLI account diagnostics and scheduled-run timing, outcome and
   exact reply inspection. Keep unavailable historical timing explicit.
-- [ ] Release native scheduled-job diagnostics, retained-run recovery and
-  read-only navigation into live job and sub-agent conversations. Verify source
-  scan completion and progress remain distinct from routine refreshes.
+- [x] Release native scheduled-job diagnostics, retained-run recovery and
+  read-only navigation into live job and sub-agent conversations. Signed build
+  106 and the deployed coordinator share these contracts. Live retry preserved
+  the parked task, and source readback separates progress from completed scans.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
 
