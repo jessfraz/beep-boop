@@ -273,7 +273,8 @@ impl Fixture {
             .unwrap();
         let mut server = Server(Some(child));
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !self.state.join("agent.sock").exists() {
+        // The pathname can appear before listen(2) accepts connections.
+        while UnixStream::connect(self.state.join("agent.sock")).is_err() {
             assert!(
                 server.0.as_mut().unwrap().try_wait().unwrap().is_none(),
                 "Fixture coordinator exited before binding: {}",
@@ -283,6 +284,15 @@ impl Fixture {
                 Instant::now() < deadline,
                 "Fixture coordinator did not bind: {}",
                 fs::read_to_string(&stderr).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Binding the socket permits early clients while built-in timers are
+        // still being committed. Count comparisons need that native baseline.
+        while self.status().triggers == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "Fixture coordinator did not initialize its background timers"
             );
             thread::sleep(Duration::from_millis(10));
         }
