@@ -29,6 +29,7 @@ const chrome = process.env.AGENT_TEST_CHROME;
 const extensionDirectory = process.env.AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR;
 const extensionId = "mmlmfjhmonkocbjadbfplnigmagldckm";
 const skipChrome = (chrome === undefined || extensionDirectory === undefined) && process.env.CI !== "true";
+const nativeOperationTimeout = 45_000;
 
 async function within<T>(operation: Promise<T>, milliseconds: number, message: string): Promise<T> {
   const timer = new AbortController();
@@ -78,7 +79,7 @@ class NativeBrowserBroker {
     assert.equal(this.pending.has(request.operation_id), false);
     const reply = new Promise<BrowserReply>((resolve, reject) => this.pending.set(request.operation_id, { resolve, reject }));
     this.child.stdin.write(JSON.stringify(request) + "\n");
-    try { return await within(reply, 45_000, "Native browser broker did not confirm the operation"); }
+    try { return await within(reply, nativeOperationTimeout, "Native browser broker did not confirm the operation"); }
     finally { this.pending.delete(request.operation_id); }
   }
   async close(): Promise<void> {
@@ -239,10 +240,16 @@ async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignF
   let delayed: ServerResponse | undefined;
   let validation: ServerResponse | undefined;
   let validationFinished = false;
+  let nativeInput: ServerResponse | undefined;
+  let nativeInputResolve = () => {};
+  const nativeInputHeld = new Promise<void>(resolve => { nativeInputResolve = resolve; });
   let submittedResolve = () => {};
   const submitted = new Promise<void>(resolve => { submittedResolve = resolve; });
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://fixture.invalid");
+    if (url.pathname === "/native-input") {
+      nativeInput = response; nativeInputResolve(); return;
+    }
     if (url.pathname === "/validate") {
       // Alpha's native Save waits for server validation while Beta can submit.
       if (url.searchParams.get("owner") === "alpha" && !validationFinished) validation = response;
@@ -360,6 +367,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
   t.after(async () => {
     const failures: unknown[] = [];
     let stopped = true;
+    nativeInput?.end(); nativeInput = undefined;
     for (const broker of brokers) try { await broker.close(); } catch (error) { failures.push(error); }
     for (const observer of observers) try { await within(observer.close(), 5000, "Public observer disconnect timed out"); } catch (error) { failures.push(error); }
     for (const host of hosts) try { await within(host.close(), 10_000, "Browser host cleanup timed out"); } catch (error) { failures.push(error); }
@@ -450,10 +458,27 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
   return {
     origin, pairingToken: token, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
     finishValidation() { validationFinished = true; validation?.end("valid"); validation = undefined; },
-    async waitForActiveTab(url: string) {
-      await within((async () => {
-        while (await statusEval("(async () => (await chrome.tabs.query({active:true,lastFocusedWindow:true}))[0]?.url ?? null)()") !== url) await setTimeout(10);
-      })(), 5000, "The pending native input must activate its owned tab");
+    nativeInputHeld,
+    finishNativeInput() { nativeInput?.end("ready"); nativeInput = undefined; },
+    async waitForActiveTab(url: string, pending: Promise<unknown>) {
+      const controller = new AbortController();
+      let observed: string | null = null;
+      try {
+        await within(Promise.race([(async () => {
+          for (;;) {
+            controller.signal.throwIfAborted();
+            const active = await statusEval("(async () => (await chrome.tabs.query({active:true,lastFocusedWindow:true}))[0]?.url ?? null)()");
+            assert.ok(active === null || typeof active === "string"); observed = active;
+            if (active === url) return;
+            await setTimeout(10, undefined, { signal: controller.signal });
+          }
+        })(), pending.then(() => { throw new Error("The held native input completed before its tab activated"); })]),
+        nativeOperationTimeout, "The pending native input must activate its owned tab");
+      } catch (error) {
+        const active = observed === null ? null : new URL(observed);
+        throw new Error(`Native activation failed; last active path ${active?.pathname ?? "none"}, owner ${active?.searchParams.get("owner") ?? "none"}`,
+          { cause: error });
+      } finally { controller.abort(); }
     },
     async nativeBroker() {
       const executable = process.env.AGENT_TEST_BROWSER_BROKER ?? fileURLToPath(new URL("../../../target/debug/examples/browser_fixture", import.meta.url));
@@ -751,16 +776,25 @@ test("concurrent browser connections keep form input, tab ownership and cleanup 
   };
   const alpha = selected[0], beta = selected[1]; assert.ok(alpha && beta);
   await f.client.activate(`${f.origin}/unrelated`);
+  // A real operation from Beta holds the native-input lease before Alpha's
+  // click arrives. Queueing may exceed five seconds without losing ownership.
+  const held = beta.host.execute(beta.request({ type: "run_code", tab_id: beta.tab.id,
+    code: "async page => { await fetch(new URL('/native-input', page.url())); }" })).then(reply => {
+    assert.ok(reply.response.type === "ready", JSON.stringify(reply.response)); assert.equal(reply.response.is_error, false);
+  });
+  void held.catch(() => {});
+  await within(Promise.race([f.nativeInputHeld, held]), nativeOperationTimeout, "The real native-input operation must reach its held HTTP response");
+  const inputReleased = setTimeout(6000).then(() => f.finishNativeInput());
   const alphaSave = save(alpha); void alphaSave.catch(() => {});
   let saved: typeof selected;
   try {
     // Alpha is awaiting a real server response when Beta's simultaneous native
     // click arrives. The calls overlap; only the host may serialize their input.
-    await f.waitForActiveTab(alpha.tab.url);
+    await f.waitForActiveTab(alpha.tab.url, alphaSave);
     const both = Promise.all([alphaSave, save(beta)]); void both.catch(() => {});
     await setTimeout(1000); f.finishValidation();
     saved = await both;
-  } finally { f.finishValidation(); }
+  } finally { f.finishNativeInput(); f.finishValidation(); await held; await inputReleased; }
   assert.equal(f.count(), 2);
   const submitted = new Map(f.submittedForms().map(form => [form.path, new URLSearchParams(form.body)]));
   assert.equal(submitted.size, 2);
