@@ -458,9 +458,11 @@ settles after the linked recovery inputs finish and execution is idle, even
 while the task waits for external work.
 
 Explicit job recovery uses Pi's retry operation on the existing parked native
-task. It does not create another occurrence or change a timer. Native job and
-conversation inspection use the same runtime records and history projection as
-the CLI; inspection detaches without aborting the worker.
+timer, background task or current root model generation. Model recovery requires
+the owning worker's configured execution context; another actor or generation
+cannot grant a retry. Recovery preserves admitted occurrences, queued inputs and
+timers. Native job and conversation inspection use the same runtime records
+and history projection as the CLI; inspection detaches without aborting work.
 
 ### Cross-host recovery
 

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineEntry, defineTask, ROOT_CONVERSATION_ID, type Harness, type Registry,
-  type HarnessInspection, type NextTaskState, type Task, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+import { defineDoc, defineEntry, defineTask, LiveDoc, ROOT_CONVERSATION_ID, type Harness, type Registry,
+  type HarnessInspection, type NextTaskState, type Task, type TaskId as NativeTaskId, type TaskInspection, type Tx } from "@earendil-works/pi-durable";
 import type { BackgroundCadence } from "./generated/BackgroundCadence.js";
 import type { BackgroundCheckpoint } from "./generated/BackgroundCheckpoint.js";
 import type { BackgroundSettings } from "./generated/BackgroundSettings.js";
@@ -409,13 +409,52 @@ export class BackgroundScheduler {
     }) };
     });
   }
+  /** The current root generation must own, or block, this lane's admitted
+   * input. A saved actor alone does not authorize retrying other work. */
+  private async actorGeneration(id: string, lane: Lane | undefined, inspection: HarnessInspection): Promise<{ generation: TaskInspection; schedule_id: string; actor_id: string } | undefined> {
+    if (lane?.active === null || lane?.active === undefined) return;
+    const input = inspection.tasks.find(task => task.record.id === lane.active && task.record.kind === "agent.background")?.record.input;
+    if (input === null || typeof input !== "object" || Array.isArray(input) || input.type !== "work") return;
+    const key = input.key, work = input.work;
+    if (key === null || typeof key !== "object" || Array.isArray(key) || key.type !== "job" || key.job_id !== id || typeof key.schedule_id !== "string" ||
+      work === null || typeof work !== "object" || Array.isArray(work) || (work.type !== "job" && work.type !== "manual_job")) return;
+    const occurrence = work.occurrence;
+    if (occurrence === null || typeof occurrence !== "object" || Array.isArray(occurrence) || typeof occurrence.id !== "string") return;
+    const requestId = occurrence.id;
+    const actorId = (lane.last_run?.task === lane.active ? lane.last_run.actor_task_id : undefined) ?? lane.actor_task_id;
+    if (actorId === null || actorId === undefined) return;
+    const conversationId = await this.session.commit(async tx => {
+      const actor = await this.tasks.findIn(tx, actorId);
+      return actor?.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === id)
+        ? actor.conversation_id : undefined;
+    }, BACKGROUND_CONTEXT);
+    if (conversationId === undefined) return;
+    const conversation = await this.tasks.conversation(conversationId);
+    const run = (await this.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run;
+    if (run === undefined) return;
+    const current = await this.session.commit(async tx => {
+      const submission = await tx.submissionByRequest(conversation.id, requestId);
+      return submission?.type === "input" && (submission.status === "queued" ||
+        submission.status === "placed" && run.inputs.includes(submission.id)) ? run.taskId : undefined;
+    }, BACKGROUND_CONTEXT);
+    const generation = inspection.tasks.find(task => task.record.id === current && task.record.conversationId === conversation.id &&
+      task.record.kind === "pi.generation" && task.record.owner === undefined && !task.record.background);
+    return generation === undefined ? undefined : { generation, schedule_id: key.schedule_id, actor_id: actorId };
+  }
   async getJob(id: string): Promise<ScheduledJobStatus> {
     const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
-    const job = (await this.listJobs(inspection)).find((item) => item.job.id === id);
+    let job = (await this.listJobs(inspection)).find((item) => item.job.id === id);
     if (job === undefined) throw new Error("Unknown scheduled job");
     const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
     const lane = state?.lanes.find((item) => item.id === JSON.stringify(["job", id]));
     const reference = lane?.last_run;
+    const actorWork = await this.actorGeneration(id, lane, inspection);
+    const blocked = actorWork?.generation.state.kind === "blocked" ? actorWork.generation.state.reason : undefined;
+    if (blocked !== undefined) {
+      const message = blocked === "restart_limit" ? "Job model generation is parked after repeated interrupted restarts; retry the interrupted run"
+        : `Job model generation is blocked by its native task definition (${blocked})`;
+      job = { ...job, schedules: job.schedules.map(schedule => schedule.schedule_id === actorWork?.schedule_id ? { ...schedule, error: message } : schedule) };
+    }
     // Older state has no reference; never invent execution times from an
     // admission timestamp or present another occurrence's summary as its output.
     if (reference === undefined) return job;
@@ -424,7 +463,8 @@ export class BackgroundScheduler {
     if (record === undefined) return job;
     const trigger = state?.triggers.find((item) => item.key.type === "job" && item.key.job_id === id && item.key.schedule_id === reference.schedule_id);
     let execution: JobExecutionState;
-    if (live?.state.kind === "blocked") execution = { status: "blocked", message: live.state.reason };
+    if (blocked !== undefined && lane?.active === reference.task) execution = { status: "blocked", message: blocked };
+    else if (live?.state.kind === "blocked") execution = { status: "blocked", message: live.state.reason };
     else if (live?.state.kind === "ready" || record.state.status === "pending") execution = { status: "queued" };
     else switch (record.state.status) {
       case "running": execution = { status: "running" }; break;
@@ -462,8 +502,8 @@ export class BackgroundScheduler {
       output_truncated: characters.length > 16000 };
     return { ...job, last_run };
   }
-  /** Retry only this applied job's interrupted native timer/work. Pi retains
-   * its existing occurrence, checkpoint and durable request identity. */
+  /** Retry only this applied job's interrupted native timer/work or current
+   * root model generation, retaining the occurrence, checkpoint and input. */
   async retryJob(id: string): Promise<ScheduledJobStatus> {
     const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
     if (!state?.jobs.some(job => job.id === id)) throw new TaskError("Unknown scheduled job");
@@ -471,11 +511,16 @@ export class BackgroundScheduler {
     for (const trigger of state.triggers) {
       if (trigger.enabled && trigger.key.type === "job" && trigger.key.job_id === id && trigger.task !== null) candidates.add(trigger.task);
     }
-    const active = state.lanes.find(lane => lane.id === JSON.stringify(["job", id]))?.active;
+    const lane = state.lanes.find(lane => lane.id === JSON.stringify(["job", id])), active = lane?.active;
     if (active !== null && active !== undefined) candidates.add(active);
     const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
     const parked = inspection.tasks.filter(task => candidates.has(task.record.id) && task.record.kind === "agent.background" &&
       task.state.kind === "blocked" && task.state.reason === "restart_limit");
+    const actorWork = await this.actorGeneration(id, lane, inspection);
+    if (actorWork?.generation.state.kind === "blocked" && actorWork.generation.state.reason === "restart_limit") {
+      if (this.tasks.hasExecutionOwner(actorWork.actor_id, actorWork.generation.record.conversationId)) parked.push(actorWork.generation);
+      else if (parked.length === 0) throw new TaskError("The job's existing worker must attach before its model generation can be retried");
+    }
     if (parked.length === 0) throw new TaskError("This job has no parked interrupted run or timer to retry");
     for (const task of parked) await this.session.retryTask(task.record.id, BACKGROUND_CONTEXT);
     return this.getJob(id);

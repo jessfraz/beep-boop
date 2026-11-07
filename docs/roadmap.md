@@ -35,6 +35,8 @@ recovery; [history](history.md) describes import and retrieval.
   passed live checks, preserving active and dirty work.
 - [x] Verify failed scheduled occurrences settle after recovery on their
   existing tasks, clearing scheduler errors while preserving unresolved work.
+- [ ] Verify parked scheduled model generations recover live on the existing
+  actor, preserving queued occurrences and native submission identities.
 - [x] Verify current source events reach triage beside historical backlogs.
   Deployed per-account old/new selection and separate polling/triage lanes
   passed live checks with older mail pending. Interrupted source claims

@@ -302,6 +302,13 @@ export class TaskStore {
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
   isRunning(id: string): boolean { return [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }
+  /** A root worker becomes busy after guidance and its execution binding are
+   * ready. A saved allocation or a running child cannot own a model retry. */
+  hasExecutionOwner(id: string, conversationId: ConversationId): boolean {
+    const active = this.running.get(id);
+    return active?.attached === true && active.busy && !active.fenced && active.observer?.signal.aborted !== true &&
+      active.conversation?.id === conversationId;
+  }
   private busy(id: string, agentId?: string): boolean { const run = this.running.get(this.actorKey(id, agentId)); return run !== undefined && (run.busy || run.admissions > 0); }
   private actorKey(id: string, agentId?: string): string { return agentId === undefined ? id : id + ":" + agentId; }
   private assertSource(conversationId: string): void {
