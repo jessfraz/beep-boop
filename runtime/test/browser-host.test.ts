@@ -227,7 +227,7 @@ async function closeChrome(browser: ChildProcess, exited: Promise<void>, client:
   if (!await stopped()) throw new Error("Disposable Chrome process group or stdio did not stop during fixture cleanup", { cause: protocolError });
 }
 
-async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignFrame?: boolean } = {}) {
+async function fixture(t: TestContext, options: { slowSubmit?: boolean; slowPopup?: boolean; foreignFrame?: boolean } = {}) {
   assert.ok(chrome && existsSync(chrome), "AGENT_TEST_CHROME must name a disposable-test-capable Chrome binary");
   assert.ok(extensionDirectory && existsSync(extensionDirectory), "AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR must name the extracted official extension");
   const manifest: unknown = JSON.parse(await readFile(join(extensionDirectory, "manifest.json"), "utf8"));
@@ -238,6 +238,10 @@ async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignF
   let submissions = 0;
   const submittedForms: { path: string; body: string }[] = [];
   let delayed: ServerResponse | undefined;
+  let popup: ServerResponse | undefined;
+  let popupResolve = () => {};
+  const popupHeld = new Promise<void>(resolve => { popupResolve = resolve; });
+  const finishPopup = () => { popup?.end("<!doctype html><title>Owned popup</title><h1>Popup ready</h1>"); popup = undefined; };
   let validation: ServerResponse | undefined;
   let validationFinished = false;
   let nativeInput: ServerResponse | undefined;
@@ -280,7 +284,10 @@ async function fixture(t: TestContext, options: { slowSubmit?: boolean; foreignF
       <button type="button" onclick="alert('Fixture dialog')">Open dialog</button>
       <button type="button" onclick="alert('First sequential dialog'); alert('Second sequential dialog')">Open two dialogs</button><button type="submit">Save</button></form>`);
     else if (url.pathname === "/done") response.end("<!doctype html><title>Saved form</title><h1>Saved</h1>");
-    else if (request.url === "/popup") response.end("<!doctype html><title>Owned popup</title><h1>Popup ready</h1>");
+    else if (request.url === "/popup") {
+      popup = response; popupResolve();
+      if (!options.slowPopup) finishPopup();
+    }
     else if (url.pathname === "/embedded") response.end("<!doctype html><label>Frame note<input name=note></label>");
     else if (url.pathname === "/password") response.end("<!doctype html><title>Owned password form</title><form>"
       + '<label>Normal field<input name=normal value="Visible normal field"></label><label>Password<input name=password type=password></label>'
@@ -368,6 +375,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     const failures: unknown[] = [];
     let stopped = true;
     nativeInput?.end(); nativeInput = undefined;
+    finishPopup();
     for (const broker of brokers) try { await broker.close(); } catch (error) { failures.push(error); }
     for (const observer of observers) try { await within(observer.close(), 5000, "Public observer disconnect timed out"); } catch (error) { failures.push(error); }
     for (const host of hosts) try { await within(host.close(), 10_000, "Browser host cleanup timed out"); } catch (error) { failures.push(error); }
@@ -457,6 +465,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
   };
   return {
     origin, pairingToken: token, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
+    popupHeld, finishPopup,
     finishValidation() { validationFinished = true; validation?.end("valid"); validation = undefined; },
     nativeInputHeld,
     finishNativeInput() { nativeInput?.end("ready"); nativeInput = undefined; },
@@ -625,7 +634,7 @@ test("public runBeforeUnload close acknowledges a pending dialog without claimin
 });
 
 test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated pages and deduplicates mutations", { skip: skipChrome, timeout: 120_000 }, async t => {
-  const f = await fixture(t), host = f.host, request = requests();
+  const f = await fixture(t, { slowPopup: true }), host = f.host, request = requests();
   const opened = (await host.execute(request({ type: "open", url: `${f.origin}/form` }))).response;
   assert.ok(opened.type === "ready", JSON.stringify(opened)); assert.equal(opened.is_error, false);
   assert.equal(opened.tabs.length, 1); const tab = opened.tabs[0]; assert.ok(tab);
@@ -648,7 +657,25 @@ test("real Chrome adapter owns exact tabs and scoped popups, preserves unrelated
   const popupRequest = request({ type: "click", tab_id: tab.id, element_ref: elementRef(waited.output, "button", "Open popup") });
   const popupPending = host.execute(popupRequest);
   await f.client.call("Target.createTarget", { url: `${f.origin}/user-concurrent`, background: true });
-  const popup = (await popupPending).response;
+  // Playwright emits popup after its initial response starts loading, which
+  // can follow the click receipt. Hold that response to exercise the race.
+  await within(f.popupHeld, 5000, "The owned click must request its popup");
+  const clicked = (await popupPending).response;
+  assert.ok(clicked.type === "ready", JSON.stringify(clicked)); assert.equal(clicked.is_error, false);
+  assert.equal(clicked.tabs.length, 1);
+  assert.equal(JSON.stringify(clicked).includes("user-concurrent"), false);
+  f.finishPopup();
+  // Read fresh state until adoption completes, without replaying the click.
+  const popup = await (async () => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const response: BrowserResponse = (await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response;
+      assert.ok(response.type === "ready", JSON.stringify(response)); assert.equal(response.is_error, false);
+      assert.equal(JSON.stringify(response).includes("user-concurrent"), false);
+      if (response.tabs.some(page => page.url === `${f.origin}/popup`)) return response;
+      await setTimeout(25);
+    }
+    throw new Error("The owned opener's popup must be adopted after its response starts loading");
+  })();
   assert.ok(popup.type === "ready", JSON.stringify(popup)); assert.equal(popup.is_error, false);
   assert.equal(popup.tabs.length, 2); assert.ok(popup.tabs.some(page => page.url === `${f.origin}/popup`));
   assert.equal(JSON.stringify(popup).includes("user-concurrent"), false);
