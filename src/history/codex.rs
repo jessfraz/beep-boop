@@ -1,5 +1,7 @@
 //! Read-only Codex app-server integration. Native IDs identify threads/items;
-//! source files and the Codex state database are never parsed here.
+//! native APIs own payload decoding; projection metadata supplies catch-up IDs.
+
+mod projection;
 
 use std::{
     collections::HashMap,
@@ -159,9 +161,20 @@ impl CodexHistory {
                     metadata.thread.id == thread_id,
                     "Codex returned another thread"
                 );
+                let version = metadata.thread.metadata(false)?.version;
+                let projection = match self.start_projection(&metadata.thread).await {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error)
+                        if error.is::<ProjectionStale>()
+                            || error.is::<projection::SourceChanged>() =>
+                    {
+                        return Ok(projection_gap(thread_id, version, error));
+                    }
+                    Err(_) => None,
+                };
                 ReadCursor {
                     thread_id: thread_id.clone(),
-                    version: metadata.thread.metadata(false)?.version,
+                    version,
                     mode: if metadata.thread.history_mode == "paginated" {
                         Mode::Items
                     } else {
@@ -172,6 +185,7 @@ impl CodexHistory {
                     order: 0,
                     page_hash: None,
                     incomplete: false,
+                    projection,
                 }
             }
         };
@@ -181,6 +195,34 @@ impl CodexHistory {
             position.thread_id == thread_id,
             "Codex history cursor belongs to another thread"
         );
+        if position
+            .projection
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.refresh)
+            && let Err(error) = self.refresh_projection(&thread_id, &mut position).await
+        {
+            if error.is::<ProjectionChanged>() {
+                // A replacement native store also invalidates the child
+                // process's open database handles before a full reread.
+                *self.connection.lock().await = None;
+            }
+            return Ok(projection_gap(thread_id, position.version, error));
+        }
+        if position
+            .projection
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.tail)
+        {
+            return match self.delta(&thread_id, position).await {
+                Ok(page) => Ok(page),
+                Err(error) => {
+                    if error.is::<ProjectionChanged>() {
+                        *self.connection.lock().await = None;
+                    }
+                    Ok(projection_gap(thread_id, String::new(), error))
+                }
+            };
+        }
         let native = loop {
             match self.page(&thread_id, &position).await {
                 Ok(page) => break page,
@@ -276,6 +318,19 @@ impl CodexHistory {
             None
         };
         let complete = next_cursor.is_none() && !position.incomplete;
+        let resume_cursor = if let Some(checkpoint) = position.projection.as_mut() {
+            if next_cursor.is_none() {
+                if let Err(error) = self.verify_prefix(&thread_id, &checkpoint.prefix).await {
+                    return Ok(projection_gap(thread_id, position.version, error));
+                }
+                checkpoint.tail = true;
+                checkpoint.position = None;
+            }
+            checkpoint.refresh = true;
+            Some(serde_json::to_string(&position)?)
+        } else {
+            None
+        };
         bounded(HistoryResponse::Read {
             thread_id,
             // A later listing sees a stronger/newer hint and schedules another
@@ -284,8 +339,261 @@ impl CodexHistory {
             items,
             source_exhausted: next_cursor.is_none(),
             next_cursor,
+            resume_cursor,
             gaps,
             complete,
+        })
+    }
+
+    fn projection_home(&self) -> Result<PathBuf> {
+        let home = self
+            .codex_home
+            .clone()
+            .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+            .context("Codex home is unavailable")?;
+        Ok(std::fs::canonicalize(home)?)
+    }
+
+    async fn verify_prefix(&self, thread: &str, prefix: &projection::Prefix) -> Result<()> {
+        // A caller-supplied cursor never authorizes a filesystem path. Resolve
+        // the current locator through the native owner before hashing bytes.
+        let native: NativeRead = self
+            .rpc(
+                "thread/read",
+                ReadParams {
+                    thread_id: thread,
+                    include_turns: false,
+                },
+            )
+            .await?;
+        ensure!(
+            native.thread.id == thread
+                && native.thread.history_mode == "paginated"
+                && native.thread.forked_from_id.is_none(),
+            "Native lineage changed"
+        );
+        let path = native
+            .thread
+            .path
+            .as_deref()
+            .and_then(locator_fingerprint)
+            .map(|(path, _, _, _)| path)
+            .context("Native source is unavailable")?;
+        prefix.verify(path).await
+    }
+
+    async fn current_projection(&self, thread: &str) -> Result<NativeItems> {
+        // Keep payload reads behind the native API. Projection byte coverage is
+        // checked separately: listing alone does not materialize a stale store.
+        self.rpc(
+            "thread/items/list",
+            ItemsParams {
+                thread_id: thread,
+                cursor: None,
+                limit: 1,
+                sort_direction: "desc",
+            },
+        )
+        .await
+    }
+
+    async fn start_projection(
+        &self,
+        native: &NativeThread,
+    ) -> Result<Option<projection::Checkpoint>> {
+        if native.history_mode != "paginated"
+            || native.forked_from_id.is_some()
+            || native.metadata(false)?.parent_thread_id.is_some()
+        {
+            return Ok(None);
+        }
+        let Some((path, _, _, _)) = native.path.as_deref().and_then(locator_fingerprint) else {
+            return Ok(None);
+        };
+        // Recompression changes physical lineage; let native history handle it.
+        if path.extension().is_some_and(|extension| extension == "zst") {
+            return Ok(None);
+        }
+        let latest = self.current_projection(&native.id).await?;
+        if let Some(entry) = latest.data.first() {
+            let header: ItemHeader = serde_json::from_value(entry.item.clone())?;
+            let _: NativeItems = self
+                .rpc(
+                    "thread/items/read",
+                    ReadItemsParams {
+                        thread_id: &native.id,
+                        turn_id: &entry.turn_id,
+                        item_ids: &[header.id],
+                    },
+                )
+                .await?;
+        }
+        let page = projection::page(self.projection_home()?, &native.id, None).await?;
+        let length = fs::metadata(&path).await?.len();
+        ensure!(page.bytes <= length, projection::SourceChanged);
+        ensure!(page.bytes == length, ProjectionStale);
+        let prefix = projection::Prefix::read(path, page.bytes, None).await?;
+        Ok(Some(projection::Checkpoint {
+            revision: RETENTION_REVISION,
+            store: page.identity,
+            prefix,
+            after: page.maximum,
+            through: page.maximum,
+            position: None,
+            tail: false,
+            refresh: false,
+        }))
+    }
+
+    async fn refresh_projection(&self, thread: &str, position: &mut ReadCursor) -> Result<()> {
+        let checkpoint = position
+            .projection
+            .as_mut()
+            .context("Missing native checkpoint")?;
+        ensure!(checkpoint.revision == RETENTION_REVISION, ProjectionChanged);
+        let native: NativeRead = self
+            .rpc(
+                "thread/read",
+                ReadParams {
+                    thread_id: thread,
+                    include_turns: false,
+                },
+            )
+            .await?;
+        ensure!(
+            native.thread.id == thread
+                && native.thread.history_mode == "paginated"
+                && native.thread.forked_from_id.is_none(),
+            ProjectionChanged
+        );
+        let observed = native.thread.metadata(false)?;
+        ensure!(observed.parent_thread_id.is_none(), ProjectionChanged);
+        self.current_projection(thread).await?;
+        let page = projection::page(self.projection_home()?, thread, None)
+            .await
+            .context(ProjectionChanged)?;
+        ensure!(
+            page.identity == checkpoint.store && page.maximum >= checkpoint.through,
+            ProjectionChanged
+        );
+        let path = native
+            .thread
+            .path
+            .as_deref()
+            .and_then(locator_fingerprint)
+            .map(|(path, _, _, _)| path)
+            .context(ProjectionChanged)?;
+        ensure!(
+            !path.extension().is_some_and(|extension| extension == "zst"),
+            ProjectionChanged
+        );
+        let length = fs::metadata(&path).await?.len();
+        ensure!(page.bytes <= length, projection::SourceChanged);
+        ensure!(page.bytes == length, ProjectionStale);
+        // Verify every old byte before accepting appended completion events for
+        // earlier items. A changed/truncated prefix invalidates the whole walk.
+        let prefix = projection::Prefix::read(path, page.bytes, Some(&checkpoint.prefix)).await?;
+        if checkpoint.tail {
+            checkpoint.through = page.maximum;
+            checkpoint.prefix = prefix;
+            position.version = observed.version;
+            position.incomplete = false;
+        }
+        checkpoint.refresh = false;
+        Ok(())
+    }
+
+    async fn delta(&self, thread: &str, mut position: ReadCursor) -> Result<HistoryResponse> {
+        let checkpoint = position
+            .projection
+            .as_mut()
+            .context("Missing native checkpoint")?;
+        let page = projection::page(self.projection_home()?, thread, Some(checkpoint))
+            .await
+            .context(ProjectionChanged)?;
+        let rows = &page.rows[..page.rows.len().min(25)];
+        let mut turns: HashMap<&str, Vec<String>> = HashMap::new();
+        for row in rows {
+            turns
+                .entry(&row.turn_id)
+                .or_default()
+                .push(row.item_id.clone());
+        }
+        let mut native = HashMap::new();
+        for (turn, ids) in turns {
+            let response: NativeItems = self
+                .rpc(
+                    "thread/items/read",
+                    ReadItemsParams {
+                        thread_id: thread,
+                        turn_id: turn,
+                        item_ids: &ids,
+                    },
+                )
+                .await?;
+            for entry in response.data {
+                let header: ItemHeader = serde_json::from_value(entry.item.clone())?;
+                native.insert((entry.turn_id.clone(), header.id), entry);
+            }
+        }
+        let mut items = Vec::new();
+        let mut gaps = Vec::new();
+        let mut bytes = 2048;
+        let mut consumed = 0;
+        for row in rows {
+            let entry = native
+                .get(&(row.turn_id.clone(), row.item_id.clone()))
+                .context(ProjectionChanged)?;
+            let (item, mut missing) = self.normalize(thread, entry, row.order).await?;
+            let length = item
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()?
+                .map_or(0, |value| value.len())
+                + serde_json::to_vec(&missing)?.len();
+            if bytes + length > PAGE_BYTES - 8192 && (!items.is_empty() || !gaps.is_empty()) {
+                break;
+            }
+            ensure!(
+                length < PAGE_BYTES - 8192,
+                "Native item exceeded its page budget"
+            );
+            bytes += length;
+            consumed += 1;
+            if let Some(item) = item {
+                items.push(item);
+            }
+            gaps.append(&mut missing);
+            checkpoint.position = Some(projection::Position {
+                ordinal: row.ordinal,
+                item_id: row.item_id.clone(),
+            });
+        }
+        let exhausted = consumed == page.rows.len();
+        let next_cursor = if exhausted {
+            self.verify_prefix(thread, &checkpoint.prefix).await?;
+            checkpoint.after = checkpoint.through;
+            checkpoint.position = None;
+            None
+        } else {
+            Some(serde_json::to_string(&position)?)
+        };
+        let checkpoint = position
+            .projection
+            .as_mut()
+            .context("Missing native checkpoint")?;
+        checkpoint.refresh = true;
+        let resume_cursor = Some(serde_json::to_string(&position)?);
+        bounded(HistoryResponse::Read {
+            thread_id: thread.into(),
+            version: position.version,
+            items,
+            next_cursor,
+            resume_cursor,
+            complete: exhausted && gaps.is_empty(),
+            source_exhausted: exhausted,
+            gaps,
         })
     }
 
@@ -755,6 +1063,8 @@ struct ReadCursor {
     page_hash: Option<String>,
     #[serde(default)]
     incomplete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection: Option<projection::Checkpoint>,
 }
 struct TemporaryAsset(PathBuf);
 impl Drop for TemporaryAsset {
@@ -999,10 +1309,48 @@ fn gap_response(
         version,
         items: vec![],
         next_cursor: None,
+        resume_cursor: None,
         source_exhausted: false,
         gaps: vec![gap(code, None, message)],
         complete: false,
     }
+}
+#[derive(Debug)]
+struct ProjectionChanged;
+impl std::fmt::Display for ProjectionChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Native source or projection changed; reread its history")
+    }
+}
+impl std::error::Error for ProjectionChanged {}
+#[derive(Debug)]
+struct ProjectionStale;
+impl std::fmt::Display for ProjectionStale {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Native history projection is behind its source")
+    }
+}
+impl std::error::Error for ProjectionStale {}
+fn projection_gap(thread: String, version: String, error: anyhow::Error) -> HistoryResponse {
+    let changed = error.is::<ProjectionChanged>();
+    gap_response(
+        thread,
+        version,
+        if changed {
+            HistoryGapCode::Changed
+        } else {
+            HistoryGapCode::Unavailable
+        },
+        if error.is::<projection::SourceChanged>() {
+            "Native source prefix changed; retained history requires source reconciliation"
+        } else if error.is::<ProjectionStale>() {
+            "Native history projection has not reached the source; retry after its writer catches up"
+        } else if changed {
+            "Native source or projection changed; reread its history"
+        } else {
+            "Native history catch-up is temporarily unavailable"
+        },
+    )
 }
 fn remove_encrypted(value: &mut Value) {
     match value {
@@ -1209,6 +1557,13 @@ struct ItemsParams<'a> {
     cursor: Option<&'a str>,
     limit: u32,
     sort_direction: &'static str,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadItemsParams<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    item_ids: &'a [String],
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3547,6 +3902,67 @@ try{
             assert_eq!(metadata.parent_thread_id, None);
             assert_eq!(metadata.forked_from_id.as_deref(), Some("fork-parent"));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Codex and built runtime; only isolated synthetic history and Pi SQLite"]
+    async fn installed_codex_completed_import_catches_appends_and_earlier_updates_incrementally() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = history(directory.path(), "codex".into());
+        source.codex_home = Some(directory.path().to_owned());
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
+        let runtime_root = runtime
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut child = tokio::process::Command::new("node")
+            .args([
+                "--no-warnings",
+                "--input-type=module",
+                "--eval",
+                include_str!("../../tests/fixtures/codex-import-roundtrip.mjs"),
+            ])
+            .arg(&runtime)
+            .arg(directory.path())
+            .arg(uuid::Uuid::new_v4().to_string())
+            .current_dir(runtime_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: HistoryRequest = serde_json::from_str(&line).unwrap();
+                let response = source.request(request).await.unwrap();
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                if input.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                input.flush().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        drop(input);
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "Real native/importer roundtrip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]

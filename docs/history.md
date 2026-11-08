@@ -26,10 +26,21 @@ the classification. Originals stay intact. Reloaded views use the
 classification; already printed terminal scrollback cannot be rewritten.
 
 Run import again to catch up. Completed reliable source versions are skipped;
-partial reads resume their committed cursor. Once a transcript scan reaches its
-end, missing attachments retry only their affected source pages. Changed or
-unreliable sources are scanned again; older partial checkpoints reconcile once
-before using targeted retries. Unchanged transcripts still reconcile corrected
+partial reads resume their committed cursor. Current paginated Codex stores
+retain a host-specific change position after EOF, so later runs transfer only
+new or updated items, including edits to older messages. Native APIs still own
+item payloads; read-only native projection metadata identifies changed IDs and
+their original order. The projection must cover the source before a delta is
+accepted. Each catch-up verifies the entire retained source prefix locally;
+rewrites or truncation leave an explicit gap until the native source is
+reconciled. Unsupported stores, inherited histories and legacy checkpoints use
+the native full-history path. Reader retention upgrades invalidate old change
+positions once. Large threads publish committed page counters at most once per
+second while the thread is still being read.
+
+Once a transcript scan reaches its end, missing attachments retry only their
+affected source pages. Older partial checkpoints reconcile once before using
+targeted retries. Unchanged transcripts still reconcile corrected
 lineage without duplicating messages or regenerating vectors. A reader upgrade
 that retains additional event kinds or media references rescans source history
 once, reusing item identities and cached vectors. Retained text is indexed

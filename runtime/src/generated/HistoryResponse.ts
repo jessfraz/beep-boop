@@ -3,4 +3,8 @@ import type { HistoryGap } from "./HistoryGap.js";
 import type { HistoryItem } from "./HistoryItem.js";
 import type { HistoryThread } from "./HistoryThread.js";
 
-export type HistoryResponse = { "type": "list", threads: Array<HistoryThread>, next_cursor: string | null, } | { "type": "read", thread_id: string, version: string, items: Array<HistoryItem>, next_cursor: string | null, gaps: Array<HistoryGap>, complete: boolean, source_exhausted?: boolean, } | { "type": "asset", path: string, offset: number, data_base64: string, next_offset: number | null, total_bytes: number, sha256: string, };
+export type HistoryResponse = { "type": "list", threads: Array<HistoryThread>, next_cursor: string | null, } | { "type": "read", thread_id: string, version: string, items: Array<HistoryItem>, next_cursor: string | null,
+/**
+ * Durable catch-up position, including EOF, separate from this walk's continuation.
+ */
+resume_cursor?: string, gaps: Array<HistoryGap>, complete: boolean, source_exhausted?: boolean, } | { "type": "asset", path: string, offset: number, data_base64: string, next_offset: number | null, total_bytes: number, sha256: string, };

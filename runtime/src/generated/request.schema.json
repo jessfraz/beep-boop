@@ -1070,6 +1070,13 @@
                 "null"
               ]
             },
+            "resume_cursor": {
+              "description": "Durable catch-up position, including EOF, separate from this walk's continuation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "source_exhausted": {
               "type": "boolean",
               "default": false

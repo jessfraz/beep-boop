@@ -21,6 +21,7 @@ export const ImportedItemEntry = defineEntry<{ source: "codex"; thread_id: strin
 export const ImportedThreadEntry = defineEntry<{ source: "codex"; thread: HistoryThread }>("agent.history.thread");
 type ThreadState = { native_id: ConversationId | null; record: ImportedConversation | null; watermark: EntryId | null; evidence: string | null; snapshot?: SourceSnapshot; capture?: CaptureState };
 export type ImportCheckpoint = { version: string; next_cursor: string | null; complete: boolean; gaps: HistoryGap[]; updated_at: number;
+  resume_cursor?: string | null;
   source_exhausted?: boolean; retry_pages?: HistoryRetryPage[]; snapshot?: SourceSnapshot; capture?: CaptureState };
 const Threads = defineDocFamily<ThreadState, null>({ kind: "agent.history.threads", scope: "session", family: true, version: 1,
   initial: () => ({ native_id: null, record: null, watermark: null, evidence: null }), checkpointWhen: () => true });
@@ -411,6 +412,7 @@ export class HistoryStore {
         if (checkpoint === null || batch.thread.updated_at > checkpoint.updated_at || (batch.thread.updated_at === checkpoint.updated_at && !olderCheckpoint && !unknownCheckpoint)) {
           if (!(batch.thread.version_reliable && checkpoint?.version === batch.thread.version && checkpoint.complete && !batch.complete)) {
             host.checkpoint = { version: batch.thread.version, next_cursor: batch.next_cursor, complete: batch.complete && batch.gaps.length === 0,
+              ...(batch.resume_cursor === undefined ? {} : { resume_cursor: batch.resume_cursor }),
               gaps: batch.complete || batch.retry_pages !== undefined ? structuredClone(batch.gaps) : gaps(checkpoint?.version === batch.thread.version ? checkpoint.gaps : [], batch.gaps), updated_at: batch.thread.updated_at,
               ...(batch.source_exhausted === undefined ? {} : { source_exhausted: batch.source_exhausted }),
               ...(batch.retry_pages === undefined ? {} : { retry_pages: structuredClone(batch.retry_pages) }) };

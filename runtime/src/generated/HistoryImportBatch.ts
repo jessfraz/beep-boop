@@ -4,4 +4,4 @@ import type { HistoryItem } from "./HistoryItem.js";
 import type { HistoryRetryPage } from "./HistoryRetryPage.js";
 import type { HistoryThread } from "./HistoryThread.js";
 
-export type HistoryImportBatch = { host_id: string, thread: HistoryThread, items: Array<HistoryItem>, next_cursor: string | null, gaps: Array<HistoryGap>, complete: boolean, source_exhausted?: boolean, retry_pages?: Array<HistoryRetryPage>, };
+export type HistoryImportBatch = { host_id: string, thread: HistoryThread, items: Array<HistoryItem>, next_cursor: string | null, resume_cursor?: string, gaps: Array<HistoryGap>, complete: boolean, source_exhausted?: boolean, retry_pages?: Array<HistoryRetryPage>, };

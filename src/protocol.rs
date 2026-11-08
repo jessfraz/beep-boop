@@ -1555,6 +1555,9 @@ pub struct HistoryImportBatch {
     pub thread: HistoryThread,
     pub items: Vec<HistoryItem>,
     pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub resume_cursor: Option<String>,
     pub gaps: Vec<HistoryGap>,
     pub complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

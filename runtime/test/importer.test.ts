@@ -70,6 +70,81 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   return { conversation, entries: entries.items.filter(ImportedItemEntry.is), all: entries.items };
 }
 
+test("large thread progress publishes committed page counters before that thread finishes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-live-progress-")), app = await open(directory);
+  const source = thread("large-thread");
+  let release = () => {}, entered = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  let pending: Promise<ImportProgress> | undefined;
+  try {
+    pending = app.importer.run([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type !== "read") throw new Error("No media in this fixture");
+      if (request.cursor === null) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 1_100); });
+        return page(source, [item("first-page")], "second-page");
+      }
+      entered(); await gate;
+      return page(source, [item("second-page")]);
+    }), () => {}, async () => {});
+    await reading;
+    assert.equal((await app.importer.status()).items_added, 1);
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "second-page");
+    assert.equal((await originals(app, source.id)).entries.length, 1);
+    release(); assert.equal((await pending).phase, "complete");
+  } finally { release(); await pending?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("asset-only recovery preserves the durable EOF position for the next changed source", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-tail-assets-")); let app = await open(directory);
+  let source = thread("tail-media"), recovered = false;
+  const missing: HistoryGap = { code: "missing", item_id: "media", message: "Synthetic media is unavailable" };
+  const producer: Producer = (_host, request) => {
+    if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+    if (request.type !== "read") throw new Error("No transferred media in this fixture");
+    if (source.version === "native-v2") {
+      assert.equal(request.cursor, "durable-tail");
+      return { ...page(source, [item("new")]), resume_cursor: "new-durable-tail" };
+    }
+    assert.equal(request.cursor, null, "Retry only the original affected page");
+    return { ...page(source, [item("old"), item("media")]), complete: recovered,
+      gaps: recovered ? [] : [missing], resume_cursor: "durable-tail" };
+  };
+  try {
+    assert.equal((await app.run(producer)).phase, "partial"); recovered = true;
+    assert.equal((await app.run(producer)).phase, "complete");
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.resume_cursor, "durable-tail");
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    source = { ...source, version: "native-v2", updated_at: 3 };
+    const result = await app.run(producer);
+    assert.equal(result.items_added, 1); assert.equal(result.items_unchanged, 0);
+    assert.equal((await originals(app, source.id)).entries.length, 3);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a changed source restarts the full walk even when native page cursors are reused", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-source-reset-")), app = await open(directory);
+  const source = thread("reset-source"), requests: (string | null)[] = []; let invalid = true;
+  try {
+    const result = await app.run((_host, request) => {
+      if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
+      if (request.type !== "read") throw new Error("No media in this fixture");
+      requests.push(request.cursor);
+      if (request.cursor === null) return page(source, [item("first")], "page-two");
+      if (invalid) {
+        invalid = false;
+        return { ...page(source, []), complete: false, source_exhausted: false,
+          gaps: [{ code: "changed", item_id: null, message: "Native source requires a fresh walk" }] };
+      }
+      return page(source, [item("second")]);
+    });
+    assert.equal(result.phase, "complete"); assert.equal(result.items_added, 2);
+    assert.deepEqual(requests, [null, "page-two", null, "page-two"]);
+    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("same-version imports repair native lineage before completed skips and affected-page retries without reindexing", async (t) => {
   for (const complete of [true, false]) await t.test(complete ? "completed checkpoint" : "partial media checkpoint", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-import-lineage-")); let app = await open(directory);

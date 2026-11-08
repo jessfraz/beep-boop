@@ -114,6 +114,10 @@ pub enum HistoryResponse {
         version: String,
         items: Vec<HistoryItem>,
         next_cursor: Option<String>,
+        /// Durable catch-up position, including EOF, separate from this walk's continuation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        resume_cursor: Option<String>,
         gaps: Vec<HistoryGap>,
         complete: bool,
         // The native transcript reached EOF, independent of missing media.

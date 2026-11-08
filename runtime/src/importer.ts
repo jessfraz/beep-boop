@@ -97,6 +97,12 @@ export class CodexImporter {
       if (indexingGap !== undefined) addGap(snapshot, indexingGap);
       return this.publish(snapshot);
     };
+    let nextProgress = performance.now() + 1_000;
+    const checkpoint = async () => {
+      if (performance.now() < nextProgress) return;
+      nextProgress = performance.now() + 1_000;
+      await publish();
+    };
     try {
       for (const node of nodes) {
         progress.host_id = node.host_id;
@@ -111,7 +117,7 @@ export class CodexImporter {
                 const firstThread = progress.phase === "discovering";
                 progress.threads_seen += 1; progress.phase = "importing";
                 if (firstThread) await publish();
-                try { await this.thread(node.host_id, thread, progress, call); }
+                try { await this.thread(node.host_id, thread, progress, call, checkpoint); }
                 catch (error) { addGap(progress, `${node.name}: ${thread.id}: ${message(error)}`); }
                 await publish();
               }
@@ -132,7 +138,8 @@ export class CodexImporter {
     progress.phase = progress.gaps.length === 0 ? "complete" : "partial";
     await this.publish(progress, checkpoint); return progress;
   }
-  private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall): Promise<void> {
+  private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall,
+    checkpoint: () => Promise<void>): Promise<void> {
     const saved = await this.history.checkpoint(thread.id, host);
     if (thread.version_reliable && saved?.version === thread.version) {
       await this.history.reconcileLineage(thread);
@@ -141,9 +148,9 @@ export class CodexImporter {
     let gaps: HistoryGap[] | undefined;
     if (thread.version_reliable && saved?.version === thread.version && saved.source_exhausted && saved.retry_pages !== undefined) {
       const planned = new Set(saved.retry_pages.flatMap((page) => page.gaps.map((gap) => JSON.stringify(gap))));
-      if (saved.gaps.every((gap) => planned.has(JSON.stringify(gap)))) gaps = await this.retry(host, thread, saved.retry_pages, progress, call);
+      if (saved.gaps.every((gap) => planned.has(JSON.stringify(gap)))) gaps = await this.retry(host, thread, saved.retry_pages, progress, call, checkpoint, saved.resume_cursor);
     }
-    gaps ??= await this.scan(host, thread, saved, progress, call);
+    gaps ??= await this.scan(host, thread, saved, progress, call, checkpoint);
     progress.threads_imported += 1;
     for (const gap of gaps) addGap(progress, `${thread.id}: ${gap.message}`, gap.code !== "missing" || gap.item_id === null);
   }
@@ -163,12 +170,13 @@ export class CodexImporter {
     return { items, gaps: unique(gaps) };
   }
   private async scan(host: string, thread: HistoryThread, saved: ImportCheckpoint | undefined,
-    progress: ImportProgress, call: HostCall): Promise<HistoryGap[]> {
+    progress: ImportProgress, call: HostCall, checkpoint: () => Promise<void>): Promise<HistoryGap[]> {
     // Legacy partial checkpoints with gaps have no affected-page receipts.
     // Read them conservatively once; an unreliable locator cannot skip a prefix.
     const resume = thread.version_reliable && saved?.version === thread.version &&
       (saved.retry_pages !== undefined || saved.gaps.length === 0);
-    let cursor = resume ? saved.next_cursor : null;
+    let resumeCursor = thread.version_reliable ? saved?.resume_cursor ?? null : null;
+    let cursor = resumeCursor ?? (resume ? saved.next_cursor : null);
     let gaps: HistoryGap[] = cursor === null ? [] : saved?.gaps ?? [];
     let retries: HistoryRetryPage[] = cursor === null ? [] : structuredClone(saved?.retry_pages ?? []);
     const failed = retries.filter((page) => page.cursor === cursor && page.gaps.some((gap) => !assetGap(gap)));
@@ -178,12 +186,12 @@ export class CodexImporter {
     // Record the current observation before an RPC can fail, so a changed or
     // unreliable locator cannot keep advertising yesterday's complete coverage.
     await this.history.import({ host_id: host, thread, items: [], next_cursor: cursor,
-      gaps, complete: false, source_exhausted: false, retry_pages: retries }, capture);
-    do {
+      ...(resumeCursor === null || resumeCursor === undefined ? {} : { resume_cursor: resumeCursor }), gaps, complete: false, source_exhausted: false, retry_pages: retries }, capture);
+    while (true) {
       const page = await this.read(host, { type: "read", thread_id: thread.id, cursor }, call);
       if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
       if (page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null) && resets++ === 0) {
-        cursor = null; gaps = []; retries = []; thread = { ...thread, version: page.version || thread.version };
+        cursor = null; resumeCursor = null; gaps = []; retries = []; cursors.clear(); thread = { ...thread, version: page.version || thread.version };
         capture = await this.history.capture(host, thread, true) ?? null; continue;
       }
       if (page.version.length > 0) thread = { ...thread, version: page.version };
@@ -192,19 +200,22 @@ export class CodexImporter {
       gaps = unique([...gaps, ...retained.gaps]);
       const exhausted = page.source_exhausted === true || page.complete;
       const readFailed = page.next_cursor === null && !exhausted && page.gaps.some((gap) => gap.item_id === null);
+      if (!readFailed) resumeCursor = page.resume_cursor ?? null;
       const retryGaps = readFailed ? retained.gaps : retained.gaps.filter(assetGap);
       if (retryGaps.length > 0) retries.push({ cursor, gaps: retryGaps });
       const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: readFailed ? cursor : page.next_cursor,
-        gaps, complete: exhausted && gaps.length === 0, source_exhausted: exhausted, retry_pages: retries }, capture);
+        ...(resumeCursor === null || resumeCursor === undefined ? {} : { resume_cursor: resumeCursor }), gaps, complete: exhausted && gaps.length === 0, source_exhausted: exhausted, retry_pages: retries }, capture);
       progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
+      await checkpoint();
       if (readFailed) break;
       cursor = page.next_cursor;
-      if (cursor !== null) { if (cursors.has(cursor)) throw new Error("History reader repeated a cursor"); cursors.add(cursor); }
-    } while (cursor !== null);
+      if (cursor === null) break;
+      if (cursors.has(cursor)) throw new Error("History reader repeated a cursor"); cursors.add(cursor);
+    }
     return gaps;
   }
   private async retry(host: string, thread: HistoryThread, saved: HistoryRetryPage[],
-    progress: ImportProgress, call: HostCall): Promise<HistoryGap[] | undefined> {
+    progress: ImportProgress, call: HostCall, checkpoint: () => Promise<void>, resumeCursor: string | null | undefined): Promise<HistoryGap[] | undefined> {
     let capture = await this.history.capture(host, thread, true) ?? null;
     const retries = structuredClone(saved), cursors = new Set<string>();
     for (let index = 0; index < retries.length;) {
@@ -231,8 +242,9 @@ export class CodexImporter {
       retries.splice(index, 1, ...replacements);
       const gaps = unique(retries.flatMap((page) => page.gaps));
       const receipt = await this.history.import({ host_id: host, thread, items: retained.items, next_cursor: null,
-        gaps, complete: retries.length === 0, source_exhausted: true, retry_pages: retries }, capture);
+        ...(resumeCursor === null || resumeCursor === undefined ? {} : { resume_cursor: resumeCursor }), gaps, complete: retries.length === 0, source_exhausted: true, retry_pages: retries }, capture);
       progress.items_added += receipt.added_items; progress.items_unchanged += receipt.existing_items;
+      await checkpoint();
       // Failed items wait for a later import. Follow only a new continuation
       // needed to locate this page's other affected IDs.
       if (remaining.length > 0 && page.next_cursor !== null) {
