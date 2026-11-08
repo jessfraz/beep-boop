@@ -21,7 +21,7 @@ final class RowModel: Identifiable {
 @MainActor @Observable
 final class ChatModel {
   private enum Admission {
-    case pending(text: String, revision: Int)
+    case pending(text: String)
     case saved
   }
 
@@ -47,14 +47,8 @@ final class ChatModel {
   var sources: [SourceState] = []
   var error: String?
   var revision = 0
-  private var draftText = ""
-  var draft: String {
-    get {
-      if case .pending(_, let revision) = admission, revision == draftRevision { return "" }
-      return draftText
-    }
-    set {
-      draftText = newValue
+  var draft = "" {
+    didSet {
       draftRevision &+= 1
       scheduleDraftSave()
     }
@@ -106,11 +100,18 @@ final class ChatModel {
   @ObservationIgnored private var address: CoordinatorAddress?
   @ObservationIgnored private var active = true
 
+  static func persistent(
+    in directory: URL = .applicationSupportDirectory.appending(path: "Agent")
+  ) -> ChatModel {
+    ChatModel(
+      draftStore: AttachmentStore(directory: directory.appending(path: "Drafts")),
+      persistence: ComposerDraftStore(url: directory.appending(path: "Composer/draft.json")),
+      sharedInbox: try? SharedDraftInbox.configured())
+  }
+
   private var currentDraft: ComposerDraft {
-    var text = draftText
-    if case .pending(let submitted, let revision) = admission,
-      revision != draftRevision, !submitted.isEmpty
-    {
+    var text = draft
+    if case .pending(let submitted) = admission, !submitted.isEmpty {
       // A crash before outbox admission must recover both unsent notes.
       text = submitted + (text.isEmpty ? "" : "\n\n" + text)
     }
@@ -315,18 +316,20 @@ final class ChatModel {
     guard canSend
     else { return }
     let text = draft
-    let submittedDraftRevision = draftRevision
     let generation = generation
     var admitted = false
-    // Hide the submitted text immediately, retaining its saved draft until
-    // the outbox takes ownership. New typing gets a separate revision.
-    admission = .pending(text: text, revision: submittedDraftRevision)
+    // Clear the actual bound value before any await. The pending admission
+    // retains the recovery copy until the durable outbox takes ownership.
+    admission = .pending(text: text)
+    changingDraft = true
+    draft = ""
+    changingDraft = false
     defer {
       admission = nil
-      if !admitted, draftRevision != submittedDraftRevision, !text.isEmpty {
+      if !admitted, !text.isEmpty {
         // Local rejection has no outbox row. Preserve both the original and
         // anything typed while admission or attachment preparation was pending.
-        draft = text + (draftText.isEmpty ? "" : "\n\n" + draftText)
+        draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
       }
     }
     let mode = mode
@@ -337,7 +340,7 @@ final class ChatModel {
         feedbackScreenshotID == nil, let screenshot
       {
         guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
-        // Capture before the composer changes. A failed admission retains this exact image.
+        // Capture once. A failed admission retains this exact image.
         let data = try screenshot()
         let file = try await attachmentStore().stage(
           data: data, name: "Feedback.png", mediaType: "image/png")
@@ -358,9 +361,6 @@ final class ChatModel {
     if admitted {
       // The outbox owns this draft even if its connection has since stopped.
       admission = .saved
-      // A later editor assignment can contain identical text. Clear only the
-      // exact draft revision that was durably admitted.
-      if draftRevision == submittedDraftRevision { draft = "" }
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
@@ -374,21 +374,52 @@ final class ChatModel {
       draftError = draftError ?? "Restore the saved draft before replacing the composer."
       return
     }
-    guard !admitting, draft.isEmpty, attachments.isEmpty else {
+    guard !admitting, !preparingAttachments, draft.isEmpty, attachments.isEmpty else {
       error = "Send or clear the current draft before restoring another message."
       return
     }
+    guard let session else { return }
+    preparingAttachments = true
+    defer { preparingAttachments = false }
     do {
       let store = try attachmentStore()
-      guard let restored = await session?.restore(id, to: store) else { return }
-      draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
-      attachments.insert(contentsOf: restored.attachments, at: 0)
-      mode = restored.mode
-      if restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback" {
-        feedbackScreenshotID =
-          restored.attachments.last(where: { $0.reference.name == "Feedback.png" })?.id
+      guard let restored = await session.restore(id, to: store) else { return }
+      let previous = currentDraft
+      let feedback = restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback"
+      replaceComposer(
+        with: ComposerDraft(
+          text: restored.text + (draft.isEmpty ? "" : "\n\n" + draft), mode: restored.mode,
+          attachments: restored.attachments + attachments,
+          consumedTransfers: consumedTransfers,
+          feedbackScreenshotID: feedback
+            ? restored.attachments.last(where: { $0.reference.name == "Feedback.png" })?.id
+            : feedbackScreenshotID))
+      let savedRevision = persistentRevision &+ 1
+      guard await saveDraft() else { return }
+      switch await session.commitRestoration(restored) {
+      case .committed, .originalRetained:
+        break
+      case .invalidated:
+        guard persistentRevision == savedRevision else {
+          error = "Already saved or restored. Review the kept draft before sending."
+          return
+        }
+        replaceComposer(with: previous)
+        // Until rollback is durable, the saved replacement still owns its files.
+        if await saveDraft() {
+          for file in restored.attachments { try await store.remove(file) }
+        }
       }
     } catch { self.error = error.localizedDescription }
+  }
+  private func replaceComposer(with value: ComposerDraft) {
+    changingDraft = true
+    draft = value.text
+    mode = value.mode
+    attachments = value.attachments
+    consumedTransfers = value.consumedTransfers
+    feedbackScreenshotID = value.feedbackScreenshotID
+    changingDraft = false
   }
   private func attachmentStore() throws -> AttachmentStore {
     if let draftStore { return draftStore }

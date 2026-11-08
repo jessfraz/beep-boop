@@ -28,6 +28,48 @@ private actor AdmissionGate {
   }
 }
 
+@MainActor private func waitForComposerState(_ predicate: @MainActor () -> Bool) async throws {
+  let deadline = ContinuousClock.now + .seconds(8)
+  while !predicate() {
+    guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
+    try await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func failedDraftRestorationKeepsTheOriginalDurableOutbox() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    let directory = outbox.deletingLastPathComponent()
+    let files = AttachmentStore(directory: directory.appending(path: "Drafts"))
+    let draftURL = directory.appending(path: "composer.json")
+    let model = await MainActor.run {
+      ChatModel(draftStore: files, persistence: ComposerDraftStore(url: draftURL))
+    }
+    await model.restoreDraft()
+    await fixture.refuseUploads()
+    await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
+    try await waitForComposerState { model.connection == .connected }
+    let file = try await files.stage(
+      data: Data("Keep the original file".utf8), name: "Note.txt", mediaType: "text/plain")
+    #expect(await session.submit("Restore the original message", files: [file]))
+    try await waitForComposerState { model.rows.last?.row.delivery == .rejected }
+    let inputID = try #require(await MainActor.run { model.rows.last?.row.inputID })
+    let original = try Data(contentsOf: outbox)
+
+    // A real second owner makes the replacement save fail without a fake store.
+    let otherOwner = ComposerDraftStore(url: draftURL)
+    let adopted = try await otherOwner.load(from: files)
+    try await otherOwner.save(
+      ComposerDraft(text: "Another unsent note"), revision: adopted.revision + 1)
+    await model.restore(inputID)
+    #expect(try Data(contentsOf: outbox) == original)
+    #expect(await model.draftError != nil)
+    let reopened = try await ComposerDraftStore(url: draftURL).load(from: files)
+    #expect(reopened.draft.text == "Another unsent note")
+    await model.stop()
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendClearsComposerBeforeAdmissionAndPreservesNewTyping() async {
   let gate = AdmissionGate()

@@ -41,11 +41,7 @@ public struct MainChatView: View {
   @Environment(\.displayScale) private var displayScale
 
   public init(notifications: AppNotifications? = nil) {
-    _model = State(
-      initialValue: ChatModel(
-        persistence: ComposerDraftStore(
-          url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
-        sharedInbox: try? SharedDraftInbox.configured()))
+    _model = State(initialValue: ChatModel.persistent())
     managesConnection = true
     detailLoader = nil
     initialScrollTarget = nil

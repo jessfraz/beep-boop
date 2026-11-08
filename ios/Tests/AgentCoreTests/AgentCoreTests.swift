@@ -469,10 +469,150 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       restoredFile.url.deletingLastPathComponent().deletingLastPathComponent()
         == file.url.deletingLastPathComponent().deletingLastPathComponent())
     #expect(try Data(contentsOf: restoredFile.url) == bytes)
+    let draftURL = outbox.deletingLastPathComponent().appending(path: "composer.json")
+    let persistence = ComposerDraftStore(url: draftURL)
+    let empty = try await persistence.load(from: store)
+    try await persistence.save(
+      .init(text: restored.text, mode: restored.mode, attachments: restored.attachments),
+      revision: empty.revision + 1)
+    #expect(await session.commitRestoration(restored) == .committed)
+    let reopened = try await ComposerDraftStore(url: draftURL).load(from: store)
+    #expect(reopened.draft.text == "Fix this")
+    #expect(reopened.draft.attachments == restored.attachments)
     try await store.remove(restoredFile)
     #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
     #expect(
       try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func restorationPreparationKeepsTheOriginalOutboxUntilTheReplacementIsDurable() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    let store = AttachmentStore(
+      directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
+    let file = try await store.stage(
+      data: Data("Original bytes".utf8), name: "Original.txt", mediaType: "text/plain")
+    await fixture.refuseUploads()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("Restore this original", files: [file]))
+    let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
+    let id = try #require(rejected.rows.last?.inputID)
+    let original = try Data(contentsOf: outbox)
+    let prepared = try #require(await session.restore(id, to: store))
+    #expect(prepared.text == "Restore this original")
+    #expect(try Data(contentsOf: outbox) == original)
+    let restoredFile = try #require(prepared.attachments.first)
+    #expect(try Data(contentsOf: restoredFile.url) == Data("Original bytes".utf8))
+    // Preparation alone cannot forget the sole durable record, including if
+    // saving the replacement fails or the caller exits before saving it.
+    await session.disconnect()
+    #expect(try Data(contentsOf: outbox) == original)
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func failedRestorationRemovesPartialCopiesAndPreservesTheOriginalOutbox() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    let draftDirectory = outbox.deletingLastPathComponent().appending(path: "Drafts")
+    let store = AttachmentStore(directory: draftDirectory)
+    let first = try await store.stage(
+      data: Data("First".utf8), name: "First.txt", mediaType: "text/plain")
+    let second = try await store.stage(
+      data: Data("Second".utf8), name: "Second.txt", mediaType: "text/plain")
+    await fixture.refuseUploads()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("Keep the original", files: [first, second]))
+    let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
+    let id = try #require(rejected.rows.last?.inputID)
+    let original = try Data(contentsOf: outbox)
+    try await store.remove(first)
+    try await store.remove(second)
+    let missingSource = outbox.deletingLastPathComponent().appending(
+      path: "Attachments/\(second.id)/\(second.reference.name)")
+    try FileManager.default.removeItem(at: missingSource)
+    #expect(await session.restore(id, to: store) == nil)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: draftDirectory.path).isEmpty)
+    #expect(try Data(contentsOf: outbox) == original)
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    let directory = outbox.deletingLastPathComponent()
+    let store = AttachmentStore(directory: directory.appending(path: "Drafts"))
+    let bytes = Data("Keep the saved replacement".utf8)
+    let file = try await store.stage(data: bytes, name: "Original.txt", mediaType: "text/plain")
+    await fixture.refuseUploads()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("Keep this draft", files: [file]))
+    let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
+    let inputID = try #require(rejected.rows.last?.inputID)
+    let prepared = try #require(await session.restore(inputID, to: store))
+    let original = try Data(contentsOf: outbox)
+    let draftURL = directory.appending(path: "composer.json")
+    let persistence = ComposerDraftStore(url: draftURL)
+    let empty = try await persistence.load(from: store)
+    try await persistence.save(
+      .init(text: prepared.text, mode: prepared.mode, attachments: prepared.attachments),
+      revision: empty.revision + 1)
+    let stranger = CoordinatorSession(outboxURL: directory.appending(path: "unrelated.json"))
+    #expect(await stranger.commitRestoration(prepared) == .invalidated)
+    #expect(try Data(contentsOf: outbox) == original)
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }
+    #expect(await session.commitRestoration(prepared) == .originalRetained)
+    #expect(try Data(contentsOf: outbox) == original)
+    let saved = try await ComposerDraftStore(url: draftURL).load(from: store)
+    #expect(saved.draft.text == "Keep this draft")
+    #expect(saved.draft.attachments == prepared.attachments)
+    let ownedFile = try #require(prepared.attachments.first)
+    #expect(try Data(contentsOf: ownedFile.url) == bytes)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    #expect(await session.commitRestoration(prepared) == .committed)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+    #expect(try Data(contentsOf: ownedFile.url) == bytes)
+    #expect(await fixture.count() == 0, "Retirement never submits the restored draft")
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func reconciledInputInvalidatesRestorationWithoutDeletingTheSavedReplacement() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    let directory = outbox.deletingLastPathComponent()
+    let store = AttachmentStore(directory: directory.appending(path: "Drafts"))
+    let bytes = Data("Original attachment".utf8)
+    let file = try await store.stage(data: bytes, name: "Original.txt", mediaType: "text/plain")
+    await fixture.loseInputAcknowledgements()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    _ = try await until(session) { $0.connection == .connected }
+    #expect(await session.submit("Original accepted by the coordinator", files: [file]))
+    let uncertain = try await until(session) { $0.rows.last?.delivery == .uncertain }
+    let inputID = try #require(uncertain.rows.last?.inputID)
+    let prepared = try #require(await session.restore(inputID, to: store))
+    let draftURL = directory.appending(path: "composer.json")
+    let persistence = ComposerDraftStore(url: draftURL)
+    let empty = try await persistence.load(from: store)
+    try await persistence.save(
+      .init(text: prepared.text, mode: prepared.mode, attachments: prepared.attachments),
+      revision: empty.revision + 1)
+    _ = try await until(session) { $0.connection == .connected && $0.rows.last?.entryID != nil }
+    #expect(await session.commitRestoration(prepared) == .invalidated)
+    #expect(await session.restore(inputID, to: store) == nil)
+    #expect(
+      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+    let saved = try await ComposerDraftStore(url: draftURL).load(from: store)
+    #expect(saved.draft.attachments == prepared.attachments)
+    #expect(try Data(contentsOf: #require(prepared.attachments.first).url) == bytes)
+    #expect(await fixture.count() == 1, "Reconciliation never replays an accepted input")
   }
 }
 

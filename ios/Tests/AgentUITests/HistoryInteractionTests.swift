@@ -1,6 +1,7 @@
 import AgentCore
 import Network
 import UIKit
+import Vision
 import XCTest
 
 @MainActor
@@ -45,17 +46,61 @@ final class HistoryInteractionTests: XCTestCase {
       object: editor)
   }
 
+  private func assertVisibleEditorText(
+    _ expected: String, excluding submitted: String? = nil, in editor: XCUIElement,
+    file: StaticString = #filePath, line: UInt = #line
+  ) async throws {
+    let deadline = ContinuousClock.now + .seconds(5)
+    var recognized = ""
+    var screenshot = editor.screenshot()
+    repeat {
+      screenshot = editor.screenshot()
+      let image = try XCTUnwrap(screenshot.image.cgImage, file: file, line: line)
+      let request = VNRecognizeTextRequest()
+      request.recognitionLevel = .accurate
+      request.recognitionLanguages = ["en-US"]
+      request.usesLanguageCorrection = false
+      try VNImageRequestHandler(cgImage: image).perform([request])
+      recognized = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+        .joined(separator: " ")
+      let visible = recognized.lowercased().filter { !$0.isWhitespace }
+      let containsSubmitted =
+        submitted.map {
+          visible.contains($0.lowercased().filter { !$0.isWhitespace })
+        } ?? false
+      if visible.contains(expected.lowercased().filter { !$0.isWhitespace }), !containsSubmitted {
+        return
+      }
+      if ContinuousClock.now >= deadline { break }
+      try await Task.sleep(for: .milliseconds(100))
+    } while true
+    let attachment = XCTAttachment(screenshot: screenshot)
+    attachment.name = "native-composer-visible-text"
+    attachment.lifetime = .keepAlways
+    add(attachment)
+    XCTFail(
+      "Expected visible editor text \(String(reflecting: expected)); recognized \(String(reflecting: recognized)); accessibility value \(String(reflecting: editor.value))",
+      file: file, line: line)
+  }
+
   func testSendClearsTheNativeComposerAndKeepsTheKeyboardForTheNextMessage() async throws {
     let app = try await launchMessages([])
     let composer = editor(app)
     XCTAssertTrue(composer.waitForExistence(timeout: 5))
     composer.tap()
-    for text in ["The test parcel is ready.", "The second test parcel is ready."] {
+    for (visibleLine, text) in [
+      ("Orchid beacon", "Orchid beacon\nThe first note expands the native editor."),
+      ("Maple lantern", "Maple lantern\nThe next note uses the same focused editor."),
+    ] {
       composer.typeText(text)
+      try await assertVisibleEditorText(visibleLine, in: composer)
       let send = app.buttons["Send message"]
       XCTAssertTrue(send.waitForExistence(timeout: 3))
       XCTAssertTrue(send.isEnabled)
       send.tap()
+      // Check rendered glyphs before polling the transcript or changing focus.
+      // Accessibility alone can already report an empty value.
+      try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: composer)
       XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
       let cleared = emptyEditor(composer)
       XCTAssertEqual(

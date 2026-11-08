@@ -39,6 +39,16 @@ public struct RestoredDraft: Sendable {
   public let text: String
   public let mode: InputMode
   public let attachments: [LocalAttachment]
+  fileprivate let sourceRequest: NativeRequestSubmit
+  fileprivate let sourceOwner: UUID
+}
+
+public enum RestorationCommitResult: Sendable, Equatable {
+  case committed
+  /// The saved replacement owns its files; retry retirement without resending.
+  case originalRetained
+  /// The receipt no longer identifies an eligible pending input in this session.
+  case invalidated
 }
 
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
@@ -96,6 +106,7 @@ public actor CoordinatorSession {
   private var actionConnections: [UUID: LineConnection] = [:]
   private var previewRequests: Set<UUID> = []
   private var pending: [PendingInput] = []
+  private let restorationOwner = UUID()
   private var outboxLoaded = false
   private var attemptedInputs: Set<String> = []
   private var generation = UUID()
@@ -270,6 +281,7 @@ public actor CoordinatorSession {
         files.append(try await draftStore.duplicate(original))
       }
     } catch {
+      for file in files { try? await draftStore.remove(file) }
       snapshot.error = error.localizedDescription
       publish()
       return nil
@@ -278,13 +290,34 @@ public actor CoordinatorSession {
       for file in files { try? await draftStore.remove(file) }
       return nil
     }
-    guard acknowledge(inputID) else {
+    // The caller owns these copies, but the original remains durable until
+    // that caller has saved the complete replacement and commits its receipt.
+    return RestoredDraft(
+      text: request.text, mode: request.mode, attachments: files,
+      sourceRequest: request, sourceOwner: restorationOwner)
+  }
+
+  public func commitRestoration(_ restored: RestoredDraft) -> RestorationCommitResult {
+    guard restored.sourceOwner == restorationOwner else {
+      snapshot.error =
+        "This restored draft belongs to another chat session. Its original was preserved."
       publish()
-      return nil
+      return .invalidated
     }
-    transcript.delivery(inputID, .rejected)
+    let request = restored.sourceRequest
+    guard pending.contains(where: { $0.request == request && $0.state != .accepted }) else {
+      snapshot.error =
+        "The original message was already accepted or restored. No message was resent."
+      publish()
+      return .invalidated
+    }
+    guard acknowledge(request.inputId) else {
+      publish()
+      return .originalRetained
+    }
+    transcript.delivery(request.inputId, .rejected)
     publish()
-    return RestoredDraft(text: request.text, mode: request.mode, attachments: files)
+    return .committed
   }
   public func loadEarlier(anchorID: String? = nil) async {
     guard let cursor = snapshot.olderCursor else { return }
