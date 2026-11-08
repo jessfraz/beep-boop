@@ -167,8 +167,10 @@ func sendingKeepsItsPersistedBackupUntilAdmissionFinishes(admitted: Bool, newTex
   #expect(saved.draft.text == backup)
   await gate.finish(admitted)
   await sending.value
-  let restored = try await ComposerDraftStore(url: url).load(from: files)
   #expect(model.draft == (admitted ? newText : backup))
+  // Rejection schedules an autosave. Finish it before another owner reloads.
+  #expect(await model.saveDraft())
+  let restored = try await ComposerDraftStore(url: url).load(from: files)
   #expect(restored.draft.text == model.draft)
 }
 
