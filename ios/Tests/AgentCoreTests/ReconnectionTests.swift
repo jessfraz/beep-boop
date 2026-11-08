@@ -37,6 +37,9 @@ private actor ReconnectCoordinator {
     }
   }
   func activeSockets() -> Int { sockets.count }
+  func activeSocketStates() -> [String] {
+    sockets.values.map { String(describing: $0.state) }.sorted()
+  }
   func errors() -> [String] { failures }
   func observerEvent(_ event: NativeEvent) async throws {
     for id in observers {
@@ -453,7 +456,17 @@ func terminalCoordinatorRejectionStopsRetryingAndStaysOutOfHistory(_ behavior: R
 {
   try await withReconnectCoordinator(behavior) { model, fixture, _ in
     // The initial disconnected snapshot is not a terminal server response.
-    try await waitForReconnectState { model.connection == .disconnected && model.error != nil }
+    do {
+      try await waitForReconnectState { model.connection == .disconnected && model.error != nil }
+    } catch {
+      let observed = await fixture.observedIDs()
+      let failures = await fixture.errors()
+      let sockets = await fixture.activeSocketStates()
+      Issue.record(
+        "Terminal \(behavior) response did not settle: connection=\(model.connection), error=\(model.error ?? "none"), observedIDs=\(observed), fixtureErrors=\(failures), sockets=\(sockets), waitError=\(error)"
+      )
+      return
+    }
     try await Task.sleep(for: .milliseconds(2300))
     #expect(model.connection == .disconnected)
     #expect(model.error != nil)
