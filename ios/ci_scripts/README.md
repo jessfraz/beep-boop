@@ -34,6 +34,8 @@ model credentials or live coordinator.
 Failed package checks keep their exit status and stream their full output. The
 hook also emits up to three bounded compiler or test failure diagnostics using
 Xcode's `error:` format, rather than reporting only the script's exit code.
+The public Cloud check may still show only the script status; inspect the
+action's full log for the emitted diagnostics.
 
 The `/ios` filter includes the app, generated native contracts, package tests
 and release scripts. CLI-only and runtime-only changes do not create a signed

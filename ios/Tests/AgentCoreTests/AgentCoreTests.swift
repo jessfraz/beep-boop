@@ -183,7 +183,7 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
   }
 }
 
-enum UnavailablePeer: CaseIterable, Sendable { case refusedTCP, missingUnixSocket }
+enum UnavailablePeer: CaseIterable, Sendable { case closedTCP, missingUnixSocket }
 
 @Test(.timeLimit(.minutes(1)), arguments: UnavailablePeer.allCases)
 func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: UnavailablePeer)
@@ -193,9 +193,9 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
   defer { try? FileManager.default.removeItem(at: directory) }
   let socket: NWConnection
-  let expectedFailure: NWError
+  let expectedFailures: [NWError]
   switch peer {
-  case .refusedTCP:
+  case .closedTCP:
     let listener = try NWListener(using: .tcp, on: .any)
     let listening = AsyncThrowingStream<Void, any Error>.makeStream()
     listener.stateUpdateHandler = { state in
@@ -214,11 +214,12 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     listener.cancel()
     for try await _ in listening.stream {}
     socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
-    expectedFailure = .posix(.ECONNREFUSED)
+    // Network.framework may report the closed listener as refused or reset.
+    expectedFailures = [.posix(.ECONNREFUSED), .posix(.ECONNRESET)]
   case .missingUnixSocket:
     socket = NWConnection(
       to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)
-    expectedFailure = .posix(.ENOENT)
+    expectedFailures = [.posix(.ENOENT)]
   }
   let failures = AsyncStream<NWError>.makeStream(bufferingPolicy: .bufferingNewest(1))
   socket.stateUpdateHandler = { state in
@@ -241,10 +242,10 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     }
   }
   defer { sending.cancel() }
-  // Bound release after either Network.framework or the send reports refusal;
+  // Bound release after either Network.framework or the send reports failure;
   // OS path establishment is outside that response-time contract.
   let original = try #require(await failures.stream.first(where: { _ in true }))
-  #expect(original == expectedFailure)
+  #expect(expectedFailures.contains(original))
   do {
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask { try await sending.value }
@@ -257,10 +258,10 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
         sending.cancel()
       }
       try await group.next()
-      Issue.record("A refused connection accepted input")
+      Issue.record("An unavailable connection accepted input")
     }
   } catch {
-    #expect(!(error is ConnectionError), "Refusal must release the send before its timeout")
+    #expect(!(error is ConnectionError), "Network failure must release the send before its timeout")
     #expect(
       error as? NWError == original, "The owner must classify the original network failure")
     #expect(ConnectionError.shouldReconnect(after: error))
