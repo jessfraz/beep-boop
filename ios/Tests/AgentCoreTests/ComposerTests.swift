@@ -81,6 +81,50 @@ func durableAdmissionDoesNotEraseANewerDraftWithIdenticalText(afterClearing: Boo
   }
 }
 
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func savedAdmissionStaysRetiredWhenTheConnectionOwnerStops(newerDraft: Bool) async throws {
+  try await withCoordinator { session, _, outbox in
+    let gate = AdmissionGate()
+    let directory = outbox.deletingLastPathComponent()
+    let draftURL = directory.appending(path: "composer.json")
+    let files = AttachmentStore(directory: directory.appending(path: "Drafts"))
+    let model = await MainActor.run {
+      ChatModel(
+        draftStore: files, persistence: ComposerDraftStore(url: draftURL),
+        admit: { text, mode, files in
+          let saved = await session.submit(text, mode: mode, files: files)
+          #expect(saved)
+          return await gate.admit(text)
+        })
+    }
+    await model.restoreDraft()
+    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    for await update in session.updates where update.connection == .connected { break }
+    await MainActor.run {
+      model.connection = .connected
+      model.draft = "The same text in a different draft"
+    }
+    #expect(await model.saveDraft())
+    let sending = Task { await model.send() }
+    for await _ in gate.entered { break }
+    let saved = try JSONDecoder().decode(
+      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    #expect(saved.count == 1)
+    if newerDraft {
+      await MainActor.run { model.draft = "The same text in a different draft" }
+    }
+    await model.stop()
+    await session.disconnect()
+    await gate.finish(true)
+    await sending.value
+    let expected = newerDraft ? "The same text in a different draft" : ""
+    #expect(await model.draft == expected)
+    let restored = try await ComposerDraftStore(url: draftURL).load(from: files)
+    #expect(restored.draft.text == expected)
+    #expect(await !model.admitting)
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async {
   let model = ChatModel(admit: { _, _, _ in false })
@@ -128,8 +172,8 @@ func sendingKeepsItsPersistedBackupUntilAdmissionFinishes(admitted: Bool, newTex
   #expect(restored.draft.text == model.draft)
 }
 
-@MainActor @Test(.timeLimit(.minutes(1)))
-func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping() async {
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping(stopping: Bool) async {
   let gate = AdmissionGate()
   let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
   model.connection = .connected
@@ -137,6 +181,7 @@ func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping() async {
   let sending = Task { await model.send() }
   for await _ in gate.entered { break }
   model.draft = "New typing"
+  if stopping { await model.stop() }
   await gate.finish(false)
   await sending.value
   #expect(model.draft == "Original draft\n\nNew typing")

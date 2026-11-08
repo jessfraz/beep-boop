@@ -102,6 +102,7 @@ required for sharing on a phone; an unsigned build does not establish that.
   together. Reopening restores that draft; importing or restoring never sends it.
   Sending clears the text immediately while retaining its saved backup until
   outbox admission. Local rejection restores it, preserving newer typing.
+  A saved message stays retired if its connection closes during admission.
 - **Connection → Conversation settings** changes the main conversation's model,
   reasoning and Fast setting without submitting the draft. Configured and
   effective selections are shown separately; an unknown active selection stays

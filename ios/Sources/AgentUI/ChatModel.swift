@@ -323,9 +323,7 @@ final class ChatModel {
     admission = .pending(text: text, revision: submittedDraftRevision)
     defer {
       admission = nil
-      if !admitted, self.generation == generation,
-        draftRevision != submittedDraftRevision, !text.isEmpty
-      {
+      if !admitted, draftRevision != submittedDraftRevision, !text.isEmpty {
         // Local rejection has no outbox row. Preserve both the original and
         // anything typed while admission or attachment preparation was pending.
         draft = text + (draftText.isEmpty ? "" : "\n\n" + draftText)
@@ -357,9 +355,9 @@ final class ChatModel {
     }
     guard self.generation == generation else { return }
     admitted = await admit(text, mode, files)
-    if admitted { admission = .saved }
-    guard self.generation == generation else { return }
     if admitted {
+      // The outbox owns this draft even if its connection has since stopped.
+      admission = .saved
       // A later editor assignment can contain identical text. Clear only the
       // exact draft revision that was durably admitted.
       if draftRevision == submittedDraftRevision { draft = "" }

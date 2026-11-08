@@ -15,8 +15,8 @@
   // Hosted captures share one scene and must own its key window serially.
   @Suite(.serialized) struct NativeRenderingTests {
     #if os(iOS)
-      @Test @MainActor func sendingClearsNativeMarkedTextWithoutDismissingTheKeyboard() async throws
-      {
+      @Test(arguments: [false, true]) @MainActor
+      func sendingClearsNativeMarkedTextWithoutDismissingTheKeyboard(stopping: Bool) async throws {
         let entered = AsyncStream<Void>.makeStream()
         let admission = AsyncStream<Bool>.makeStream()
         defer { admission.continuation.finish() }
@@ -53,6 +53,7 @@
         editor.setMarkedText(text, selectedRange: NSRange(location: text.utf16.count, length: 0))
         try await Task.sleep(for: .milliseconds(100))
         #expect(model.draft == text)
+        #expect(editor.markedTextRange != nil)
         let sending = Task { await model.send() }
         for await _ in entered.stream { break }
         try await Task.sleep(for: .milliseconds(100))
@@ -61,16 +62,22 @@
         #expect(editor.text(in: range) == "", "Sent text must leave the actual native editor")
         #expect(editor.isFirstResponder)
         #expect(model.draft.isEmpty)
-        editor.insertText("The next parcel")
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(model.draft == "The next parcel")
+        if stopping {
+          await model.stop()
+        } else {
+          editor.insertText("The next parcel")
+          try await Task.sleep(for: .milliseconds(100))
+          #expect(model.draft == "The next parcel")
+        }
         admission.continuation.yield(true)
         await sending.value
+        try await Task.sleep(for: .milliseconds(100))
+        let expected = stopping ? "" : "The next parcel"
         let next = try #require(
           editor.textRange(from: editor.beginningOfDocument, to: editor.endOfDocument))
-        #expect(editor.text(in: next) == "The next parcel")
+        #expect(editor.text(in: next) == expected)
         #expect(editor.isFirstResponder)
-        #expect(model.draft == "The next parcel")
+        #expect(model.draft == expected)
       }
     #endif
 
