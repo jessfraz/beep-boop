@@ -47,6 +47,10 @@ PY
 }
 
 check contracts swift test --package-path "$native_dir" --scratch-path "$run_dir/build" \
+  --skip NativeRenderingTests --attachments-path "$run_dir/rendered"
+# Native captures own MainActor separately from async lifecycle deadlines.
+check rendering swift test --package-path "$native_dir" --scratch-path "$run_dir/build" \
+  --filter NativeRenderingTests \
   --attachments-path "$run_dir/rendered"
 check history-performance swift test --configuration release --package-path "$native_dir" \
   --scratch-path "$run_dir/build" --attachments-path "$run_dir/rendered" \

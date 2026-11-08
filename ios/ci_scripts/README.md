@@ -27,6 +27,8 @@ Configure one release workflow:
 The required Test action retains UI screenshots and test results as native
 Xcode Cloud artifacts. Before the archive command, `ci_pre_xcodebuild.sh` runs
 the Swift package's behavioral tests and isolated Release performance budgets.
+Native rendering runs separately from asynchronous lifecycle tests so captures
+cannot block their main actor while connection deadlines elapse.
 An error exits the hook and fails the archive. The hook also rejects archives
 from other branches or pull requests. It installs no dependencies and uses no
 model credentials or live coordinator.

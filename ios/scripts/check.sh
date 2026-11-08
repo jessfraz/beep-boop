@@ -37,7 +37,12 @@ if [[ "$phase" == all || "$phase" == host ]]; then
     -name '*.swift' ! -name Generated.swift -print0 \
     | xargs -0 xcrun swift-format lint --strict
   mkdir "$run_dir/macos-rendered"
+  # Native captures block MainActor. Run them apart from async lifecycle tests
+  # so rendering time cannot consume a network assertion's deadline.
   swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
+    --skip NativeRenderingTests --attachments-path "$run_dir/macos-rendered"
+  swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
+    --filter NativeRenderingTests \
     --attachments-path "$run_dir/macos-rendered"
   swift test --configuration release --package-path "$native_dir" \
     --scratch-path "$run_dir/macos" --filter "$performance_test" \
