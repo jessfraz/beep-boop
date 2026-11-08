@@ -31,6 +31,10 @@ An error exits the hook and fails the archive. The hook also rejects archives
 from other branches or pull requests. It installs no dependencies and uses no
 model credentials or live coordinator.
 
+Failed package checks keep their exit status and stream their full output. The
+hook also emits up to three bounded compiler or test failure diagnostics using
+Xcode's `error:` format, rather than reporting only the script's exit code.
+
 The `/ios` filter includes the app, generated native contracts, package tests
 and release scripts. CLI-only and runtime-only changes do not create a signed
 iOS build. Manual starts from `main` remain available.
@@ -71,6 +75,7 @@ Apple references:
 - [First workflow setup](https://developer.apple.com/documentation/xcode/configuring-your-first-xcode-cloud-workflow)
 - [Workflow actions](https://developer.apple.com/documentation/xcode/configuring-your-xcode-cloud-workflow-s-actions)
 - [Custom scripts](https://developer.apple.com/documentation/xcode/writing-custom-build-scripts)
+- [Script diagnostics](https://developer.apple.com/documentation/xcode/running-custom-scripts-during-a-build)
 - [Internal TestFlight delivery](https://developer.apple.com/documentation/xcode/creating-a-workflow-that-builds-your-app-for-distribution)
 - [Cloud build numbers](https://developer.apple.com/documentation/xcode/setting-the-next-build-number-for-xcode-cloud-builds)
 - [Built-in environment variables](https://developer.apple.com/documentation/xcode/environment-variable-reference)
