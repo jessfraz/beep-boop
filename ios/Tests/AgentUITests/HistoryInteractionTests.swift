@@ -34,9 +34,14 @@ final class HistoryInteractionTests: XCTestCase {
   }
 
   private func emptyEditor(_ editor: XCUIElement) -> XCTNSPredicateExpectation {
-    // UIKit exposes an empty editor as either nil or an empty string.
+    // XCTest can expose an empty field's placeholder as its value.
     XCTNSPredicateExpectation(
-      predicate: NSPredicate(format: "exists == YES AND (value == nil OR value == %@)", ""),
+      predicate: NSPredicate { object, _ in
+        guard let field = object as? XCUIElement, field.exists else { return false }
+        guard let value = field.value else { return true }
+        guard let text = value as? String else { return false }
+        return text.isEmpty || text == field.placeholderValue
+      },
       object: editor)
   }
 
@@ -55,7 +60,8 @@ final class HistoryInteractionTests: XCTestCase {
       let cleared = emptyEditor(composer)
       XCTAssertEqual(
         XCTWaiter.wait(for: [cleared], timeout: 2), .completed,
-        "A sent message must leave the native composer: \(composer.debugDescription)")
+        "A sent message must leave the native composer; value=\(String(reflecting: composer.value)), placeholder=\(String(reflecting: composer.placeholderValue)): \(composer.debugDescription)"
+      )
       XCTAssertTrue(app.keyboards.firstMatch.exists)
     }
   }
