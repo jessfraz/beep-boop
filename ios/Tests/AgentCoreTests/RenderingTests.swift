@@ -14,6 +14,66 @@
 
   // Hosted captures share one scene and must own its key window serially.
   @Suite(.serialized) struct NativeRenderingTests {
+    #if os(iOS)
+      @Test @MainActor func sendingClearsNativeMarkedTextWithoutDismissingTheKeyboard() async throws
+      {
+        let entered = AsyncStream<Void>.makeStream()
+        let admission = AsyncStream<Bool>.makeStream()
+        defer { admission.continuation.finish() }
+        let model = ChatModel(admit: { _, _, _ in
+          entered.continuation.yield(())
+          for await result in admission.stream { return result }
+          return false
+        })
+        model.connection = .connected
+        let host = UIHostingController(rootView: MainChatView(model: model))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previous?.makeKey()
+        }
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        func input(in view: UIView) -> (UIView & UITextInput)? {
+          if let input = view as? (UIView & UITextInput) { return input }
+          for child in view.subviews {
+            if let input = input(in: child) { return input }
+          }
+          return nil
+        }
+        let editor = try #require(input(in: host.view))
+        #expect(editor.becomeFirstResponder())
+        let text = "The test parcel is ready"
+        editor.setMarkedText(text, selectedRange: NSRange(location: text.utf16.count, length: 0))
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(model.draft == text)
+        let sending = Task { await model.send() }
+        for await _ in entered.stream { break }
+        try await Task.sleep(for: .milliseconds(100))
+        let range = try #require(
+          editor.textRange(from: editor.beginningOfDocument, to: editor.endOfDocument))
+        #expect(editor.text(in: range) == "", "Sent text must leave the actual native editor")
+        #expect(editor.isFirstResponder)
+        #expect(model.draft.isEmpty)
+        editor.insertText("The next parcel")
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(model.draft == "The next parcel")
+        admission.continuation.yield(true)
+        await sending.value
+        let next = try #require(
+          editor.textRange(from: editor.beginningOfDocument, to: editor.endOfDocument))
+        #expect(editor.text(in: next) == "The next parcel")
+        #expect(editor.isFirstResponder)
+        #expect(model.draft == "The next parcel")
+      }
+    #endif
+
     @MainActor private func renderRows(
       _ rows: [ChatRow], size: DynamicTypeSize = .large, scheme: ColorScheme = .light,
       expandedActivity: Bool = false, inspection: ToolDetailsAvailable? = nil

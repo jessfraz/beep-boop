@@ -33,6 +33,27 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  func testSendClearsTheNativeComposerAndKeepsTheKeyboardForTheNextMessage() async throws {
+    let app = try await launchMessages([])
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    for text in ["The test parcel is ready.", "The second test parcel is ready."] {
+      composer.typeText(text)
+      let send = app.buttons["Send message"]
+      XCTAssertTrue(send.waitForExistence(timeout: 3))
+      XCTAssertTrue(send.isEnabled)
+      send.tap()
+      XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
+      let cleared = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "value == %@", ""), object: composer)
+      XCTAssertEqual(
+        XCTWaiter.wait(for: [cleared], timeout: 2), .completed,
+        "A sent message must leave the native composer: \(composer.debugDescription)")
+      XCTAssertTrue(app.keyboards.firstMatch.exists)
+    }
+  }
+
   func testShareExtensionSavesAnUnsentDraftAndHostImportsItOnceAfterRelaunch() async throws {
     let text = "Selected content for the unsent shared draft."
     let app = try await launchMessages([

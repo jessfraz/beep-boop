@@ -29,13 +29,14 @@ private actor AdmissionGate {
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
-func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async {
+func sendClearsComposerBeforeAdmissionAndPreservesNewTyping() async {
   let gate = AdmissionGate()
   let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
   model.connection = .connected
   model.draft = "Original draft"
   let sending = Task { await model.send() }
   for await _ in gate.entered { break }
+  #expect(model.draft.isEmpty, "Send must immediately clear the composer during admission")
   model.draft = "New typing while admission is pending"
   await model.send()
   #expect(await gate.count() == 1)
@@ -94,6 +95,53 @@ func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async {
   #expect(admitted.draft.isEmpty)
 }
 
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true], ["", "New typing"])
+func sendingKeepsItsPersistedBackupUntilAdmissionFinishes(admitted: Bool, newText: String)
+  async throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let files = AttachmentStore(directory: root.appending(path: "Files"))
+  let url = root.appending(path: "draft.json")
+  let gate = AdmissionGate()
+  let model = ChatModel(
+    draftStore: files, persistence: ComposerDraftStore(url: url),
+    admit: { text, _, _ in await gate.admit(text) })
+  await model.restoreDraft()
+  model.connection = .connected
+  model.draft = "Original draft"
+  #expect(await model.saveDraft())
+  let sending = Task { await model.send() }
+  for await _ in gate.entered { break }
+  #expect(model.draft.isEmpty)
+  if !newText.isEmpty {
+    model.draft = newText
+    #expect(await model.saveDraft())
+  }
+  let backup = "Original draft" + (newText.isEmpty ? "" : "\n\n" + newText)
+  let saved = try await ComposerDraftStore(url: url).load(from: files)
+  #expect(saved.draft.text == backup)
+  await gate.finish(admitted)
+  await sending.value
+  let restored = try await ComposerDraftStore(url: url).load(from: files)
+  #expect(model.draft == (admitted ? newText : backup))
+  #expect(restored.draft.text == model.draft)
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping() async {
+  let gate = AdmissionGate()
+  let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
+  model.connection = .connected
+  model.draft = "Original draft"
+  let sending = Task { await model.send() }
+  for await _ in gate.entered { break }
+  model.draft = "New typing"
+  await gate.finish(false)
+  await sending.value
+  #expect(model.draft == "Original draft\n\nNew typing")
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactScreenshot() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -118,8 +166,8 @@ func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactScreenshot() async throw
   #expect(model.draft == "/feedback The text is clipped")
 }
 
-@MainActor @Test(.timeLimit(.minutes(1)))
-func attachmentOnlyAdmissionPreservesFilesAddedWhileTheOriginalIsSaving() async throws {
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func attachmentOnlyAdmissionPreservesFilesAndNewTyping(admitted: Bool) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let gate = AdmissionGate()
@@ -134,11 +182,15 @@ func attachmentOnlyAdmissionPreservesFilesAddedWhileTheOriginalIsSaving() async 
   await model.attach(data: Data([1]), name: "First.txt", mediaType: "text/plain")
   let sending = Task { await model.send() }
   for await _ in gate.entered { break }
+  model.draft = "New typing"
   await model.attach(data: Data([2]), name: "Second.txt", mediaType: "text/plain")
-  await gate.finish(true)
+  await gate.finish(admitted)
   await sending.value
-  #expect(model.attachments.map(\.reference.name) == ["Second.txt"])
-  #expect(try Data(contentsOf: #require(model.attachments.first).url) == Data([2]))
+  #expect(
+    model.attachments.map(\.reference.name)
+      == (admitted ? ["Second.txt"] : ["First.txt", "Second.txt"]))
+  #expect(model.draft == "New typing")
+  #expect(try Data(contentsOf: #require(model.attachments.last).url) == Data([2]))
 }
 
 @MainActor private func connectModelThenRelease(_ session: CoordinatorSession) async throws {

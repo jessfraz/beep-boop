@@ -391,7 +391,8 @@ public struct MainChatView: View {
     return try await model.toolDetails(for: row)
   }
   private var showsStop: Bool {
-    model.busy && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    !model.admitting && model.busy
+      && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && model.attachments.isEmpty
   }
   private var composer: some View {

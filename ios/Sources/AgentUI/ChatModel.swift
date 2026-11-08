@@ -20,6 +20,11 @@ final class RowModel: Identifiable {
 
 @MainActor @Observable
 final class ChatModel {
+  private enum Admission {
+    case pending(text: String, revision: Int)
+    case saved
+  }
+
   var rows: [RowModel] = [] {
     didSet { transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems) }
   }
@@ -42,8 +47,14 @@ final class ChatModel {
   var sources: [SourceState] = []
   var error: String?
   var revision = 0
-  var draft = "" {
-    didSet {
+  private var draftText = ""
+  var draft: String {
+    get {
+      if case .pending(_, let revision) = admission, revision == draftRevision { return "" }
+      return draftText
+    }
+    set {
+      draftText = newValue
       draftRevision &+= 1
       scheduleDraftSave()
     }
@@ -62,7 +73,8 @@ final class ChatModel {
   @ObservationIgnored private var consumedTransfers: Set<UUID> = []
   @ObservationIgnored private var changingDraft = false
   @ObservationIgnored private var restoringDraft = false
-  private(set) var admitting = false
+  private var admission: Admission?
+  var admitting: Bool { admission != nil }
   @ObservationIgnored private var generation = UUID()
   @ObservationIgnored private var admit:
     @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
@@ -95,8 +107,15 @@ final class ChatModel {
   @ObservationIgnored private var active = true
 
   private var currentDraft: ComposerDraft {
-    ComposerDraft(
-      text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
+    var text = draftText
+    if case .pending(let submitted, let revision) = admission,
+      revision != draftRevision, !submitted.isEmpty
+    {
+      // A crash before outbox admission must recover both unsent notes.
+      text = submitted + (text.isEmpty ? "" : "\n\n" + text)
+    }
+    return ComposerDraft(
+      text: text, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
       feedbackScreenshotID: feedbackScreenshotID)
   }
   private func scheduleDraftSave() {
@@ -295,12 +314,24 @@ final class ChatModel {
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
     guard canSend
     else { return }
-    admitting = true
-    defer { admitting = false }
     let text = draft
     let submittedDraftRevision = draftRevision
-    let mode = mode
     let generation = generation
+    var admitted = false
+    // Hide the submitted text immediately, retaining its saved draft until
+    // the outbox takes ownership. New typing gets a separate revision.
+    admission = .pending(text: text, revision: submittedDraftRevision)
+    defer {
+      admission = nil
+      if !admitted, self.generation == generation,
+        draftRevision != submittedDraftRevision, !text.isEmpty
+      {
+        // Local rejection has no outbox row. Preserve both the original and
+        // anything typed while admission or attachment preparation was pending.
+        draft = text + (draftText.isEmpty ? "" : "\n\n" + draftText)
+      }
+    }
+    let mode = mode
     let admit = admit
     var files = attachments
     do {
@@ -325,9 +356,10 @@ final class ChatModel {
       return
     }
     guard self.generation == generation else { return }
-    // Keep the draft until the owned actor has validated and saved the input.
-    // Failures also remain available in the input row for copy/retry.
-    if await admit(text, mode, files), self.generation == generation {
+    admitted = await admit(text, mode, files)
+    if admitted { admission = .saved }
+    guard self.generation == generation else { return }
+    if admitted {
       // A later editor assignment can contain identical text. Clear only the
       // exact draft revision that was durably admitted.
       if draftRevision == submittedDraftRevision { draft = "" }
