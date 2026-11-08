@@ -4,7 +4,7 @@
 mod projection;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -108,9 +108,21 @@ impl CodexHistory {
             model_providers: &[],
         };
         if cursor.is_none() {
-            // Repair legacy metadata once per walk, then page native state.
-            // The repair scan's timestamp-only cursor cannot preserve ties.
-            let _: NativeList = self.rpc("thread/list", &params).await?;
+            // A repair response warms only one filesystem page. Finish that
+            // sweep before paging state, whose cursors preserve timestamp ties.
+            let mut seen = HashSet::new();
+            loop {
+                let repaired: NativeList = self.rpc("thread/list", &params).await?;
+                let Some(next) = repaired.next_cursor else {
+                    break;
+                };
+                ensure!(
+                    !next.is_empty() && seen.insert(next.clone()),
+                    "Codex returned an invalid or repeated thread-repair cursor"
+                );
+                params.cursor = Some(next);
+            }
+            params.cursor = None;
             params.use_state_db_only = true;
         }
         let page: NativeList = self.rpc("thread/list", params).await?;
@@ -3995,7 +4007,8 @@ try{
             text_elements: Vec<Value>,
         }
         fn rollout(home: &Path, id: &str, timestamp: &'static str) {
-            let folder = home.join("sessions/2026/01/02");
+            let created = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+            let folder = home.join(format!("sessions/{}", created.format("%Y/%m/%d")));
             std::fs::create_dir_all(&folder).unwrap();
             let mut line = serde_json::to_vec(&Line {
                 timestamp,
@@ -4028,7 +4041,10 @@ try{
             );
             line.push(b'\n');
             std::fs::write(
-                folder.join(format!("rollout-2026-01-02T12-00-00-{id}.jsonl")),
+                folder.join(format!(
+                    "rollout-{}-{id}.jsonl",
+                    created.format("%Y-%m-%dT%H-%M-%S")
+                )),
                 line,
             )
             .unwrap();
@@ -4093,7 +4109,10 @@ try{
             let Some(next) = next else { break };
             cursor = Some(next);
         }
-        assert_eq!(imported, expected);
+        assert_eq!(
+            imported, expected,
+            "A new walk must repair later rollouts beyond the first native filesystem page"
+        );
     }
 
     #[tokio::test]

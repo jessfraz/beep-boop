@@ -8,7 +8,7 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Finish Codex catch-up and vector indexing, reconcile available text against
   source checkpoints, and verify real searches. Missing media stays explicit
   coverage gaps; importing and searching open no Rex sessions.
-- [ ] Import changes to completed Codex conversations from validated change
+- [x] Import changes to completed Codex conversations from validated change
   watermarks, preserving earlier edits, source lineage and retention upgrades.
 - [x] Finish live search latency validation, including time outside the index
   query while background work runs.

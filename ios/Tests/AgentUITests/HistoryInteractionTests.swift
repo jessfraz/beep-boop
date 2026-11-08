@@ -33,6 +33,13 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  private func emptyEditor(_ editor: XCUIElement) -> XCTNSPredicateExpectation {
+    // UIKit exposes an empty editor as either nil or an empty string.
+    XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "exists == YES AND (value == nil OR value == %@)", ""),
+      object: editor)
+  }
+
   func testSendClearsTheNativeComposerAndKeepsTheKeyboardForTheNextMessage() async throws {
     let app = try await launchMessages([])
     let composer = editor(app)
@@ -45,8 +52,7 @@ final class HistoryInteractionTests: XCTestCase {
       XCTAssertTrue(send.isEnabled)
       send.tap()
       XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
-      let cleared = XCTNSPredicateExpectation(
-        predicate: NSPredicate(format: "value == %@", ""), object: composer)
+      let cleared = emptyEditor(composer)
       XCTAssertEqual(
         XCTWaiter.wait(for: [cleared], timeout: 2), .completed,
         "A sent message must leave the native composer: \(composer.debugDescription)")
@@ -152,12 +158,10 @@ final class HistoryInteractionTests: XCTestCase {
     let delete = app.keys["delete"]
     XCTAssertTrue(delete.exists)
     delete.tap()
-    let cleared = XCTNSPredicateExpectation(
-      predicate: NSPredicate(format: "value == %@", ""), object: composer)
+    let cleared = emptyEditor(composer)
     XCTAssertEqual(
       XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
       "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
-    XCTAssertEqual(composer.value as? String, "")
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
     XCTAssertTrue(select.waitForExistence(timeout: 3))
