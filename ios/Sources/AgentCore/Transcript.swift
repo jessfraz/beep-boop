@@ -125,6 +125,12 @@ struct Transcript: Sendable {
         inputOrigin: request.origin))
     bound()
   }
+  mutating func retirePending(_ inputID: String) {
+    // Outbox retirement releases only the optimistic row, never server history.
+    guard let index = storage.firstIndex(where: { $0.inputID == inputID && $0.entryID == nil })
+    else { return }
+    dirtyRows.remove(storage.remove(at: index).id)
+  }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
     guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
     if entryID == nil {

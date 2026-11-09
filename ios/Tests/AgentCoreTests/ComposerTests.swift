@@ -28,6 +28,41 @@ private actor AdmissionGate {
   }
 }
 
+@MainActor
+@Test(arguments: [
+  ("", "/feedback "),
+  ("Keep the note.\nSecond line.", "/feedback Keep the note.\nSecond line."),
+  ("/help Keep the note.", "/feedback Keep the note."),
+  ("/feedback Keep the note.", "/feedback Keep the note."),
+  (" \n/help\tKeep the note.", "/feedback\tKeep the note."),
+  ("/help", "/feedback "),
+  ("/helpful is a path", "/feedback /helpful is a path"),
+  ("/tmp/example.txt", "/feedback /tmp/example.txt"),
+])
+func commandInsertionPreservesTheDurableNoteAndReplacesOnlyKnownCommands(
+  draft: String, expected: String
+) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let files = AttachmentStore(directory: root.appending(path: "Files"))
+  let url = root.appending(path: "draft.json")
+  let model = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
+  await model.restoreDraft()
+  let feedback = SlashCommand(description: "Report a problem", usage: "/feedback <note>")
+  model.commands = [feedback, .init(description: "Show commands", usage: "/help")]
+  model.mode = .followUp
+  await model.attach(data: Data("Kept attachment".utf8), name: "Note.txt", mediaType: "text/plain")
+  let attachment = try #require(model.attachments.first)
+  model.draft = draft
+  model.insertCommand(feedback)
+  #expect(model.draft == expected)
+  #expect(await model.saveDraft())
+  let restored = try await ComposerDraftStore(url: url).load(from: files)
+  #expect(restored.draft.text == expected)
+  #expect(restored.draft.mode == .followUp)
+  #expect(restored.draft.attachments == [attachment])
+}
+
 @MainActor private func waitForComposerState(_ predicate: @MainActor () -> Bool) async throws {
   let deadline = ContinuousClock.now + .seconds(8)
   while !predicate() {

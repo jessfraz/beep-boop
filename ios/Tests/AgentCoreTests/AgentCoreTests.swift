@@ -456,6 +456,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     await fixture.refuseUploads()
     await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
     _ = try await until(session) { $0.connection == .connected }
+    try await fixture.liveMessage(
+      .init(
+        continuation: false, entryId: "retained-server-message", finalChunk: true, role: .user,
+        text: "Fix this"))
+    _ = try await until(session) { $0.rows.contains { $0.entryID == "retained-server-message" } }
     #expect(await session.submit("Fix this", files: [file]))
     let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
     let id = try #require(rejected.rows.last?.inputID)
@@ -476,6 +481,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       .init(text: restored.text, mode: restored.mode, attachments: restored.attachments),
       revision: empty.revision + 1)
     #expect(await session.commitRestoration(restored) == .committed)
+    let retired = try await until(session) { _ in true }
+    #expect(!retired.rows.contains { $0.inputID == id })
+    #expect(
+      retired.rows.contains { $0.entryID == "retained-server-message" && $0.text == "Fix this" })
+    #expect(await session.restore(id, to: store) == nil)
     let reopened = try await ComposerDraftStore(url: draftURL).load(from: store)
     #expect(reopened.draft.text == "Fix this")
     #expect(reopened.draft.attachments == restored.attachments)
@@ -569,6 +579,9 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
         [.posixPermissions: 0o700], ofItemAtPath: directory.path)
     }
     #expect(await session.commitRestoration(prepared) == .originalRetained)
+    let retained = try await until(session) { _ in true }
+    let recovery = try #require(retained.rows.first { $0.inputID == inputID })
+    #expect(recovery.delivery == .rejected)
     #expect(try Data(contentsOf: outbox) == original)
     let saved = try await ComposerDraftStore(url: draftURL).load(from: store)
     #expect(saved.draft.text == "Keep this draft")
@@ -577,6 +590,8 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
     #expect(try Data(contentsOf: ownedFile.url) == bytes)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
     #expect(await session.commitRestoration(prepared) == .committed)
+    let retired = try await until(session) { _ in true }
+    #expect(!retired.rows.contains { $0.inputID == inputID })
     #expect(
       try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
     #expect(try Data(contentsOf: ownedFile.url) == bytes)

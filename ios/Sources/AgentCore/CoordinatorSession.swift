@@ -315,7 +315,7 @@ public actor CoordinatorSession {
       publish()
       return .originalRetained
     }
-    transcript.delivery(request.inputId, .rejected)
+    transcript.retirePending(request.inputId)
     publish()
     return .committed
   }

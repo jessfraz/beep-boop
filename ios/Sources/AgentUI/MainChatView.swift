@@ -407,7 +407,7 @@ public struct MainChatView: View {
                   Task { await model.removeAttachment(file) }
                 }
                 .labelStyle(.iconOnly).frame(minWidth: 44, minHeight: 44)
-                .disabled(model.admitting)
+                .disabled(model.admitting || model.preparingAttachments)
               }
             }
           }
@@ -427,7 +427,7 @@ public struct MainChatView: View {
           Menu("Commands", systemImage: "command") {
             ForEach(model.commands, id: \.usage) { command in
               Button {
-                model.draft = String(command.usage.prefix(while: { !$0.isWhitespace })) + " "
+                model.insertCommand(command)
               } label: {
                 Text(command.usage)
                 Text(command.description)

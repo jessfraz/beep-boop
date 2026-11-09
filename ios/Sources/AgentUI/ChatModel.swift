@@ -109,6 +109,19 @@ final class ChatModel {
       sharedInbox: try? SharedDraftInbox.configured())
   }
 
+  func insertCommand(_ command: SlashCommand) {
+    let name = command.usage.prefix(while: { !$0.isWhitespace })
+    guard draftReady, !name.isEmpty else { return }
+    let text = draft.drop(while: \.isWhitespace)
+    let leading = text.prefix(while: { !$0.isWhitespace })
+    if commands.contains(where: { $0.usage.prefix(while: { !$0.isWhitespace }) == leading }) {
+      let note = text.dropFirst(leading.count)
+      draft = String(name) + (note.isEmpty ? " " : String(note))
+    } else {
+      draft = String(name) + " " + draft
+    }
+  }
+
   private var currentDraft: ComposerDraft {
     var text = draft
     if case .pending(let submitted) = admission, !submitted.isEmpty {

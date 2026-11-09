@@ -8,7 +8,7 @@ import XCTest
 final class HistoryInteractionTests: XCTestCase {
   private func launchMessages(
     _ messages: [HistoryMessage], toolDetails: [String: ToolDetails] = [:],
-    appearance: String? = nil
+    appearance: String? = nil, commands: [SlashCommand] = []
   ) async throws -> XCUIApplication {
     continueAfterFailure = false
     executionTimeAllowance = 600
@@ -17,6 +17,7 @@ final class HistoryInteractionTests: XCTestCase {
     let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
     await peer.history(initial: history, pages: [:], latest: history)
     await peer.toolDetails(toolDetails)
+    await peer.commands(commands)
     let app = XCUIApplication()
     app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
     app.launchArguments += ["-notificationsEnabled", "NO"]
@@ -108,6 +109,34 @@ final class HistoryInteractionTests: XCTestCase {
         "A sent message must leave the native composer; value=\(String(reflecting: composer.value)), placeholder=\(String(reflecting: composer.placeholderValue)): \(composer.debugDescription)"
       )
       XCTAssertTrue(app.keyboards.firstMatch.exists)
+    }
+  }
+
+  func testCommandMenuPreservesTheNoteAndReplacesThePreviousCommand() async throws {
+    let feedback = SlashCommand(description: "Report a problem", usage: "/feedback <note>")
+    let help = SlashCommand(description: "Show supported commands", usage: "/help")
+    let app = try await launchMessages([], commands: [feedback, help])
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let note = "Keep this note and /tmp/example.txt."
+    composer.tap()
+    composer.typeText(note)
+    for command in [feedback, help, help] {
+      app.buttons["composerMenu"].tap()
+      action("Commands", app: app).tap()
+      let choice = app.buttons.matching(
+        NSPredicate(
+          format: "label == %@ OR label == %@", command.usage,
+          "\(command.usage), \(command.description)")
+      ).firstMatch
+      XCTAssertTrue(choice.waitForExistence(timeout: 3), app.debugDescription)
+      choice.tap()
+      let name = command.usage.prefix(while: { !$0.isWhitespace })
+      XCTAssertEqual(
+        composer.value as? String, "\(name) \(note)",
+        "Selecting \(command.usage) must preserve the note"
+      )
+      try await assertVisibleEditorText("Keep this note", in: composer)
     }
   }
 
@@ -718,7 +747,9 @@ private actor InteractionPeer {
   private var settingsValue: NativeSettingsSnapshot?
   private var settingRequests: [NativeRequestSettings] = []
   private var submitted: [NativeRequestSubmit] = []
+  private var commandValues: [SlashCommand] = []
   func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }
+  func commands(_ values: [SlashCommand]) { commandValues = values }
   func settings(_ value: NativeSettingsSnapshot) { settingsValue = value }
   func settingsControls() -> [NativeRequestSettings] { settingRequests }
   func inputs() -> [NativeRequestSubmit] { submitted }
@@ -801,6 +832,9 @@ private actor InteractionPeer {
               conversationSettings: settingsValue == nil ? nil : true,
               inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model")), to: socket)
         try await emit(.history(try XCTUnwrap(initial)), to: socket)
+        if !commandValues.isEmpty {
+          try await emit(.commands(.init(commands: commandValues)), to: socket)
+        }
         if request.sourceStatus == true, let sourceStates {
           try await emit(.sources(.init(sources: sourceStates)), to: socket)
         }
