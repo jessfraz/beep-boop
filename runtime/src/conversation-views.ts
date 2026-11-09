@@ -28,7 +28,7 @@ export interface ConversationServices {
 type Emit = (event: RuntimeEventKind) => void;
 type View = { conversation_id: string; closed: boolean; finish(): void };
 
-/** A view observes Pi; independently admitted inputs retain normal Rex ownership. */
+/** Views observe Pi; inputs retain their owning task's execution mode. */
 export class ConversationViews {
   private readonly views = new Map<number, View>();
   constructor(private readonly services: () => Promise<ConversationServices>,
@@ -86,6 +86,7 @@ export class ConversationViews {
     }
   }
   private async host(app: ConversationServices, task: TaskRecord, threadId?: string, cwd = "/"): Promise<WorkerHost> {
+    if (app.tasks.isBackgroundTask(task)) return app.tasks.workerHost(task.id);
     if (task.worker.state !== "unassigned") return app.tasks.workerHost(task.id);
     const available = await app.environment.environment();
     const origins = threadId === undefined ? [] : (await Promise.all(available.nodes.map(async (node) =>
@@ -118,11 +119,11 @@ export class ConversationViews {
       await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments, command.origin);
       emit({ type: "input_accepted", input_id: command.input_id });
       const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported?.thread.id, imported?.thread.cwd), call);
-      if (dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
+      if (!app.tasks.isBackgroundTask(dispatched) && dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
     } else {
       const dispatched = await app.tasks.continueAgent(task.id, summary.agent_id, command.input, command.input_id, call, command.mode,
         () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments, command.origin);
-      if (dispatched.agents.find((agent) => agent.id === summary.agent_id)?.worker.state !== "bound") {
+      if (!app.tasks.isBackgroundTask(dispatched) && dispatched.agents.find((agent) => agent.id === summary.agent_id)?.worker.state !== "bound") {
         throw new TaskError("Agent allocation is unconfirmed; its saved input is retained.");
       }
     }

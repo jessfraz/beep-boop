@@ -11,10 +11,10 @@ import { runScheduled } from "../src/scheduled.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
 
-test("timer and manual runs reuse one attached job conversation with each admitted prompt and model", { timeout: 15_000 }, async () => {
+test("timer and manual runs reuse one background job conversation with each admitted prompt and model", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-reuse-")), clock = new FakeClock();
-  const app = await openScheduled(directory, "original", clock), controller = new AbortController();
-  let worker: Promise<unknown> | undefined, release = () => {};
+  const app = await openScheduled(directory, "original", clock);
+  let release = () => {};
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
     plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {}, indexHistory: async () => {},
     runJob: (occurrence, signal, actor) => runScheduled(occurrence, signal, app, actor),
@@ -44,9 +44,7 @@ test("timer and manual runs reuse one attached job conversation with each admitt
       },
     ]);
     const first = await scheduler.runJob({ type: "run_job", request_id: "first", job_id: original.id, schedule_id: null });
-    await pump(async () => (await app.tasks.get(first.task_id)).worker.state === "bound");
     const conversationId = (await app.tasks.get(first.task_id)).conversation_id;
-    worker = app.worker(first.task_id, controller, app.call, true);
     await firstStarted;
     const second = await scheduler.runJob({ type: "run_job", request_id: "second", job_id: original.id, schedule_id: null });
     assert.equal(second.task_id, first.task_id);
@@ -63,10 +61,9 @@ test("timer and manual runs reuse one attached job conversation with each admitt
     assert.equal(task.conversation_id, conversationId); assert.equal((await app.tasks.list()).length, 1);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 3);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 0);
     assert.deepEqual((await scheduler.status()).errors, []);
-    controller.abort(); await worker;
     await app.tasks.update(task.id, (saved) => { saved.model = { ...original.model, model_id: "retired-model" }; });
     app.faux.setResponses([
       (_context, _options, _state, model) => {
@@ -81,14 +78,11 @@ test("timer and manual runs reuse one attached job conversation with each admitt
     ]);
     const resumed = await scheduler.runJob({ type: "run_job", request_id: "reconnected", job_id: original.id, schedule_id: null });
     assert.equal(resumed.task_id, task.id);
-    await pump(async () => (await app.tasks.get(task.id)).pending.length > 0 && (await app.tasks.get(task.id)).worker.state === "bound");
-    worker = app.worker(task.id); await worker;
     await pump(async () => (await scheduler.status()).pending === 0);
     assert.equal((await app.tasks.get(task.id)).conversation_id, conversationId);
     const read = app.commands.find((command) => command.type === "read_file");
     assert.ok(read?.type === "read_file"); assert.equal(read.path, join(updated.cwd, "source.txt"));
   } finally {
-    release(); controller.abort(); await worker?.catch(() => {});
-    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+    release(); await app.close(); await rm(directory, { recursive: true, force: true });
   }
 });

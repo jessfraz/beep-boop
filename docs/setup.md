@@ -219,13 +219,20 @@ return only the task result. No website-specific Nix entries or browser
 credential mappings are needed. Machine authentication stays with the
 credential provider and does not depend on unlocking the desktop extension.
 
-Ask Beep Boop to use Chrome on a named machine when necessary. `browser_open`
-creates an owned tab. `browser_status` inspects the live connection;
+Ask Beep Boop to use Chrome on a named machine when necessary. With native
+Chrome, `browser_user_tabs` discovers existing user web tabs without navigating
+them. `browser_claim_tab` takes the exact returned identity, URL and title to
+borrow a signed-in tab; another conversation cannot claim it concurrently.
+Workers stay on their owning host; the coordinator can choose another host
+for browser recovery. `browser_open` creates a disposable tab.
+`browser_status` inspects the live connection;
 `browser_run_code` runs an `async (page) => { ... }` function with the normal
 Playwright Page API. Use whichever locators, waits, frames, evaluation, file
 uploads, downloads and other browser operations the task needs. Await the
 operations and handle dialogs through normal Page event handlers. Return a
-serializable result or use `console.log` for output. Pages created through
+serializable result. Only that explicit result is returned, with secret
+redaction; console output and automatic page snapshots are omitted. Request
+`browser_action` snapshot explicitly when needed. Pages created through
 `page.context().newPage()` and popups from owned pages are tracked for cleanup.
 `browser_action` also provides convenience commands for snapshots, navigation,
 form input, clicks, keys, dialogs and retaining a result tab. Handles
@@ -237,9 +244,11 @@ page out invalidates its control handle and preserves the page.
 Clicks, form input, and key presses bring their owned tab to the front. Reading
 snapshots leaves the foreground tab alone.
 
+Claimed user tabs are released without closing them, including after errors;
+their drafts and existing page state survive. `close_tab` cannot close them.
 Disposable tabs close when the turn finishes. `retain_tab` preserves a needed
-draft or result for the user; `browser_release` closes remaining owned tabs and
-disconnects while Chrome keeps running. Retained results survive disconnect
+draft or result for the user; `browser_release` closes remaining disposable tabs
+and disconnects while Chrome keeps running. Retained results survive disconnect
 and leave the task's tab group.
 
 After interruption or connection loss, Beep Boop retains uncertain operations and
@@ -383,10 +392,12 @@ serialize with the job's scheduled runs without changing its next occurrence or
 any source timer. Each explicit request creates a run, including when that job
 already has work queued. Inspect it with `beep-boop tasks read ID` .
 
-Timer and manual runs share the job's task, Pi conversation and Rex chat.
-An open chat is reused; a closed Rex session can reopen with the saved
-conversation. Audit individual inputs and outcomes rather than counting tasks
-or using a task's last-update time as a run boundary.
+Timer and manual runs share the job's task and Pi conversation. Job-owned work
+and its child agents run in the coordinator's background process through
+registered host connections, without opening Rex sessions or terminals. Chat
+views attach to that same saved conversation. Audit individual inputs and
+outcomes rather than counting tasks or using a task's last-update time as a run
+boundary.
 
 Startup applies valid configured directories; validation errors retain the
 applied catalog and are reported in the coordinator log. Without configured

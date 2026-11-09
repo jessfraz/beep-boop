@@ -6,10 +6,13 @@ import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { CoordinatorEnvironment } from "../../src/environment.js";
+import { ConversationCatalog } from "../../src/catalog.js";
+import { ConversationViews } from "../../src/conversation-views.js";
+import { HistoryStore } from "../../src/history.js";
 import { createGuidance } from "../../src/guidance.js";
 import { ConversationModels } from "../../src/models.js";
 import { SourceJournal, createSourceTools } from "../../src/sources.js";
-import { TaskStore, type HostCall } from "../../src/tasks.js";
+import { TaskStore } from "../../src/tasks.js";
 import { createAppTools, Executions } from "../../src/tools.js";
 import type { AgentNode } from "../../src/generated/AgentNode.js";
 import type { HostCommand } from "../../src/generated/HostCommand.js";
@@ -35,19 +38,22 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry,
     ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }),
     identity: { attribution: null }, settings: { retry: { enabled: false } } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session, new ConversationModels(models));
+  const inference = new ConversationModels(models), tasks = new TaskStore(session, inference);
+  const histories = new HistoryStore(session); tasks.useHistory(histories);
   const environment = new CoordinatorEnvironment(session); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   await environment.configure({ node, settings: { model: fixtureModel, instructions: "Current global policy.", context_repositories: [], sources: [] } });
   environment.setConnected([node.host_id]);
   const executions = new Executions(), tools = createAppTools(tasks, executions), guidance = createGuidance(executions);
   await executions.prepareRecovery(session);
-  registry.install(guidance); registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker);
+  registry.install(guidance); registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent);
   const sources = new SourceJournal(session, tasks, executions);
   const sourceTools = createSourceTools(sources, executions); registry.install(sourceTools.main); registry.install(sourceTools.worker);
   const commands: HostCommand[] = [];
-  const call = async (command: HostCommand): Promise<HostResult> => {
+  const call = async (request: HostCommand): Promise<HostResult> => {
+    let command = request;
+    while (command.type === "on_node") command = command.command;
     commands.push(command);
-    if (command.type === "on_node" && command.command.type === "inspect_worker") return { type: "worker_presence", presence: { state: "present", running: false } };
+    if (command.type === "inspect_worker") return { type: "worker_presence", presence: { state: "present", running: false } };
     if (command.type === "resume_agent_worker") return { type: "spawned", binding: command.binding };
     if (command.type === "spawn_subagent") return { type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } };
     if (command.type === "spawn_worker" || command.type === "resume_worker") return { type: "spawned", binding };
@@ -58,14 +64,25 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     if (command.type === "read_file") return { type: "file", content: await readFile(command.path, "utf8"), truncated: false };
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
-  async function worker(taskId: string, controller = new AbortController(), hostCall: HostCall = call, interactive = false, agentId?: string) {
-    const task = await tasks.get(taskId);
-    const actor = agentId === undefined ? task : task.agents.find((agent) => agent.id === agentId);
-    if (actor?.worker.state !== "bound") throw new Error("The scheduled fixture has no bound worker");
-    return tasks.run({ type: "run_task", task_id: task.id, ...(agentId === undefined ? {} : { agent_id: agentId }), allocation_id: actor.worker.allocation_id, binding: actor.worker.binding,
-      model: fixtureModel, cwd: actor.worker.host.cwd, instructions: "", interactive },
-    (conversation, host, model) => executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [host], role: "worker", model, call: hostCall }), [guidance, tools.host, agentId === undefined ? tools.worker : tools.agent, sourceTools.worker], hostCall, undefined,
-    { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
+  function configureBackground(hostCall: (command: HostCommand, signal: AbortSignal) => Promise<HostResult> = call) {
+    tasks.useBackgroundExecution({
+      available: () => true,
+      extensions: (agentId) => [guidance, tools.host, agentId === undefined ? tools.worker : tools.agent, sourceTools.worker],
+      call: (command, host, signal) => hostCall(environment.route(command, host), signal),
+      bind: (conversation, host, model, signal) => executions.bind(conversation.id.toString(), {
+        cwd: host.cwd, hosts: [host], default_host: host, model, role: "worker",
+        project: () => hostCall({ type: "on_node", host_id: node.host_id, command: { type: "project_guidance", cwd: host.cwd } }, signal),
+        call: (command) => hostCall(environment.route(command, host), signal),
+      }),
+    });
   }
-  return { session, tasks, sources, environment, call, commands, faux, executions, worker, registry, sourceTools };
+  configureBackground();
+  const catalog = new ConversationCatalog(session, histories, tasks);
+  const views = new ConversationViews(async () => ({ harness: session, tasks, sources, histories, inference, environment, catalog }), () => {});
+  const close = async () => {
+    views.close(); catalog.close();
+    const detached = tasks.detachBackground();
+    await session.close(BACKGROUND_CONTEXT); await detached;
+  };
+  return { session, tasks, sources, environment, call, commands, faux, executions, registry, sourceTools, configureBackground, views, close };
 }

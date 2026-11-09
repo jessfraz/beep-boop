@@ -250,10 +250,9 @@ test("natural job discovery is compact and run_job returns admission while its t
   } finally { app.unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a manually admitted task executes its reviewed focus through the actual scheduled worker lifecycle", { timeout: 10_000 }, async () => {
+test("a manually admitted task executes its reviewed focus through the actual background task lifecycle", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-manual-worker-"));
-  const app = await openScheduled(directory), controller = new AbortController();
-  let worker: Promise<unknown> | undefined;
+  const app = await openScheduled(directory);
   const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
     plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {}, indexHistory: async () => {},
     runJob: (occurrence, signal, actorId) => runScheduled(occurrence, signal, app, actorId),
@@ -275,12 +274,11 @@ test("a manually admitted task executes its reviewed focus through the actual sc
     assert.deepEqual(await savedReceipt(app, "real-worker"), receipt);
     await pump(async () => {
       assert.deepEqual((await scheduler.status()).errors, [], "Manual admission must reach its ordinary task handoff");
-      return (await app.tasks.get(receipt.task_id)).worker.state === "bound";
+      return (await scheduler.status()).pending === 0;
     });
-    worker = app.worker(receipt.task_id, controller); await worker;
     await pump(async () => (await scheduler.status()).pending === 0);
     const task = await app.tasks.get(receipt.task_id), conversation = await app.tasks.conversation(task.conversation_id);
-    assert.deepEqual(task.model, job.model); assert.ok(task.worker.state === "bound"); assert.equal(task.worker.host.cwd, job.cwd);
+    assert.deepEqual(task.model, job.model); assert.equal(task.worker.state, "unassigned"); assert.equal((await app.tasks.workerHost(task.id)).cwd, job.cwd);
     const input = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, "manual:real-worker"), BACKGROUND_CONTEXT);
     assert.equal(input?.status, "done");
     const finished = (await scheduler.getJob(job.id)).last_run;
@@ -295,5 +293,5 @@ test("a manually admitted task executes its reviewed focus through the actual sc
     const effect = app.commands.find((command) => command.type === "exec"); assert.ok(effect?.type === "exec"); assert.equal(effect.cwd, job.cwd);
     assert.deepEqual(await scheduler.runJob(request("real-worker")), receipt);
     assert.equal((await app.tasks.list()).length, 1); assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);
-  } finally { controller.abort(); await worker?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

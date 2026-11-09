@@ -783,6 +783,24 @@ test("host replies are correlated to their request and release resources when a 
   const rejected = assert.rejects(abandoned, /ended before/); requests.finish(9); await rejected;
 });
 
+test("an actor stop cancels only its calls and retains an external write until its actual receipt", async () => {
+  const emitted: { request: number; call: string }[] = [], cancelled: string[] = [];
+  const requests = new HostRequests((request, call) => emitted.push({ request, call }), (_request, call) => cancelled.push(call));
+  const controller = new AbortController(); let settled = false;
+  const write = requests.call(7, { type: "write_file", path: "/example/owned-write", content: "Verified content" }, controller.signal)
+    .finally(() => { settled = true; });
+  const other = requests.call(7, { type: "read_file", path: "/example/other-actor", offset: 0, limit: 10 });
+  const first = emitted[0], second = emitted[1]; assert.ok(first && second);
+  controller.abort(); await Promise.resolve();
+  assert.deepEqual(cancelled, [first.call]); assert.equal(settled, false);
+  assert.equal(requests.reply(7, second.call, { type: "file", content: "Unaffected", truncated: false }), true);
+  assert.deepEqual(await other, { type: "file", content: "Unaffected", truncated: false });
+  assert.equal(settled, false, "Cancellation cannot infer whether an external write committed");
+  assert.equal(requests.reply(7, first.call, { type: "written" }), true); assert.deepEqual(await write, { type: "written" });
+  await assert.rejects(requests.call(7, { type: "write_file", path: "/example/late-write", content: "Must not run" }, controller.signal), /actor stopped/);
+  assert.equal(emitted.length, 2);
+});
+
 test("worker host tools execute through the attached client while the main conversation stays available", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-task-")); const app = await open(directory);
   let releaseHost: (result: HostResult) => void = () => {};

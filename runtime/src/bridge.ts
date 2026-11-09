@@ -100,10 +100,11 @@ const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
 let backgroundOwner: number | undefined;
 let backgroundSources = false;
+let backgroundAvailable = false;
 let stopBackground: (() => void) | undefined;
-function backgroundCall(command: import("./generated/HostCommand.js").HostCommand) {
+function backgroundCall(command: import("./generated/HostCommand.js").HostCommand, signal?: AbortSignal) {
   if (backgroundOwner === undefined) throw new TaskError("The coordinator background transport is unavailable");
-  return hostRequests.call(backgroundOwner, command);
+  return hostRequests.call(backgroundOwner, command, signal);
 }
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
@@ -199,8 +200,8 @@ async function openApplication(): Promise<Application> {
       }
     },
     async indexHistory() { await retrieval.sync(backgroundCall); },
-    jobActor: (job) => openJobActor(job, tasks, backgroundCall),
-    async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, environment, executions, call: backgroundCall }, actor); },
+    jobActor: (job) => openJobActor(job, tasks),
+    async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
@@ -208,6 +209,21 @@ async function openApplication(): Promise<Application> {
   toolsets.main = [...toolsets.main, responsePolicy, inputOrigins];
   toolsets.worker = [...toolsets.worker, inputOrigins];
   toolsets.agent = [...toolsets.agent, inputOrigins];
+  tasks.useBackgroundExecution({
+    available: () => backgroundAvailable,
+    extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
+    call: (operation, host, signal) => backgroundCall(environment.route(operation, host), signal),
+    prepare: (selected) => inference.preflight(selected),
+    bind: (conversation, host, model, signal) => executions.bind(conversation.id.toString(), {
+      model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id,
+      connectedHosts: () => environment.hosts(host.cwd, host.host_id, [host]), role: "worker",
+      project: () => backgroundCall(host.host_id === null ? { type: "project_guidance", cwd: host.cwd }
+        : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, signal),
+      search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
+        (operation) => backgroundCall(operation, signal), importer.isRunning(), mode),
+      call: (operation) => backgroundCall(environment.route(operation, host), signal),
+    }),
+  });
   if (await notifications.start()) harness.resume();
   return { ...core, background, toolsets, startup };
   }); } catch (error) {
@@ -393,13 +409,20 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "run_background": {
         if (backgroundOwner !== undefined) throw new TaskError("The coordinator already owns background execution");
         backgroundOwner = id;
+        backgroundAvailable = true;
         backgroundSources = command.settings.sources;
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
-          await (await app()).background.start(command.settings);
+          const application = await app();
+          await application.tasks.resumeBackground();
+          await application.background.start(command.settings);
           admissions.delete(id);
           await stopped;
-        } finally { backgroundOwner = undefined; stopBackground = undefined; }
+        } finally {
+          backgroundAvailable = false;
+          void (await app()).tasks.detachBackground();
+          backgroundOwner = undefined; stopBackground = undefined;
+        }
         break;
       }
       case "sync_jobs": emit(id, { type: "jobs_synced", report: await (await app()).background.syncJobs(command.jobs) }); break;
@@ -550,7 +573,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await conversationViews.input(command, (operation) => hostRequests.call(id, operation), (event) => emit(id, event)); break;
       }
       case "conversation_interrupt": {
-        const conversation = await (await app()).tasks.conversation(command.conversation_id);
+        const { tasks } = await app();
+        const conversation = await tasks.conversation(command.conversation_id);
+        if (await tasks.interruptBackground(command.conversation_id)) { emit(id, { type: "interrupted" }); break; }
         const owner = [...activeConversations].find(([request, active]) => !ending.has(request) &&
           active.id === conversation.id && (workers.has(request) || mainTurns.has(request)))?.[0];
         if (owner === undefined) await conversation.abort(BACKGROUND_CONTEXT);
@@ -571,7 +596,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           : hosts.find((host) => host.name === command.host || host.host_id === command.host);
         if (host === null || host === undefined) throw new TaskError("Choose an online execution host");
         const opened = await tasks.dispatch(task.id, host, (operation) => hostRequests.call(id, operation));
-        if (opened.worker.state !== "bound") throw new TaskError("Rex session allocation is unconfirmed; saved history is retained");
+        if (!tasks.isBackgroundTask(opened) && opened.worker.state !== "bound") throw new TaskError("Rex session allocation is unconfirmed; saved history is retained");
         emit(id, { type: "notice", task_id: task.id, text: `Opened ${task.title}` }); break;
       }
       case "list_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.list() }); break;
@@ -936,6 +961,9 @@ try {
     const operation = handle(request).finally(() => pending.delete(operation));
     pending.add(operation);
   }
+  const opened = application === undefined ? undefined : await application.catch(() => undefined);
+  if (opened !== undefined) void opened.tasks.detachBackground();
+  if (backgroundOwner !== undefined) hostRequests.finish(backgroundOwner);
   stopBackground?.();
   conversationViews.close();
   for (const worker of workers.values()) worker.controller.abort();
@@ -945,7 +973,12 @@ try {
     const opened = await application.catch(() => undefined);
     if (opened !== undefined) {
       opened.notifications.close(); opened.stopInputDelivery();
-      try { await opened.retrieval.close(); await opened.harness.close(BACKGROUND_CONTEXT); }
+      try {
+        void opened.tasks.detachBackground();
+        await opened.harness.close(BACKGROUND_CONTEXT);
+        await opened.tasks.detachBackground();
+        await opened.retrieval.close();
+      }
       finally { await opened.telemetry.close(); }
     }
   }

@@ -10,12 +10,13 @@ history and report concise, actionable results back to it.
               /                 \
        existing task       separate outcome
        reuse conversation  create task record
-       and Rex binding     choose online host
+       and execution mode  choose online host
               \                 /
-            named Rex task session
-            + Implementation
-            + Review
-            + Checks
+              task conversation
+              + background job actor
+              | + child agents
+              + interactive Rex session
+                + named task terminals
                        |
            outcome + next actor/check
                        |
@@ -52,7 +53,7 @@ live delivery and history replay.
                 + settings / context repositories
                 + source polling / task routing
                           |
-                reuse task owner and Rex binding
+                reuse task owner and execution mode
                 choose host only for new work
                           |
           +---------------+----------------+
@@ -89,8 +90,9 @@ connections. Saved metadata survives a restart; online status requires a live
 connection.
 
 The coordinator runs unqualified main/triage effects locally. Work targeted at
-a registered machine travels down that worker's existing connection and uses
-its local Rex socket. Unqualified task effects stay on the owning worker.
+a registered machine travels down that worker's existing connection to its
+native executor. Interactive terminal launches use its local Rex socket.
+Unqualified task effects stay on the owning worker.
 Main, workers and child agents see the connected host registry; an explicit
 `exec` host uses the same coordinator routing without moving task or resource
 ownership. Disconnects never silently move an effect onto the coordinator.
@@ -137,17 +139,18 @@ The MVP does not replicate the store or recover onto another host. If the
 coordinator is down, the client reports that it is unavailable. Copying a live
 SQLite database or starting two coordinators is not a recovery mechanism.
 
-## Tasks and Rex
+## Tasks and execution
 
 A task has a stable ID, title, intended outcome, source links, summary, pending
-inputs and one owning conversation. Its Rex binding records the actual host,
-session, window and terminal. Exact provider/account/thread links rank first;
-semantic or keyword search retrieves saved conversation text, with task metadata
-as a fallback. Read relevant originals before choosing; several conversations
-may inform one task. [History](history.md) owns the retrieval details.
+inputs and one owning conversation. An interactive task's Rex binding records
+the actual host, session, window and terminal. Exact provider/account/thread
+links rank first; semantic or keyword search retrieves saved conversation text,
+with task metadata as a fallback. Read relevant originals before choosing;
+several conversations may inform one task. [History](history.md) owns the
+retrieval details.
 
-Ordinary tasks own a top-level Rex session on their execution host. Child agents
-have independent conversations and named terminals inside that same session.
+Interactive tasks own a top-level Rex session on their execution host. Child
+agents have independent conversations and named terminals inside that session.
 They return results to their parent; the parent returns the outcome to the
 main chat. The same task cannot acquire a second active execution. Recent task
 activity promotes its session in the host's sidebar.
@@ -158,6 +161,17 @@ Follow-ups and refinements of the same broader effort stay in that task;
 named child terminals handle bounded subwork. A separate outcome can start a
 new top-level task. Private delegation receipts retain the considered
 conversation IDs, retrieval gaps and reason for overriding related work.
+
+Job-owned tasks and their children use the same actor loop, outbox, history and
+outcome journal through the coordinator's background transport. Host effects use
+registered worker connections. Timers, source handoffs and chat continuations
+retain this execution mode without allocating Rex terminals. Native views
+observe the conversation independently of execution. Stopping an actor cancels
+only its host calls; issued effects still return their actual receipts.
+An already attached Rex worker keeps ownership until it detaches; background
+dispatch does not create a competing execution.
+Coordinator shutdown detaches execution while preserving admitted Pi work.
+An explicit user Stop withdraws inputs through Pi's interruption path.
 
 Task terminals remain interactive after a turn. A single attached actor
 serializes replies typed in the terminal and inputs queued by the main agent;

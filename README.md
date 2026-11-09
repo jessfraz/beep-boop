@@ -3,9 +3,9 @@
 An agent, regrettably.
 
 A Rust CLI around [Pi Durable](https://github.com/earendil-works/pi), with
-ChatGPT plan sign-in, persistent conversations and workers in
-[Rex](https://www.superlogical.com/rex). One main conversation finds existing
-work before starting another task.
+ChatGPT plan sign-in, persistent conversations, background jobs and interactive
+workers in [Rex](https://www.superlogical.com/rex). One main conversation finds
+existing work before starting another task.
 
 ## Why
 
@@ -15,7 +15,7 @@ concrete decision. Otherwise, stay quiet.
 
 Authorization carries forward; an approved action should not trigger another
 approval loop. Pi owns the provider interface and durable conversations. Rex
-owns the hosts, sessions and terminals. Reuse them.
+supplies interactive sessions and terminals. Reuse existing work.
 
 ```text
   phone CLI in Rex       CLI / Rex terminal on any host
@@ -27,6 +27,7 @@ owns the hosts, sessions and terminals. Reuse them.
                settings / context / incoming events
                           |
                find and reuse the right task
+               jobs: background actors / interactive: Rex
                           |
           +---------------+----------------+
           |               |                |
@@ -40,11 +41,13 @@ owns the hosts, sessions and terminals. Reuse them.
      + Follow-up      + Review         + Profile
 ```
 
-Every chat uses the coordinator. Each task gets one named Rex session on its
-execution machine; its subagents get named terminals inside that session.
-Scheduled jobs reuse their job's chat and Pi conversation across runs. Each run
-keeps its own admission identity and captured file settings. Closing a Rex
-session allows it to be reopened without losing the conversation.
+Every chat uses the coordinator. Interactive tasks get a named Rex session on
+their execution machine; their subagents get named terminals inside it.
+Scheduled jobs and their child agents run in the coordinator's background
+process through registered host connections. They open no Rex sessions or
+terminals and reuse the job's task and Pi conversation across runs. Each run
+keeps its own admission identity and captured file settings. Closing an
+interactive Rex session allows it to reopen without losing the conversation.
 The coordinator and workers can run macOS or Linux; these hosts are one example.
 Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain

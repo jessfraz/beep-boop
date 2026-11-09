@@ -25,6 +25,8 @@ test("native job and saved-work inspection uses the production coordinator witho
   const socket = join(state, "agent.sock"), runtime = fileURLToPath(new URL("../src/bridge.js", import.meta.url));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/beep-boop", import.meta.url));
   const generationIDs: TaskId[] = [];
+  // Inspection remains available without an execution host or provider auth.
+  // Startup/preflight and owner shutdown must retain these parked native runs.
   await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 }); await symlink(process.execPath, join(bin, "node"));
   await writeFile(join(directory, "config.toml"), 'node_name = "work-inspection-fixture"\njob_directories = []\n');
   await writeFile(join(directory, "AGENTS.md"), "Read only the invented retained evidence.\n");
@@ -33,6 +35,16 @@ test("native job and saved-work inspection uses the production coordinator witho
     const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(state, "session.sqlite")));
     const harness = await Harness.open(storage, { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
     return { harness, storage, tasks: new TaskStore(harness, new ConversationModels(models)) };
+  }
+  async function generations() {
+    // Read the running coordinator's durable state without another Harness that
+    // could acquire execution or recover its tasks.
+    const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(state, "session.sqlite")));
+    try {
+      return await Promise.all(generationIDs.map(async id => {
+        const record = await storage.task(id, BACKGROUND_CONTEXT); assert.ok(record); return record;
+      }));
+    } finally { await storage.close(BACKGROUND_CONTEXT); }
   }
   const seeded = await open();
   const jobID = "native-work-inspection";
@@ -98,6 +110,11 @@ test("native job and saved-work inspection uses the production coordinator witho
         await delay(10, undefined, { signal: t.signal });
       }
     }
+    const beforeInspection = await generations();
+    for (const record of beforeInspection) {
+      assert.equal(record.state.status, "sleeping", "The execution owner must retain the parked generation before any inspector attaches");
+      assert.equal(record.abortRequested, false);
+    }
     await control({ type: "sync_jobs", jobs: [{ id: jobID, title: "Native work inspection", prompt: "Read existing evidence", revision: "original",
       cwd: directory, timezone: "Etc/UTC", model: DEFAULT_MODEL, schedules: [{ id: "daily",
         recurrence: "DTSTART:20270101T090000Z\nRRULE:FREQ=DAILY", focus: null, prompt: null }] }] });
@@ -150,12 +167,16 @@ test("native job and saved-work inspection uses the production coordinator witho
       const swiftExit = await new Promise<number | null>((resolve, reject) => { swift.once("close", resolve); swift.once("error", reject); });
       assert.equal(swiftExit, 0, output); assert.match(output, /1 test passed|1 tests? passed|with 1 test/);
     }
+    const afterInspection = await generations();
+    assert.deepEqual(afterInspection.map(record => ({ id: record.id, state: record.state, abortRequested: record.abortRequested })),
+      beforeInspection.map(record => ({ id: record.id, state: record.state, abortRequested: record.abortRequested })),
+      "Attaching and detaching the production inspectors must neither stop nor resume the same parked generations");
     child.kill("SIGINT"); assert.equal(await closed, 0, stderr);
     const reopened = await open();
     try {
       for (const id of generationIDs) {
         const record = await reopened.harness.getTask(id, BACKGROUND_CONTEXT); assert.ok(record);
-        assert.equal(record.state.status, "sleeping", "Closing a read-only inspector must not stop or resume the native generation");
+        assert.equal(record.state.status, "sleeping", "Graceful coordinator shutdown must retain the same parked generation for restart");
         assert.equal(record.abortRequested, false);
       }
     } finally { await reopened.harness.close(BACKGROUND_CONTEXT); }

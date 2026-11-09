@@ -22,12 +22,18 @@ pub async fn run(
         .request(RuntimeCommand::RunBackground { settings })
         .await?;
     let mut effects = tokio::task::JoinSet::new();
-    let result = loop {
+    let mut cancellations = std::collections::HashMap::new();
+    let result = async { loop {
         tokio::select! {
             event = call.events.recv() => match event.context("Background transport closed")? {
                 RuntimeEventKind::HostCall { call_id, command } => {
                     let broker = broker.clone();
-                    effects.spawn(async move { (call_id, broker.execute(*command).await) });
+                    let (cancel, cancelled) = tokio::sync::watch::channel(false);
+                    ensure!(cancellations.insert(call_id.clone(), cancel).is_none(), "A background host call ID is already running");
+                    effects.spawn(async move { (call_id, broker.execute_cancelled(*command, cancelled).await) });
+                }
+                RuntimeEventKind::HostCancel { call_id } => {
+                    if let Some(cancel) = cancellations.get(&call_id) { let _ = cancel.send(true); }
                 }
                 RuntimeEventKind::Done => break Ok(()),
                 RuntimeEventKind::Failure { message, .. } => break Err(anyhow::anyhow!(message)),
@@ -35,13 +41,22 @@ pub async fn run(
             },
             effect = effects.join_next(), if !effects.is_empty() => {
                 let (id, result) = effect.context("Background effect queue closed")??;
+                cancellations.remove(&id);
                 runtime.reply(call.request_id, id, result).await?;
             }
             _ = runtime.stopped() => break Ok(()),
         }
-    };
-    effects.abort_all();
-    while effects.join_next().await.is_some() {}
+    } }.await;
+    for cancel in cancellations.values() {
+        let _ = cancel.send(true);
+    }
+    // Processes must exit and external writes must return their real receipts
+    // before the background owner releases their executor.
+    while let Some(effect) = effects.join_next().await {
+        if let Ok((id, result)) = effect {
+            let _ = runtime.reply(call.request_id, id, result).await;
+        }
+    }
     runtime.detach(call.request_id).await;
     result
 }

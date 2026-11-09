@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { BackgroundScheduler } from "../src/background.js";
 import { watchMainNotices } from "../src/main_observation.js";
 import { runScheduled } from "../src/scheduled.js";
@@ -20,9 +21,7 @@ function scheduler(app: Awaited<ReturnType<typeof openScheduled>>, completed: st
     async plan(_cadence, _after, now) { return { due: null, next: now + DAY }; },
     async refreshSources() {}, async triageSources() {}, async collectResources() {}, async indexHistory() {},
     async runJob(occurrence, signal, actor) {
-      const scheduled = runScheduled(occurrence, signal, app, actor);
-      while ((await app.tasks.get(actor)).worker.state !== "bound") await new Promise((resolve) => setTimeout(resolve, 2));
-      await Promise.all([scheduled, app.worker(actor)]); completed.push(occurrence.id);
+      await runScheduled(occurrence, signal, app, actor); completed.push(occurrence.id);
     },
   });
 }
@@ -36,7 +35,7 @@ function origin(row: HistoryMessage | undefined, job: { id: string; title: strin
 }
 async function continued(app: Awaited<ReturnType<typeof openScheduled>>, task: TaskRecord, id: string, text: string): Promise<void> {
   app.faux.setResponses([notice(text), fauxAssistantMessage("")]);
-  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await app.worker(task.id);
+  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await app.tasks.runBackground(task.id);
 }
 
 test("actual concurrent scheduler publications retain run titles live and after rename, deletion and reopen", { timeout: 20_000 }, async () => {
@@ -86,31 +85,45 @@ test("actual concurrent scheduler publications retain run titles live and after 
     const reopened = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(reopened, durable, "Historical rows must not look up renamed or deleted job/task titles");
     origin(reopened.find((row) => row.text.includes("parcel")), packages);
-  } finally { stop(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a scheduled child inherits its trusted lineage through deletion and its own continuation", { timeout: 15_000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-notice-child-")); let app = await openScheduled(directory, "original", new FakeClock());
+  const directory = await mkdtemp(join(tmpdir(), "agent-notice-child-")); let app = await openScheduled(directory, "original", new FakeClock()), release = () => {};
   try {
     const completed: string[] = [], background = scheduler(app, completed), job = { ...exampleJob(), title: "Package tracking" };
     await background.syncJobs([job]);
-    app.faux.setResponses([fauxAssistantMessage(fauxToolCall("spawn_agent", { title: "Unrelated child title", outcome: "Check the admitted source.", input: "Check the parcel." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
+    let entered = () => {};
+    const childStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const deleted = new Promise<void>((resolve) => { release = resolve; });
+    const respond: FauxResponseFactory = async (input) => {
+      const done = (name: string) => input.messages.some((message) => message.role === "toolResult" && message.toolName === name);
+      if (getCurrentSystemPrompt(input.messages).includes("Task outcome: Check the admitted source.")) {
+        if (done("report_result")) return fauxAssistantMessage("");
+        if (done("notify_user")) return fauxAssistantMessage(fauxToolCall("report_result", { summary: "Checked the parcel with evidence." }), { stopReason: "toolUse" });
+        entered(); await deleted; return notice("The child needs a concrete decision.");
+      }
+      return done("spawn_agent") ? fauxAssistantMessage("") : fauxAssistantMessage(fauxToolCall("spawn_agent", {
+        title: "Unrelated child title", outcome: "Check the admitted source.", input: "Check the parcel.",
+      }), { stopReason: "toolUse" });
+    };
+    app.faux.setResponses(Array.from({ length: 12 }, () => respond));
     const run = await background.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "child-job" }); await eventually(() => completed.length === 1);
-    const task = await app.tasks.get(run.task_id), child = task.agents[0]; assert.ok(child); assert.equal(child.worker.state, "bound");
+    await childStarted;
+    const task = await app.tasks.get(run.task_id), child = task.agents[0]; assert.ok(child); assert.equal(child.worker.state, "unassigned");
     await background.syncJobs([]); await app.tasks.update(task.id, (saved) => { saved.title = "Wrong renamed parent title"; });
-    app.faux.setResponses([notice("The child needs a concrete decision."), fauxAssistantMessage(fauxToolCall("report_result", { summary: "Checked the parcel with evidence." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
-    await app.worker(task.id, new AbortController(), app.call, false, child.id);
+    release(); await eventually(() => !app.tasks.isRunning(task.id));
     const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 1); origin(rows[0], job);
-    await app.session.close(BACKGROUND_CONTEXT); app = await openScheduled(directory, "original", new FakeClock()); scheduler(app, []);
+    await app.close(); app = await openScheduled(directory, "original", new FakeClock()); scheduler(app, []);
     const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(saved, rows);
-    await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
     app.faux.setResponses([notice("The same child has a second necessary decision."), fauxAssistantMessage(fauxToolCall("report_result", { summary: "Rechecked the same evidence." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
-    await app.worker(task.id, new AbortController(), app.call, false, child.id);
+    await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
+    await app.tasks.runBackground(task.id, undefined, child.id);
     const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(continuedRows.length, 2); origin(continuedRows[1], job);
-  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("main, generic and legacy notices never guess a job from titles, source links or body text", async () => {
@@ -119,7 +132,7 @@ test("main, generic and legacy notices never guess a job from titles, source lin
     const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "morning-brief" }] });
     const host = await app.environment.defaultHost(await app.environment.hosts("/workspace/example", null, [])); assert.ok(host);
     await app.tasks.enqueue(task.id, "Package tracking: a claimed job name is not transport metadata.", "generic"); await app.tasks.dispatch(task.id, host, app.call);
-    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await app.worker(task.id);
+    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await app.tasks.runBackground(task.id);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.sourceTools.main] }, BACKGROUND_CONTEXT);
     const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], call: app.call });
@@ -132,5 +145,5 @@ test("main, generic and legacy notices never guess a job from titles, source lin
     }
     const rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 5); for (const row of rows) assert.equal("notice_origin" in row, false);
-  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

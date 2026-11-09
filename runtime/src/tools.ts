@@ -101,15 +101,18 @@ export class HostRequests {
   private readonly cancelled = new Set<number>();
   private readonly pending = new Map<string, {
     request: number; resolve: (value: HostResult) => void; reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancellable: boolean;
+    timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancellable: boolean; dispose(): void;
   }>();
   constructor(private readonly emit: (request: number, call: string, command: HostCommand) => void,
     private readonly cancel: (request: number, call: string) => void = () => {}) {}
-  call(request: number, command: HostCommand): Promise<HostResult> {
+  call(request: number, command: HostCommand, signal?: AbortSignal): Promise<HostResult> {
+    if (signal?.aborted) return Promise.reject(new TaskError("This actor stopped before the host operation started"));
     if (this.cancelled.has(request)) return Promise.reject(new TaskError("This turn was interrupted before the host operation started"));
     if (this.pending.size >= 128) return Promise.reject(new TaskError("Too many pending host operations"));
     const call = randomUUID();
     return new Promise<HostResult>((resolve, reject) => {
+      const aborted = () => this.cancelCall(call);
+      const dispose = () => signal?.removeEventListener("abort", aborted);
       let operation = command;
       while (operation.type === "on_node") operation = operation.command;
       const timeout = operation.type === "exec" ? operation.timeout_seconds * 1000 + 10_000
@@ -118,14 +121,15 @@ export class HostRequests {
         : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;
       const timer = setTimeout(() => {
-        this.pending.delete(call);
+        this.pending.delete(call); dispose();
         reject(new TaskError("The execution client did not confirm the operation; inspect its state before retrying"));
       }, timeout);
-      this.pending.set(call, { request, resolve, reject, timer, cancelled: false, cancellable: operation.type === "embed" });
+      this.pending.set(call, { request, resolve, reject, timer, cancelled: false, cancellable: operation.type === "embed", dispose });
+      signal?.addEventListener("abort", aborted, { once: true });
       try { this.emit(request, call, command); }
       catch {
         clearTimeout(timer);
-        this.pending.delete(call);
+        this.pending.delete(call); dispose();
         reject(new TaskError("The execution client could not be reached"));
       }
     });
@@ -134,22 +138,26 @@ export class HostRequests {
     const pending = this.pending.get(call);
     if (pending === undefined || pending.request !== request) return false;
     clearTimeout(pending.timer);
-    this.pending.delete(call);
+    this.pending.delete(call); pending.dispose();
     pending.resolve(result);
     return true;
   }
   cancelRequest(request: number): void {
     this.cancelled.add(request);
     for (const [call, pending] of this.pending) {
-      if (pending.request !== request || pending.cancelled) continue;
-      pending.cancelled = true;
-      this.cancel(request, call);
-      // Embedding is a read-only computation, so its caller need not wait for
-      // an external write receipt before releasing an interrupted turn.
-      if (pending.cancellable) {
-        clearTimeout(pending.timer); this.pending.delete(call);
-        pending.reject(new TaskError("History embedding was interrupted"));
-      }
+      if (pending.request === request) this.cancelCall(call);
+    }
+  }
+  private cancelCall(call: string): void {
+    const pending = this.pending.get(call);
+    if (pending === undefined || pending.cancelled) return;
+    pending.cancelled = true;
+    this.cancel(pending.request, call);
+    // External effects retain their pending receipt until the host drains them.
+    // Embedding is read-only and can release its caller immediately.
+    if (pending.cancellable) {
+      clearTimeout(pending.timer); this.pending.delete(call); pending.dispose();
+      pending.reject(new TaskError("History embedding was interrupted"));
     }
   }
   resumeRequest(request: number): void { this.cancelled.delete(request); }
@@ -158,7 +166,7 @@ export class HostRequests {
     for (const [call, pending] of this.pending) {
       if (pending.request !== request) continue;
       clearTimeout(pending.timer);
-      this.pending.delete(call);
+      this.pending.delete(call); pending.dispose();
       pending.reject(new TaskError("The execution request ended before the host operation completed"));
     }
   }
@@ -280,9 +288,11 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       if (args.state.state === "waiting" && args.state.next_check !== null && !Number.isFinite(Date.parse(args.state.next_check))) {
         throw new TaskError("The next check must be an ISO timestamp or null");
       }
-      return output(await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
+      const recorded = await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
         call_id: api.callId, native_task_id: api.taskId,
-        settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" }));
+        settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" });
+      return output({ id: recorded.id, conversation_id: recorded.conversation_id, state: recorded.state,
+        updated_at: recorded.updated_at } satisfies Pick<TaskRecord, "id" | "conversation_id" | "state" | "updated_at">);
     } });
   const searchModes = { semantic: "semantic", keyword: "keyword" } satisfies Record<SearchMode, SearchMode>;
   const searchTask = defineTool({ name: "search_tasks", description: "Find related tasks and imported conversations before starting new work. Semantic search is the default; use keyword for literal identifiers, paths or errors. Read matching originals before continuing them.",
@@ -395,7 +405,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       } }),
     record,
   ] });
-  const continueAgent = defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and named terminal.",
+  const continueAgent = defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and owning execution.",
       parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ maxLength: 16000 }), attachments: attachmentIds,
         mode: Type.Optional(Type.Enum(inputModes)) }),
       async execute(args, api, context) {
@@ -405,7 +415,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
         return agentOutput("continue_agent", args, api.conversationId.toString(), await tasks.continueAgent(owner.task.id, args.agent_id, args.input, inputId, execution.call, args.mode ?? "steer", undefined, await tasks.attachmentRefs(args.attachments)));
       } });
-  const spawnAgent = defineTool({ name: "spawn_agent", description: "Give a bounded assignment to a named terminal in this task's Rex session. The parent retains the overall outcome.",
+  const spawnAgent = defineTool({ name: "spawn_agent", description: "Give a bounded assignment to an agent in this task. The parent retains the overall outcome.",
       parameters: Type.Object({ title: Type.String({ minLength: 1, maxLength: 80 }),
         outcome: Type.String({ minLength: 1, maxLength: 4000 }), input: Type.String({ maxLength: 16000 }), attachments: attachmentIds }),
       async execute(args, api, context) {

@@ -40,8 +40,8 @@ recovery; [history](history.md) describes import and retrieval.
   relaunch.
   The native text view copies and clears its buffer in the Send event, before
   asynchronous admission work. Native checks cover marked text, consecutive
-  sends, foreground recovery and active responses. Distributed-app verification
-  of the reported recurrence remains open.
+  sends, foreground recovery and active responses. The replacement is available
+  in TestFlight; physical-phone verification of the recurrence remains open.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Retain the live tail and older reading position through native rotation.
@@ -49,6 +49,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
   controls through Global Nix. Background, CLI and main-agent collection have
   passed live checks, preserving active and dirty work.
+- [ ] Run scheduled tasks and their child agents without Rex terminals, retaining
+  conversation identity, host tools, live views, steering and isolated stop.
 - [x] Verify failed scheduled occurrences settle after recovery on their
   existing tasks, clearing scheduler errors while preserving unresolved work.
 - [x] Verify parked scheduled model generations recover live on the existing
@@ -99,6 +101,8 @@ recovery; [history](history.md) describes import and retrieval.
   passed fresh password/TOTP sign-in with 1Password enabled, authenticated
   access, independent connections without browser approval clicks, and owned
   tab cleanup after the Beep Boop service restarted.
+- [ ] Reuse existing signed-in user tabs with exclusive control and preserved
+  drafts; return explicit browser-script results without automatic page dumps.
 - [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
   ordinary browser relaunch and interruption recovery with autofill enabled.
 - [ ] Deliver browser screenshot attachments.
@@ -129,7 +133,7 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Scheduled jobs through the existing coordinator background process and
   task follow-through path. Reuse durable timers; persist occurrence identities
   so restarts and retries cannot run a job twice.
-- [x] Reuse each scheduled job's Rex chat and Pi conversation across timer and
+- [x] Reuse each scheduled job's task and Pi conversation across timer and
   manual runs, preserving each admitted run's prompt, model and identity.
 - [x] Release CLI account diagnostics and scheduled-run timing, outcome and
   exact reply inspection. Keep unavailable historical timing explicit.
@@ -175,8 +179,8 @@ recovery; [history](history.md) describes import and retrieval.
 
 - [ ] Reconcile Rex server restarts, terminal exits and reconnects without
   duplicate sessions or lost pending inputs.
-- [ ] Transfer direct worker execution to a daemon before its terminal client
-  exits, retaining ownership of pending host effects.
+- [ ] Transfer interactive worker execution to a daemon before its terminal
+  client exits, retaining ownership of pending host effects.
 - [ ] Tested coordinator backups and restoration, including retained assets.
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.

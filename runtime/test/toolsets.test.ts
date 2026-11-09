@@ -22,6 +22,7 @@ import { createAppTools, createJobTools, Executions } from "../src/tools.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { fixtureModel } from "./model.js";
@@ -122,6 +123,67 @@ test("the main profile exposes usable inventory and explicit compact or full tas
       (input) => { assert.match(toolResult(input, "read_task"), /ORIGINAL_TASK_EVIDENCE/); return fauxAssistantMessage("Read the selected evidence."); },
     ]);
     assert.equal((await (await root.submit({ type: "input", content: "Read the task state, then its history." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("record_task confirms the saved state without replaying retained child evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-record-confirmation-")); let app = await open(directory);
+  let release = () => {};
+  try {
+    const source = { provider: "mail", account: "example", thread_id: "verified-reply" };
+    const task = await app.tasks.create({ title: "Record current progress", outcome: "Retain the owning job prompt and original evidence.",
+      model: fixtureModel, sources: [source] });
+    await app.tasks.enqueue(task.id, "Continue the existing work.");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const parent = await app.tasks.get(task.id); assert.ok(parent.worker.state === "bound");
+    const command = { type: "run_task", task_id: task.id, allocation_id: parent.worker.allocation_id, binding,
+      instructions: "", model: fixtureModel, cwd: host.cwd } satisfies Extract<RuntimeCommand, { type: "run_task" }>;
+    const child = await app.tasks.createAgent(command.task_id, { id: "finished-review", title: "Completed review",
+      outcome: "Keep the original review evidence", input: "Review the original evidence.", inputId: "review-input" });
+    const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    await app.tasks.dispatchAgent(command.task_id, child.id, async () => ({ type: "spawned", binding: childBinding }));
+    const allocated = (await app.tasks.get(command.task_id)).agents[0]; assert.ok(allocated?.worker.state === "bound");
+    const childSummary = "The original review verified the requested behavior. ".repeat(70);
+    app.faux.setResponses([fauxAssistantMessage(fauxToolCall("report_result", { summary: childSummary }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Completed the original review.")]);
+    await app.run({ ...command, agent_id: child.id, allocation_id: allocated.worker.allocation_id, binding: childBinding });
+    const before = await app.tasks.get(command.task_id); assert.equal(before.agents[0]?.state.state, "done");
+    assert.equal(before.agents[0]?.summary, childSummary);
+    const childConversation = await app.tasks.conversation(child.conversation_id);
+    const childEntries = (await childConversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
+    const childHistory = await app.tasks.history(command.task_id, 120_000, child.id);
+    const state = { state: "waiting", actor: "Supplier reply", next_check: null } satisfies TaskRecord["state"];
+    const root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
+    await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
+    let confirmation: string | undefined, recorded: TaskRecord | undefined, read: unknown;
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { task_id: command.task_id, summary: "Waiting for the verified reply.",
+        state, sources: [source] }), { stopReason: "toolUse" }),
+      async (input) => {
+        confirmation = toolResult(input, "record_task"); recorded = await app.tasks.get(command.task_id);
+        return fauxAssistantMessage(fauxToolCall("read_task", { task_id: command.task_id, agent_id: child.id, include_history: true }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        read = JSON.parse(toolResult(input, "read_task"));
+        return fauxAssistantMessage("The saved state and original evidence remain available.");
+      },
+    ]);
+    assert.equal((await (await root.submit({ type: "input", content: "Record verified progress, then read the original review." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.ok(confirmation !== undefined && recorded !== undefined);
+    assert.ok(Buffer.byteLength(confirmation) < 512, `record_task replayed ${Buffer.byteLength(confirmation)} bytes of task evidence`);
+    const expected: Pick<TaskRecord, "id" | "conversation_id" | "state" | "updated_at"> = {
+      id: recorded.id, conversation_id: recorded.conversation_id, state, updated_at: recorded.updated_at,
+    };
+    const receipt: unknown = JSON.parse(confirmation); assert.deepEqual(receipt, expected);
+    assert.equal(recorded.summary, "Waiting for the verified reply."); assert.deepEqual(recorded.sources, [source]);
+    assert.equal(recorded.outcome, before.outcome); assert.deepEqual(recorded.agents, before.agents); assert.deepEqual(recorded.pending, before.pending);
+    assert.ok(object(read)); assert.deepEqual(read.task, recorded); assert.equal(read.history, childHistory);
+    release(); release = () => {}; await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const reopened = await app.tasks.get(command.task_id);
+    assert.deepEqual(reopened.state, state); assert.deepEqual(reopened.sources, [source]); assert.deepEqual(reopened.agents, before.agents);
+    assert.equal(reopened.outcome, before.outcome); assert.deepEqual(reopened.pending, before.pending);
+    assert.deepEqual((await (await app.tasks.conversation(child.conversation_id)).entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, childEntries);
+    assert.equal(await app.tasks.history(command.task_id, 120_000, child.id), childHistory);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
