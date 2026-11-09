@@ -208,6 +208,8 @@ content, successful native rendering and Dynamic Type height growth. Full-chat
 captures cover grouped activity, opened reasoning and command details alongside
 the real header and composer. Screenshots are review artifacts, not golden-image
 comparisons.
+CI exports PNG and text attachments from each failing test into a separate
+artifact. Complete result bundles retain the recordings and remaining evidence.
 Nested block-container layout, remote image previews, math and diagrams remain
 outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.

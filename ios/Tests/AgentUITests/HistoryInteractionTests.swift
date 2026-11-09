@@ -1,4 +1,5 @@
 import AgentCore
+import CoreImage
 import Network
 import UIKit
 import Vision
@@ -98,16 +99,22 @@ final class HistoryInteractionTests: XCTestCase {
     #endif
   }
 
-  private func emptyEditor(_ editor: XCUIElement) -> XCTNSPredicateExpectation {
-    // XCTest can expose an empty field's placeholder as its value.
-    XCTNSPredicateExpectation(
-      predicate: NSPredicate { object, _ in
-        guard let field = object as? XCUIElement, field.exists else { return false }
-        guard let value = field.value else { return true }
-        guard let text = value as? String else { return false }
-        return text.isEmpty || text == field.placeholderValue
-      },
-      object: editor)
+  private func recognizedEditorText(_ image: CGImage) throws -> String {
+    // A dim placeholder can be visible while Vision sees only the bright buttons.
+    let exposed = CIImage(cgImage: image).applyingFilter(
+      "CIExposureAdjust", parameters: [kCIInputEVKey: 2])
+    let brighter = try XCTUnwrap(CIContext().createCGImage(exposed, from: exposed.extent))
+    var recognized: [String] = []
+    for input in [image, brighter] {
+      let request = VNRecognizeTextRequest()
+      request.recognitionLevel = .accurate
+      request.recognitionLanguages = ["en-US"]
+      request.usesLanguageCorrection = false
+      try VNImageRequestHandler(cgImage: input).perform([request])
+      recognized += (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    }
+    // Keep both passes so exposure cannot hide submitted text found in the original.
+    return recognized.joined(separator: " ")
   }
 
   private func assertVisibleEditorText(
@@ -123,13 +130,7 @@ final class HistoryInteractionTests: XCTestCase {
     repeat {
       screenshot = surface.screenshot()
       let image = try XCTUnwrap(screenshot.image.cgImage, file: file, line: line)
-      let request = VNRecognizeTextRequest()
-      request.recognitionLevel = .accurate
-      request.recognitionLanguages = ["en-US"]
-      request.usesLanguageCorrection = false
-      try VNImageRequestHandler(cgImage: image).perform([request])
-      recognized = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-        .joined(separator: " ")
+      recognized = try recognizedEditorText(image)
       let visible = recognized.lowercased().filter { !$0.isWhitespace }
       let containsSubmitted =
         submitted.map {
@@ -149,8 +150,10 @@ final class HistoryInteractionTests: XCTestCase {
     window.name = "native-composer-window"
     window.lifetime = .keepAlways
     add(window)
+    let value = editor.value
+    let valueType = value.map { String(reflecting: type(of: $0)) } ?? "nil"
     XCTFail(
-      "Expected visible editor text \(String(reflecting: expected)); recognized \(String(reflecting: recognized)); accessibility value \(String(reflecting: editor.value)); capture type \(surface.elementType.rawValue) frame \(surface.frame); editor frame \(editor.frame)",
+      "Expected visible editor text \(String(reflecting: expected)); recognized \(String(reflecting: recognized)); accessibility value \(String(reflecting: value)) type \(valueType); capture type \(surface.elementType.rawValue) frame \(surface.frame); editor frame \(editor.frame)",
       file: file, line: line)
   }
 
@@ -173,11 +176,6 @@ final class HistoryInteractionTests: XCTestCase {
       // Accessibility alone can already report an empty value.
       try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: app)
       XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
-      let cleared = emptyEditor(composer)
-      XCTAssertEqual(
-        XCTWaiter.wait(for: [cleared], timeout: 2), .completed,
-        "A sent message must leave the native composer; value=\(String(reflecting: composer.value)), placeholder=\(String(reflecting: composer.placeholderValue)): \(composer.debugDescription)"
-      )
       XCTAssertTrue(app.keyboards.firstMatch.exists)
     }
   }

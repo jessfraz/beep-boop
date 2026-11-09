@@ -33,10 +33,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ios-failures-${{ matrix.phase }}-${{ github.run_attempt }}
-          path: |
-            target/ios-validation/run.*/ios-*-failures/*.png
-            target/ios-validation/run.*/ios-*-failures/*.txt
-            target/ios-validation/run.*/ios-*-failures/manifest.json
+          path: target/ios-validation/run.*/ios-*-failures/
           if-no-files-found: ignore
           retention-days: 7
       - name: Retain native test results

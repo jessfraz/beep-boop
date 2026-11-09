@@ -134,8 +134,30 @@ cleanup() {
           | tee "$run_dir/ios-$suite-summary.json"; then
           printf 'Could not summarize %s\n' "$bundle" >&2
         fi
-        if ! xcrun xcresulttool export attachments --path "$bundle" \
-          --output-path "$run_dir/ios-$suite-failures" --only-failures; then
+        if ! python3 - "$bundle" "$run_dir/ios-$suite-summary.json" \
+          "$run_dir/ios-$suite-failures" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+bundle, summary, output = sys.argv[1:]
+failures = json.loads(Path(summary).read_text()).get("testFailures", [])
+test_ids = sorted({failure["testIdentifierString"] for failure in failures})
+status = 0
+for index, test_id in enumerate(test_ids):
+    # --only-failures omits screenshots explicitly attached by a failing test.
+    # Select its images/details; full recordings stay in the result bundle.
+    for extension in ("png", "txt"):
+        result = subprocess.run([
+            "xcrun", "xcresulttool", "export", "attachments", "--path", bundle,
+            "--test-id", test_id, "--filter", f"*.{extension}",
+            "--output-path", str(Path(output) / str(index) / extension),
+        ])
+        status = status or result.returncode
+sys.exit(status)
+PY
+        then
           printf 'Could not export failure attachments from %s\n' "$bundle" >&2
         fi
       fi
