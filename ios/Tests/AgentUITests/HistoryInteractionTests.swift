@@ -65,6 +65,11 @@ final class HistoryInteractionTests: XCTestCase {
   private func enableSimulatorAutocorrection() throws {
     continueAfterFailure = false
     #if targetEnvironment(simulator)
+      func tapSwitch(_ element: XCUIElement) {
+        // Settings can wrap the actual switch in another accessibility switch.
+        let control = element.switches.firstMatch
+        (control.exists ? control : element).tap()
+      }
       // The native validation jobs own disposable simulators. Settings also
       // broadcasts the preference change to the keyboard's existing process.
       let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
@@ -92,9 +97,20 @@ final class HistoryInteractionTests: XCTestCase {
         keyboard.tap()
       }
       XCTAssertTrue(correction.waitForExistence(timeout: 5), settings.debugDescription)
-      if correction.value as? String == "1" { correction.tap() }
-      correction.tap()
+      if correction.value as? String == "1" { tapSwitch(correction) }
+      tapSwitch(correction)
       XCTAssertEqual(correction.value as? String, "1", settings.debugDescription)
+      // First-run Slide to Type onboarding can intercept later key taps.
+      let slideToType = settings.switches["Slide to Type"]
+      if slideToType.exists {
+        for _ in 0..<6 {
+          if slideToType.isHittable { break }
+          settings.swipeUp()
+        }
+        XCTAssertTrue(slideToType.isHittable, settings.debugDescription)
+        if slideToType.value as? String == "1" { tapSwitch(slideToType) }
+        XCTAssertEqual(slideToType.value as? String, "0", settings.debugDescription)
+      }
     #else
       throw XCTSkip("Keyboard preference setup requires a disposable simulator.")
     #endif
@@ -570,12 +586,19 @@ final class HistoryInteractionTests: XCTestCase {
     let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
     defer { settings.terminate() }
     var expected: [String] = []
-    for _ in 0..<3 {
-      for character in "The parcel is teh" {
+    // Repeated submissions can change native suggestions. Use a different
+    // typo for each Send and keep them separate from the identical-typing test.
+    let drafts = [
+      ("The parcel will arive", "arrive"),
+      ("The parcel has an adress", "address"),
+      ("The parcel arrives tomorow", "tomorrow"),
+    ]
+    for (draft, correction) in drafts {
+      for character in draft {
         app.keys[character == " " ? "space" : String(character)].tap()
       }
       try await eventually(description: "pending correction before the app switch") {
-        self.action("the", app: app).exists
+        self.action(correction, app: app).exists
       }
       let text = try XCTUnwrap(composer.value as? String)
       expected.append(text)
