@@ -134,6 +134,10 @@ cleanup() {
           | tee "$run_dir/ios-$suite-summary.json"; then
           printf 'Could not summarize %s\n' "$bundle" >&2
         fi
+        if ! xcrun xcresulttool export attachments --path "$bundle" \
+          --output-path "$run_dir/ios-$suite-failures" --only-failures; then
+          printf 'Could not export failure attachments from %s\n' "$bundle" >&2
+        fi
       fi
     done
   fi

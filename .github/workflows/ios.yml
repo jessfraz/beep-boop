@@ -28,13 +28,25 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - name: Check Swift and iOS
         run: bash ios/scripts/check.sh "${{ matrix.phase }}"
+      - name: Retain failure screenshots and details separately
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-failures-${{ matrix.phase }}-${{ github.run_attempt }}
+          path: |
+            target/ios-validation/run.*/ios-*-failures/*.png
+            target/ios-validation/run.*/ios-*-failures/*.txt
+            target/ios-validation/run.*/ios-*-failures/manifest.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Retain native test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ios-validation-${{ matrix.phase }}-${{ github.run_attempt }}
           path: |
-            target/ios-validation/run.*/ios-*
+            target/ios-validation/run.*/ios-*.xcresult
+            target/ios-validation/run.*/ios-*-summary.json
             target/ios-validation/run.*/macos-rendered/
           if-no-files-found: warn
           retention-days: 7

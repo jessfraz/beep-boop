@@ -113,7 +113,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   state and character/attachment counts, without message text or file paths.
   `/feedback` includes up to 15 minutes of current-process metadata in a
   private `Composer.log` attachment when a file slot is available. Collection
-  stops waiting after two seconds and reports empty or unavailable coverage.
+  includes the OS version, stops waiting after two seconds and reports empty
+  or unavailable coverage.
 - **Connection → Conversation settings** changes the main conversation's model,
   reasoning and Fast setting without submitting the draft. Configured and
   effective selections are shown separately; an unknown active selection stays
@@ -215,6 +216,8 @@ CI runs `host`, `simulator-core`, `simulator-performance` and `simulator-ui` in
 parallel; every phase must pass. The default local command runs all checks;
 `simulator` keeps the three simulator suites together for local use. Each
 simulator phase creates and removes its own device.
+Failed simulator runs also retain PNG/text attachments and their native manifest
+in a separate `ios-failures-*` CI artifact, alongside the complete result bundle.
 Set `IOS_SIMULATOR_RUNTIME` to an exact identifier from
 `xcrun simctl list runtimes` to qualify a particular installed runtime.
 The `Agent` scheme's hosted tests also check that accessibility text sizes

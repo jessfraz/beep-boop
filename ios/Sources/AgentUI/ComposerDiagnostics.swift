@@ -72,6 +72,7 @@ enum ComposerDiagnostics {
       let header =
         "Composer diagnostics: coverage=\(coverage.rawValue) records=\(lines.count) truncated=\(truncated)\n"
         + "scope=current-process window=15m order=oldest-first subsystem=\(subsystem) category=\(category)\n"
+        + "system=\(ProcessInfo.processInfo.operatingSystemVersionString)\n"
       return Export(
         coverage: coverage, recordCount: lines.count, truncated: truncated,
         text: header + lines.joined())
@@ -83,6 +84,7 @@ enum ComposerDiagnostics {
   private static func unavailable(_ reason: String) -> Export {
     Export(
       coverage: .unavailable, recordCount: 0, truncated: false,
-      text: "Composer diagnostics: coverage=unavailable reason=\(reason)\n")
+      text: "Composer diagnostics: coverage=unavailable reason=\(reason)\n"
+        + "system=\(ProcessInfo.processInfo.operatingSystemVersionString)\n")
   }
 }

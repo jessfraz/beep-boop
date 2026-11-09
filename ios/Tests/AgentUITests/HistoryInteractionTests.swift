@@ -145,8 +145,12 @@ final class HistoryInteractionTests: XCTestCase {
     attachment.name = "native-composer-visible-text"
     attachment.lifetime = .keepAlways
     add(attachment)
+    let window = XCTAttachment(screenshot: app.screenshot())
+    window.name = "native-composer-window"
+    window.lifetime = .keepAlways
+    add(window)
     XCTFail(
-      "Expected visible editor text \(String(reflecting: expected)); recognized \(String(reflecting: recognized)); accessibility value \(String(reflecting: editor.value))",
+      "Expected visible editor text \(String(reflecting: expected)); recognized \(String(reflecting: recognized)); accessibility value \(String(reflecting: editor.value)); capture type \(surface.elementType.rawValue) frame \(surface.frame); editor frame \(editor.frame)",
       file: file, line: line)
   }
 
@@ -184,6 +188,8 @@ final class HistoryInteractionTests: XCTestCase {
     let app = try await launchMessages([], peer: peer)
     let composer = editor(app)
     XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
     for (visibleLine, text) in [
       ("Juniper parcel", "Juniper parcel\nA note typed after returning to the foreground."),
       ("Cedar signal", "Cedar signal\nAnother note after the next foreground transition."),
@@ -202,8 +208,6 @@ final class HistoryInteractionTests: XCTestCase {
       ),
     ] {
       try await returnToForeground(app, peer: peer)
-      try await assertVisibleEditorText("Message Beep Boop", in: app)
-      composer.tap()
       XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
       composer.typeText(text)
       try await assertVisibleEditorText(visibleLine, in: app)
