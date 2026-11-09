@@ -19,7 +19,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
-import { Executions } from "../src/tools.js";
+import { Executions, type Execution } from "../src/tools.js";
 
 const hostId = "11111111-1111-4111-8111-111111111111";
 const otherHostId = "22222222-2222-4222-8222-222222222222";
@@ -157,7 +157,7 @@ test("an uncertain browser can release its owned tabs after restart without repl
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("real Pi browser tools retain their host, reject worker overrides, and release only their connection", async () => {
+test("real Pi browser tools retain their host, reject unknown hosts, and release only their connection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-tools-")); const app = await open(directory);
   try {
     const root = await app.session.root(BACKGROUND_CONTEXT);
@@ -186,7 +186,7 @@ test("real Pi browser tools retain their host, reject worker overrides, and rele
         async (context) => {
           try {
             const result = context.messages.findLast(message => message.role === "toolResult"); assert.ok(result?.role === "toolResult" && result.isError);
-            assert.equal(effects.length, 0, "Discovery cannot transfer a worker to another host");
+            assert.equal(effects.length, 0, "Unknown hosts cannot receive discovery calls");
           } catch (error) { failure = error; }
           return fauxAssistantMessage(fauxToolCall("browser_open", { url: "https://example.com/" }), { stopReason: "toolUse" });
         },
@@ -228,39 +228,101 @@ test("real Pi browser tools retain their host, reject worker overrides, and rele
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("real Pi discovery and claim stay on the selected host and release borrowed control on yield", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-browser-claim-tools-")); const app = await open(directory);
-  const otherHost = { ...host, host_id: otherHostId, name: "other" };
-  const selected = { target_id: "invented-native-target", url: "https://example.com/account", title: "Signed-in fixture" };
-  try {
-    const root = await app.session.root(BACKGROUND_CONTEXT);
-    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools] }, BACKGROUND_CONTEXT);
-    const effects: BrowserRequest[] = [];
-    const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host, otherHost], default_host: host,
-      call: async command => {
-        assert.ok(command.type === "browser"); assert.equal(command.host_id, otherHostId);
-        const operation = command.request; effects.push(operation);
-        if (operation.action.type === "list_user_tabs") return { type: "browser", response: {
-          type: "user_tabs", session_id: operation.session_id, tabs: [selected] } };
-        if (operation.action.type === "claim_user_tab") assert.deepEqual(operation.action.tab, selected);
-        return operation.action.type === "release" ? { type: "browser", response: {
-          type: "closed", session_id: operation.session_id, tabs: [], output: "Borrowed fixture tab preserved" } } : ready(operation);
-      } });
+for (const role of [undefined, "worker"] satisfies Execution["role"][]) {
+  test(`real Pi ${role ?? "main"} discovery and claim stay on the selected host and release borrowed control on yield`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-browser-claim-tools-")); const app = await open(directory);
+    const otherHost = { ...host, host_id: otherHostId, name: "other" };
+    const selected = { target_id: "invented-native-target", url: "https://example.com/account", title: "Signed-in fixture" };
     try {
-      app.faux.setResponses([
-        fauxAssistantMessage(fauxToolCall("browser_user_tabs", { host: "other" }), { stopReason: "toolUse" }),
-        fauxAssistantMessage(fauxToolCall("browser_claim_tab", { tab: selected }), { stopReason: "toolUse" }),
-        fauxAssistantMessage(fauxToolCall("browser_user_tabs", {}), { stopReason: "toolUse" }),
-        fauxAssistantMessage("Existing fixture account checked."),
-      ]);
-      const result = await (await root.submit({ type: "input", content: "Use the existing fixture account on the other host." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-      assert.equal(result.status, "done");
-      assert.deepEqual(effects.map(operation => operation.action.type), ["list_user_tabs", "claim_user_tab", "list_user_tabs", "release"]);
-      assert.ok(effects.every(operation => operation.session_id === effects[0]?.session_id));
-      assert.equal((await app.browsers.binding(root.id.toString()))?.state, "released");
-    } finally { unbind(); }
-  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
-});
+      const root = await app.session.root(BACKGROUND_CONTEXT);
+      await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools] }, BACKGROUND_CONTEXT);
+      const effects: BrowserRequest[] = [];
+      const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], default_host: host,
+        ...(role === undefined ? {} : { role }), origin_host_id: hostId,
+        connectedHosts: async () => [host, otherHost],
+        call: async command => {
+          assert.ok(command.type === "browser"); assert.equal(command.host_id, otherHostId);
+          const operation = command.request; effects.push(operation);
+          if (operation.action.type === "list_user_tabs") return { type: "browser", response: {
+            type: "user_tabs", session_id: operation.session_id, tabs: [selected] } };
+          if (operation.action.type === "claim_user_tab") assert.deepEqual(operation.action.tab, selected);
+          return operation.action.type === "release" ? { type: "browser", response: {
+            type: "closed", session_id: operation.session_id, tabs: [], output: "Borrowed fixture tab preserved" } } : ready(operation);
+        } });
+      try {
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("browser_user_tabs", { host: "other" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("browser_claim_tab", { tab: selected }), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("browser_user_tabs", {}), { stopReason: "toolUse" }),
+          fauxAssistantMessage(fauxToolCall("browser_user_tabs", { host: hostId }), { stopReason: "toolUse" }),
+          context => {
+            const result = context.messages.findLast(message => message.role === "toolResult");
+            assert.ok(result?.role === "toolResult" && result.isError, "A live connection cannot move to another host");
+            return fauxAssistantMessage("Existing fixture account checked.");
+          },
+        ]);
+        const result = await (await root.submit({ type: "input", content: "Use the existing fixture account on the other host." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+        assert.equal(result.status, "done");
+        assert.deepEqual(effects.map(operation => operation.action.type), ["list_user_tabs", "claim_user_tab", "list_user_tabs", "release"]);
+        assert.ok(effects.every(operation => operation.session_id === effects[0]?.session_id));
+        assert.equal((await app.browsers.binding(root.id.toString()))?.state, "released");
+      } finally { unbind(); }
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+for (const tool of ["browser_open", "browser_user_tabs"]) {
+  test(`worker browser defaults stay on their origin after host refresh through ${tool}`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-browser-worker-origin-")); const app = await open(directory);
+    const origin = { ...host, host_id: otherHostId, name: "origin" };
+    let online = true;
+    try {
+      const root = await app.session.root(BACKGROUND_CONTEXT);
+      await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools] }, BACKGROUND_CONTEXT);
+      const effects: Extract<HostCommand, { type: "browser" }>[] = [];
+      const unbind = app.executions.bind(root.id.toString(), { cwd: origin.cwd, hosts: [origin], default_host: origin,
+        role: "worker", origin_host_id: otherHostId, connectedHosts: async () => online ? [host, origin] : [host],
+        call: async command => {
+          assert.ok(command.type === "browser"); effects.push(command);
+          const operation = command.request;
+          if (operation.action.type === "list_user_tabs") return { type: "browser", response: {
+            type: "user_tabs", session_id: operation.session_id, tabs: [] } };
+          return operation.action.type === "release" ? { type: "browser", response: {
+            type: "closed", session_id: operation.session_id, tabs: [], output: "Released fixture connection" } } : ready(operation);
+        } });
+      try {
+        // Exec and guidance refresh the same connected registry in production.
+        await app.executions.hosts(root.id.toString());
+        const args = tool === "browser_open" ? { url: "https://example.com/" } : {};
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: "toolUse" }),
+          fauxAssistantMessage("Checked the owning host."),
+        ]);
+        assert.equal((await (await root.submit({ type: "input", content: "Check this task's browser." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+        assert.deepEqual(effects.map(command => command.host_id), [otherHostId, otherHostId]);
+        assert.equal((await app.browsers.binding(root.id.toString()))?.state, "released");
+        online = false;
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: "toolUse" }),
+          context => {
+            const result = context.messages.findLast(message => message.role === "toolResult");
+            assert.ok(result?.role === "toolResult" && result.isError, "An offline origin cannot silently fall back to the coordinator");
+            return fauxAssistantMessage("The owning host is offline.");
+          },
+        ]);
+        assert.equal((await (await root.submit({ type: "input", content: "Check again." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+        assert.equal(effects.length, 2, "Registry refresh cannot redirect the default to another host");
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall(tool, { ...args, host: hostId }), { stopReason: "toolUse" }),
+          fauxAssistantMessage("Checked the explicitly selected host."),
+        ]);
+        assert.equal((await (await root.submit({ type: "input", content: "Use the other connected machine explicitly." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+        assert.deepEqual(effects.map(command => command.host_id), [otherHostId, otherHostId, hostId, hostId]);
+        assert.equal((await app.browsers.binding(root.id.toString()))?.host_id, hostId);
+      } finally { unbind(); }
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("real bridge emits browser scripts through the generated event contract and consumes their host replies", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-browser-wire-")), queue = join(directory, "responses.json");

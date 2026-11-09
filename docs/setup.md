@@ -223,8 +223,10 @@ Ask Beep Boop to use Chrome on a named machine when necessary. With native
 Chrome, `browser_user_tabs` discovers existing user web tabs without navigating
 them. `browser_claim_tab` takes the exact returned identity, URL and title to
 borrow a signed-in tab; another conversation cannot claim it concurrently.
-Workers stay on their owning host; the coordinator can choose another host
-for browser recovery. `browser_open` creates a disposable tab.
+Workers default to their owning host; workers and the coordinator can explicitly
+choose another connected host for browser recovery. Release a live connection
+before switching hosts. An offline default never silently selects another
+machine's account. `browser_open` creates a disposable tab.
 `browser_status` inspects the live connection;
 `browser_run_code` runs an `async (page) => { ... }` function with the normal
 Playwright Page API. Use whichever locators, waits, frames, evaluation, file
