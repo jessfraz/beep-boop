@@ -93,6 +93,8 @@ The coordinator runs unqualified main/triage effects locally. Work targeted at
 a registered machine travels down that worker's existing connection to its
 native executor. Interactive terminal launches use its local Rex socket.
 Unqualified task effects stay on the owning worker.
+Browser commands use the named host's service, including from attached Rex
+clients, so its capabilities and connection ownership apply consistently.
 Main, workers and child agents see the connected host registry; an explicit
 `exec` host uses the same coordinator routing without moving task or resource
 ownership. Disconnects never silently move an effect onto the coordinator.

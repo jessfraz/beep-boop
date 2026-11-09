@@ -480,7 +480,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        if !attached || matches!(**command, HostCommand::OnNode { .. } | HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
+                        // The named node service owns browser connections and capability checks.
+                        if !attached || matches!(**command, HostCommand::Browser { .. } | HostCommand::OnNode { .. } | HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
                             let (cancel, cancelled) = tokio::sync::watch::channel(false);
                             cancellations.insert(call_id.clone(), cancel);
                             let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
@@ -1324,6 +1325,198 @@ mod tests {
         );
         status(service.client().await).await;
         drop((reader, writer));
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn attached_browser_requests_use_the_registered_host_and_keep_ordinary_calls() {
+        use crate::browser::{BrowserAction, BrowserRequest, BrowserResponse, BrowserUserTab};
+        use crate::protocol::HostCommand;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("browser-routing.mjs");
+        fs::write(&script, r#"
+          import {createInterface} from 'node:readline';
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {join} from 'node:path';
+          const emit=(id,event)=>process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
+          const calls=new Map();
+          function next(id) {
+            const call=calls.get(id);
+            if(call.results.length===call.commands.length) {
+              writeFileSync(join(process.argv[2],'browser-replies.json'),JSON.stringify(call.results));
+              calls.delete(id);emit(id,{type:'done'});return;
+            }
+            emit(id,{type:'host_call',call_id:'step-'+call.results.length,command:call.commands[call.results.length]});
+          }
+          createInterface({input:process.stdin}).on('line',line=>{
+            const {id,command}=JSON.parse(line);
+            if(command.type==='run_task') {
+              calls.set(id,{commands:JSON.parse(readFileSync(join(process.argv[2],'browser-commands.json'),'utf8')),results:[]});
+              emit(id,{type:'task_ready',conversation_id:'fixture',title:'Browser routing'});next(id);
+            } else if(command.type==='host_reply') {calls.get(id).results.push(command.result);next(id);}
+            else if(command.type==='detach_worker'||command.type==='interrupt') {}
+            else {emit(id,{type:'configured'});emit(id,{type:'done'});}
+          });
+        "#).unwrap();
+        let legacy = "11111111-1111-4111-8111-111111111111";
+        let missing = "22222222-2222-4222-8222-222222222222";
+        let session_id = uuid::Uuid::new_v4();
+        let original_session = uuid::Uuid::new_v4();
+        let browser = |host: &str, session_id, operation: &str, action| HostCommand::Browser {
+            host_id: host.into(),
+            request: BrowserRequest {
+                owner_id: "fixture-owner".into(),
+                session_id,
+                operation_id: operation.into(),
+                action,
+            },
+        };
+        let commands = vec![
+            browser(legacy, session_id, "discover", BrowserAction::ListUserTabs),
+            browser(
+                legacy,
+                session_id,
+                "claim",
+                BrowserAction::ClaimUserTab {
+                    tab: BrowserUserTab {
+                        target_id: "fixture-target".into(),
+                        url: "https://example.com/account".into(),
+                        title: "Fixture account".into(),
+                    },
+                },
+            ),
+            browser(
+                legacy,
+                original_session,
+                "original-status",
+                BrowserAction::Status,
+            ),
+            browser(missing, session_id, "missing-host", BrowserAction::Status),
+            HostCommand::ReadFile {
+                path: "/example/attached-only".into(),
+                offset: 0,
+                limit: 100,
+            },
+        ];
+        fs::write(
+            directory.path().join("browser-commands.json"),
+            serde_json::to_vec(&commands).unwrap(),
+        )
+        .unwrap();
+        let service = Running::start_script(directory, script, ShutdownReason::Requested).await;
+        let mut worker = service.client().await;
+        // Exact legacy registration: it advertises Browser, with no user-tab capability.
+        worker.write_all(br#"{"type":"connect_worker","node":{"host_id":"11111111-1111-4111-8111-111111111111","name":"legacy-fixture","rex_server":null,"agent_program":"/example/agent","home_directory":"/example","coordinator":"tailscale://100.64.0.10","launch":{"model":null,"state_dir":null,"runtime":null,"config":null,"instructions":null},"machine":null,"capabilities":{"resume_agent":true,"browser":true}}}"#).await.unwrap();
+        worker.write_all(b"\n").await.unwrap();
+        let (worker_read, mut worker_write) = worker.into_split();
+        let mut worker_read = FrameReader::new(BufReader::new(worker_read));
+        let ready: RuntimeEventKind =
+            serde_json::from_slice(&worker_read.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ready, RuntimeEventKind::WorkerReady { .. }));
+
+        let mut client = service.client().await;
+        let mut command = attached_command();
+        if let RuntimeCommand::RunTask { interactive, .. } = &mut command {
+            *interactive = Some(true);
+        }
+        write_frame(&mut client, &command).await.unwrap();
+        let (client_read, mut client_write) = client.into_split();
+        let mut client_read = FrameReader::new(BufReader::new(client_read));
+        let ready: RuntimeEventKind =
+            serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(ready, RuntimeEventKind::TaskReady { .. }));
+        let (from_worker, first) = timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                frame = worker_read.next_frame() => (true, frame),
+                frame = client_read.next_frame() => (false, frame),
+            }
+        })
+        .await
+        .unwrap();
+        let first: RuntimeEventKind = serde_json::from_slice(&first.unwrap().unwrap()).unwrap();
+        if !from_worker {
+            drop((worker_read, worker_write, client_read, client_write));
+            service.stop().await;
+            panic!("Explicit browser requests must not reach the attached client: {first:?}");
+        }
+        let RuntimeEventKind::HostCall { call_id, command } = first else {
+            panic!("Expected the original browser connection's status");
+        };
+        let HostCommand::Browser { host_id, request } = *command else {
+            panic!("Expected browser status on its named host");
+        };
+        assert_eq!(host_id, legacy);
+        assert_eq!(request.owner_id, "fixture-owner");
+        assert_eq!(request.session_id, original_session);
+        assert_eq!(request.operation_id, "original-status");
+        assert!(matches!(request.action, BrowserAction::Status));
+        write_frame(
+            &mut worker_write,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Browser {
+                    response: BrowserResponse::Disconnected {
+                        session_id: original_session,
+                        message: "Original connection is unavailable; inspect before continuing."
+                            .into(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let ordinary: RuntimeEventKind =
+            serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
+        let RuntimeEventKind::HostCall { call_id, command } = ordinary else {
+            panic!("Expected the ordinary attached call to survive");
+        };
+        assert!(
+            matches!(*command, HostCommand::ReadFile { path, .. } if path == "/example/attached-only")
+        );
+        write_frame(
+            &mut client_write,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::File {
+                    content: "from attached client".into(),
+                    truncated: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let done: RuntimeEventKind =
+            serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(done, RuntimeEventKind::Done));
+        let replies: Vec<HostResult> = serde_json::from_slice(
+            &fs::read(service.wait_for("browser-replies.json").await).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replies.len(), 5);
+        for reply in &replies[..2] {
+            assert!(
+                matches!(reply, HostResult::Browser { response: BrowserResponse::Failed { session_id: actual, message } }
+                if *actual == session_id && message.contains("Update Beep Boop"))
+            );
+        }
+        assert!(
+            matches!(&replies[2], HostResult::Browser { response: BrowserResponse::Disconnected { session_id, .. } } if *session_id == original_session)
+        );
+        assert!(
+            matches!(&replies[3], HostResult::Failed { message } if message.contains("no fallback host"))
+        );
+        assert!(
+            matches!(&replies[4], HostResult::File { content, .. } if content == "from attached client")
+        );
+        assert!(
+            timeout(Duration::from_millis(25), worker_read.next_frame())
+                .await
+                .is_err(),
+            "No new browser session or replay may follow an unavailable original handle"
+        );
+        drop((worker_read, worker_write, client_read, client_write));
         service.stop().await;
     }
 
