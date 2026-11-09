@@ -311,6 +311,9 @@ export class BrowserHost {
 
   private webFrame(frame: Frame): boolean {
     for (let current: Frame | null = frame; current !== null; current = current.parentFrame()) {
+      // Sandboxed srcdoc frames can report an empty Playwright URL. Their
+      // collector checks the document protocol; the parent still owns access.
+      if (current.url() === "" && current.parentFrame() !== null) continue;
       try { if (!WEB_DOCUMENT_PROTOCOLS.has(new URL(current.url()).protocol)) return false; }
       catch { return false; }
     }

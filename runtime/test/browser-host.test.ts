@@ -1208,3 +1208,35 @@ test("document-start clears and ordinary blank or srcdoc frames never expose fil
   assert.equal(released.type, "closed", JSON.stringify(released));
   assert.ok((await f.client.pages()).some(page => page.url === f.origin + "/unrelated"));
 });
+
+test("sandboxed srcdoc passwords remain private across owned browser operations",
+  { skip: skipChrome, timeout: 90_000 }, async t => {
+  const f = await fixture(t), request = requests();
+  const opened = (await f.host.execute(request({ type: "open", url: "about:blank" }))).response;
+  assert.ok(opened.type === "ready", JSON.stringify(opened));
+  const tab = opened.tabs[0]; assert.ok(tab);
+  const navigated = (await f.host.execute(request({ type: "run_code", tab_id: tab.id,
+    code: `async page => {
+      await page.goto(${JSON.stringify(f.origin + "/password")});
+      await page.evaluate(() => {
+        const frame = document.createElement('iframe');
+        frame.sandbox = 'allow-scripts';
+        frame.srcdoc = '<label>Sandbox password<input type="password"></label>';
+        document.body.append(frame);
+      });
+      const input = page.frameLocator('iframe[sandbox]').getByLabel('Sandbox password');
+      await input.fill('SYNTHETIC_SANDBOX_PASSWORD_42');
+      const value = await input.inputValue();
+      await input.fill('');
+      return { value };
+    }` }))).response;
+  assert.ok(navigated.type === "ready", JSON.stringify(navigated));
+  assert.equal(JSON.stringify(navigated).includes("SYNTHETIC_SANDBOX_PASSWORD_42"), false);
+  const output: unknown = JSON.parse(navigated.output);
+  assert.ok(object(output));
+  assert.deepEqual(output.result, { value: "[redacted]" });
+  const status = (await f.host.execute(request({ type: "status" }))).response;
+  assert.ok(status.type === "ready", JSON.stringify(status));
+  const released = (await f.host.execute(request({ type: "release" }))).response;
+  assert.equal(released.type, "closed", JSON.stringify(released));
+});
