@@ -108,6 +108,12 @@ required for sharing on a phone; an unsigned build does not establish that.
   Restoring an outbox input saves the complete replacement draft before
   retiring the original. Failed preparation removes partial attachment copies.
   Successful restoration removes the local recovery row and keeps server history.
+- Composer diagnostics use Apple's unified log subsystem `dev.jessfraz.Agent`,
+  category `Composer`. They record the build, lifecycle, send/clear/admission
+  state and character/attachment counts, without message text or file paths.
+  `/feedback` includes up to 15 minutes of current-process metadata in a
+  private `Composer.log` attachment when a file slot is available. Collection
+  stops waiting after two seconds and reports empty or unavailable coverage.
 - **Connection → Conversation settings** changes the main conversation's model,
   reasoning and Fast setting without submitting the draft. Configured and
   effective selections are shown separately; an unknown active selection stays
@@ -160,7 +166,7 @@ required for sharing on a phone; an unsigned build does not establish that.
   starts agent work. Cancel before saving leaves the composer untouched.
   An uncertain save retries the same frozen selection and transfer ID.
 - `/feedback` captures the current app window before sending and includes it
-  with the report. Failed admission keeps that exact screenshot for retry.
+  with the report. Failed admission keeps the exact captured evidence for retry.
   Pi's existing adapter handles model image input; other files remain available
   to agent tools on the execution host. No provider requests originate on iOS.
 

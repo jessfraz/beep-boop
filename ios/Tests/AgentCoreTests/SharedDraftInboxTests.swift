@@ -752,7 +752,11 @@ import UniformTypeIdentifiers
     let capture = try png()
     await model.send(screenshot: { capture })
     #expect(await model.saveDraft())
-    let original = try #require(model.attachments.first)
+    let original = model.attachments
+    #expect(original.map(\.reference.name) == ["Feedback.png", "Composer.log"])
+    let image = try #require(original.first)
+    let diagnostics = try #require(original.last)
+    let log = try Data(contentsOf: diagnostics.url)
     let reopened = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
     await reopened.restoreDraft()
     reopened.connection = .connected
@@ -761,8 +765,9 @@ import UniformTypeIdentifiers
       return capture
     })
     #expect(reopened.draft == model.draft)
-    #expect(reopened.attachments == [original])
-    #expect(try Data(contentsOf: original.url) == capture)
+    #expect(reopened.attachments == original)
+    #expect(try Data(contentsOf: image.url) == capture)
+    #expect(try Data(contentsOf: diagnostics.url) == log)
   }
 
   @Test @MainActor

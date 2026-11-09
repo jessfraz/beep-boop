@@ -17,7 +17,9 @@ jobs:
   checks:
     name: Native checks (${{ matrix.phase }})
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The existing sequential UI suite takes about 27 minutes before the
+    # foreground, suspension and native keyboard coverage added here.
+    timeout-minutes: ${{ matrix.phase == 'simulator-ui' && 40 || 30 }}
     strategy:
       fail-fast: false
       matrix:

@@ -209,16 +209,14 @@ public struct MainChatView: View {
       }
       .onChange(of: scenePhase) { _, phase in
         notifications?.mainVisible = mainVisible
-        if managesConnection {
-          Task {
-            // Publish the scene's connection intent before file I/O yields.
-            // A late background save must not disconnect a newer foreground.
-            await model.setActive(phase == .active)
-            if phase == .active {
-              await model.receiveSharedDrafts()
-            } else {
-              _ = await model.saveDraft()
-            }
+        Task {
+          // Attached sessions share the same scene lifecycle as configured ones.
+          // Publish connection intent before file I/O can yield to a newer phase.
+          await model.setActive(phase == .active)
+          if phase == .active {
+            await model.receiveSharedDrafts()
+          } else {
+            _ = await model.saveDraft()
           }
         }
       }
@@ -503,6 +501,8 @@ public struct MainChatView: View {
       }
     }
     .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("messageComposer")
   }
   private var connectionSettings: some View {
     NavigationStack {

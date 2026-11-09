@@ -30,10 +30,12 @@ recovery; [history](history.md) describes import and retrieval.
   Delivery and processing have separate states; completed work is normal,
   blocked work is visible, and explicit continuation can recover a parked
   main generation without duplicating its saved inputs.
-- [x] Clear the iOS composer immediately on Send while retaining its backup
+- [ ] Clear the iOS composer immediately on Send while retaining its backup
   until outbox admission. Preserve newer typing and restore local rejections;
   connection changes cannot resurrect saved text. Native tests keep the
   keyboard active through consecutive sends and use production persistence.
+  A physical-device recurrence after foregrounding remains unresolved; qualify
+  the full visible composer during reconnect and active responses before closing.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree

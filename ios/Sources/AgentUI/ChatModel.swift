@@ -1,6 +1,7 @@
 import AgentCore
 import CryptoKit
 import Foundation
+import OSLog
 import Observation
 
 #if os(iOS)
@@ -20,6 +21,14 @@ final class RowModel: Identifiable {
 
 @MainActor @Observable
 final class ChatModel {
+  private enum ComposerEvent: String {
+    case active, inactive, restored, edited, sendRequested, sendIgnored, cleared, outboxSaved,
+      localDraftRestored,
+      saveFailed
+  }
+
+  @ObservationIgnored private let composerLogger = Logger(
+    subsystem: "dev.jessfraz.Agent", category: "Composer")
   private enum Admission {
     case pending(text: String)
     case saved
@@ -51,6 +60,7 @@ final class ChatModel {
     didSet {
       draftRevision &+= 1
       scheduleDraftSave()
+      if !changingDraft, oldValue.isEmpty != draft.isEmpty { logComposer(.edited) }
     }
   }
   @ObservationIgnored private var draftRevision = 0
@@ -156,6 +166,7 @@ final class ChatModel {
       return true
     } catch {
       draftError = error.localizedDescription
+      logComposer(.saveFailed)
       return false
     }
   }
@@ -179,6 +190,7 @@ final class ChatModel {
       persistentRevision = restored.revision
       changingDraft = false
       draftReady = true
+      logComposer(.restored)
       pendingSharedImport = !consumedTransfers.isEmpty
       _ = await saveDraft()
       guard sharedInbox != nil || consumedTransfers.isEmpty else {
@@ -313,6 +325,7 @@ final class ChatModel {
   }
   func setActive(_ active: Bool) async {
     self.active = active
+    logComposer(active ? .active : .inactive)
     guard let session, let address else { return }
     if active { await session.connect(address) } else { await session.disconnect() }
   }
@@ -326,8 +339,12 @@ final class ChatModel {
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
   }
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
+    logComposer(.sendRequested)
     guard canSend
-    else { return }
+    else {
+      logComposer(.sendIgnored)
+      return
+    }
     let text = draft
     let generation = generation
     var admitted = false
@@ -337,12 +354,14 @@ final class ChatModel {
     changingDraft = true
     draft = ""
     changingDraft = false
+    logComposer(.cleared)
     defer {
       admission = nil
       if !admitted, !text.isEmpty {
         // Local rejection has no outbox row. Preserve both the original and
         // anything typed while admission or attachment preparation was pending.
         draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
+        logComposer(.localDraftRestored)
       }
     }
     let mode = mode
@@ -361,9 +380,28 @@ final class ChatModel {
           try? await draftStore?.remove(file)
           return
         }
+        guard attachments.count < AttachmentLimits.maximumCount else {
+          try? await draftStore?.remove(file)
+          throw AttachmentError.tooMany
+        }
         attachments.append(file)
         files.append(file)
         feedbackScreenshotID = file.id
+        // Feedback owns private evidence, not transcript messages. Preserve the
+        // screenshot and user files even when log access or staging fails.
+        if attachments.count < AttachmentLimits.maximumCount {
+          let diagnostics = await ComposerDiagnostics.export()
+          if let log = try? await attachmentStore().stage(
+            data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
+          {
+            if self.generation == generation, attachments.count < AttachmentLimits.maximumCount {
+              attachments.append(log)
+              files.append(log)
+            } else {
+              try? await draftStore?.remove(log)
+            }
+          }
+        }
       }
     } catch {
       self.error = error.localizedDescription
@@ -374,6 +412,7 @@ final class ChatModel {
     if admitted {
       // The outbox owns this draft even if its connection has since stopped.
       admission = .saved
+      logComposer(.outboxSaved)
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
@@ -381,6 +420,13 @@ final class ChatModel {
         for file in files { try? await store.remove(file) }
       }
     }
+  }
+  private func logComposer(_ event: ComposerEvent) {
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+    // Only state and counts enter system logs; never draft text, files or addresses.
+    composerLogger.notice(
+      "event=\(event.rawValue, privacy: .public) build=\(build, privacy: .public) generation=\(self.generation.uuidString, privacy: .public) revision=\(self.draftRevision) characters=\(self.draft.count) attachments=\(self.attachments.count) active=\(self.active) ready=\(self.draftReady) connected=\(self.connection == .connected) busy=\(self.busy) admitting=\(self.admitting) preparing=\(self.preparingAttachments) shared=\(self.pendingSharedImport)"
+    )
   }
   func restore(_ id: String) async {
     guard draftReady else {

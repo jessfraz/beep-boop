@@ -8,11 +8,11 @@ import XCTest
 final class HistoryInteractionTests: XCTestCase {
   private func launchMessages(
     _ messages: [HistoryMessage], toolDetails: [String: ToolDetails] = [:],
-    appearance: String? = nil, commands: [SlashCommand] = []
+    appearance: String? = nil, commands: [SlashCommand] = [],
+    peer: InteractionPeer = InteractionPeer()
   ) async throws -> XCUIApplication {
     continueAfterFailure = false
     executionTimeAllowance = 600
-    let peer = InteractionPeer()
     addTeardownBlock { await peer.stop() }
     let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
     await peer.history(initial: history, pages: [:], latest: history)
@@ -35,6 +35,69 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  private func returnToForeground(
+    _ app: XCUIApplication, peer: InteractionPeer, waitForSuspension: Bool = false
+  ) async throws {
+    try await eventually(description: "initial conversation observer") {
+      await peer.observationCount() > 0
+    }
+    let observers = await peer.observationCount()
+    XCUIDevice.shared.press(.home)
+    if waitForSuspension {
+      guard app.wait(for: .runningBackgroundSuspended, timeout: 30) else {
+        throw XCTSkip("The test runner kept the app in \(app.state), without suspending it.")
+      }
+    } else {
+      XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+    }
+    app.activate()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
+    try await eventually(description: "conversation observer reconnect after foreground") {
+      await peer.observationCount() > observers
+    }
+    let ready = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "hittable == true"), object: editor(app))
+    XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed)
+  }
+
+  private func enableSimulatorAutocorrection() throws {
+    continueAfterFailure = false
+    #if targetEnvironment(simulator)
+      // The native validation jobs own disposable simulators. Settings also
+      // broadcasts the preference change to the keyboard's existing process.
+      let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+      settings.launch()
+      defer { settings.terminate() }
+      let correction = settings.switches["Auto-Correction"]
+      if !correction.exists {
+        let back = settings.buttons["BackButton"]
+        if back.exists { back.tap() }
+        let keyboard = settings.staticTexts["Keyboard"]
+        if !keyboard.exists {
+          let general = settings.staticTexts["General"]
+          for _ in 0..<6 {
+            if general.exists && general.isHittable { break }
+            settings.swipeUp()
+          }
+          XCTAssertTrue(general.isHittable, settings.debugDescription)
+          general.tap()
+        }
+        for _ in 0..<6 {
+          if keyboard.exists && keyboard.isHittable { break }
+          settings.swipeUp()
+        }
+        XCTAssertTrue(keyboard.isHittable, settings.debugDescription)
+        keyboard.tap()
+      }
+      XCTAssertTrue(correction.waitForExistence(timeout: 5), settings.debugDescription)
+      if correction.value as? String == "1" { correction.tap() }
+      correction.tap()
+      XCTAssertEqual(correction.value as? String, "1", settings.debugDescription)
+    #else
+      throw XCTSkip("Keyboard preference setup requires a disposable simulator.")
+    #endif
+  }
+
   private func emptyEditor(_ editor: XCUIElement) -> XCTNSPredicateExpectation {
     // XCTest can expose an empty field's placeholder as its value.
     XCTNSPredicateExpectation(
@@ -48,14 +111,17 @@ final class HistoryInteractionTests: XCTestCase {
   }
 
   private func assertVisibleEditorText(
-    _ expected: String, excluding submitted: String? = nil, in editor: XCUIElement,
+    _ expected: String, excluding submitted: String? = nil, in app: XCUIApplication,
     file: StaticString = #filePath, line: UInt = #line
   ) async throws {
+    let editor = editor(app)
+    let surface = app.descendants(matching: .any).matching(identifier: "messageComposer").firstMatch
+    XCTAssertTrue(surface.exists, file: file, line: line)
     let deadline = ContinuousClock.now + .seconds(5)
     var recognized = ""
-    var screenshot = editor.screenshot()
+    var screenshot = surface.screenshot()
     repeat {
-      screenshot = editor.screenshot()
+      screenshot = surface.screenshot()
       let image = try XCTUnwrap(screenshot.image.cgImage, file: file, line: line)
       let request = VNRecognizeTextRequest()
       request.recognitionLevel = .accurate
@@ -94,14 +160,14 @@ final class HistoryInteractionTests: XCTestCase {
       ("Maple lantern", "Maple lantern\nThe next note uses the same focused editor."),
     ] {
       composer.typeText(text)
-      try await assertVisibleEditorText(visibleLine, in: composer)
+      try await assertVisibleEditorText(visibleLine, in: app)
       let send = app.buttons["Send message"]
       XCTAssertTrue(send.waitForExistence(timeout: 3))
       XCTAssertTrue(send.isEnabled)
       send.tap()
       // Check rendered glyphs before polling the transcript or changing focus.
       // Accessibility alone can already report an empty value.
-      try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: composer)
+      try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: app)
       XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
       let cleared = emptyEditor(composer)
       XCTAssertEqual(
@@ -110,6 +176,134 @@ final class HistoryInteractionTests: XCTestCase {
       )
       XCTAssertTrue(app.keyboards.firstMatch.exists)
     }
+  }
+
+  func testSendClearsVisibleTextAfterReturningToTheForeground() async throws {
+    let peer = InteractionPeer()
+    await peer.streamRepliesOnSubmit()
+    let app = try await launchMessages([], peer: peer)
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    for (visibleLine, text) in [
+      ("Juniper parcel", "Juniper parcel\nA note typed after returning to the foreground."),
+      ("Cedar signal", "Cedar signal\nAnother note after the next foreground transition."),
+      (
+        "Sending must collapse",
+        """
+        A longer note fills the native editor.
+        Its first lines scroll out of view.
+        The draft spans more than six lines.
+        Incoming output continues to stream.
+        Sending must collapse the editor.
+        The keyboard stays available.
+        The next draft starts empty.
+        Granite return
+        """
+      ),
+    ] {
+      try await returnToForeground(app, peer: peer)
+      try await assertVisibleEditorText("Message Beep Boop", in: app)
+      composer.tap()
+      XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+      composer.typeText(text)
+      try await assertVisibleEditorText(visibleLine, in: app)
+      let send = app.buttons["Send message"]
+      XCTAssertTrue(send.waitForExistence(timeout: 3))
+      XCTAssertTrue(send.isEnabled)
+      send.tap()
+      try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: app)
+      XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+      let update = "Streaming continues for \(visibleLine)."
+      try await peer.beginReply(update)
+      XCTAssertTrue(
+        app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", update)).firstMatch
+          .waitForExistence(timeout: 3))
+      try await assertVisibleEditorText("Message Beep Boop", excluding: visibleLine, in: app)
+      let sent = app.staticTexts.matching(NSPredicate(format: "label == %@", text)).firstMatch
+      XCTAssertTrue(sent.waitForExistence(timeout: 3), app.debugDescription)
+      XCTAssertTrue(app.keyboards.firstMatch.exists)
+    }
+  }
+
+  func testSendClearsAnUnacceptedAutocorrectionAndKeepsNewIdenticalTyping() async throws {
+    try enableSimulatorAutocorrection()
+    let peer = InteractionPeer()
+    await peer.streamRepliesOnSubmit()
+    let app = try await launchMessages([], peer: peer)
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    try await returnToForeground(app, peer: peer)
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    // Predictive suggestions alone do not establish that autocorrection is on.
+    for key in ["T", "e", "h", "space"] { app.keys[key].tap() }
+    let corrected = XCTNSPredicateExpectation(
+      predicate: NSPredicate { _, _ in
+        (composer.value as? String)?.lowercased() == "the "
+      }, object: composer)
+    XCTAssertEqual(XCTWaiter.wait(for: [corrected], timeout: 3), .completed, app.debugDescription)
+    composer.press(forDuration: 1)
+    let selectAll = action("Select All", app: app)
+    XCTAssertTrue(selectAll.waitForExistence(timeout: 3))
+    selectAll.tap()
+    app.keys["delete"].tap()
+    try await assertVisibleEditorText("Message Beep Boop", in: app)
+    let input = "The parcel is teh"
+    // Exercise the software keyboard and its prediction UI with real key taps.
+    for character in input {
+      app.keys[character == " " ? "space" : String(character)].tap()
+    }
+    let correction = action("the", app: app)
+    try await eventually(description: "pending native autocorrection") { correction.exists }
+    let note = try XCTUnwrap(composer.value as? String)
+    XCTAssertEqual(note.lowercased(), input.lowercased())
+    let pending = XCTAttachment(screenshot: app.screenshot())
+    pending.name = "unaccepted-native-autocorrection"
+    pending.lifetime = .keepAlways
+    add(pending)
+    // Keep the correction pending: no space, suggestion tap or focus change.
+    app.buttons["Send message"].tap()
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "The parcel", in: app)
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    XCTAssertTrue(app.keyboards.firstMatch.exists)
+    for character in note {
+      app.keys[character == " " ? "space" : String(character)].tap()
+    }
+    let typed = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", note), object: composer)
+    XCTAssertEqual(XCTWaiter.wait(for: [typed], timeout: 3), .completed, app.debugDescription)
+    let update = "The next draft stays while output streams."
+    try await peer.beginReply(update)
+    XCTAssertTrue(
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", update)).firstMatch
+        .waitForExistence(timeout: 3))
+    XCTAssertEqual(composer.value as? String, note)
+    try await assertVisibleEditorText("The parcel", in: app)
+  }
+
+  func testSendClearsVisibleTextAfterActualSuspension() async throws {
+    let peer = InteractionPeer()
+    await peer.streamRepliesOnSubmit()
+    let app = try await launchMessages([], peer: peer)
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let note = "Cypress packet\nThis saved note returns after genuine app suspension."
+    composer.tap()
+    composer.typeText(note)
+    try await assertVisibleEditorText("Cypress packet", in: app)
+    try await returnToForeground(app, peer: peer, waitForSuspension: true)
+    try await assertVisibleEditorText("Cypress packet", in: app)
+    composer.tap()
+    app.buttons["Send message"].tap()
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Cypress packet", in: app)
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    try await peer.beginReply("Streaming continues after suspension.")
+    XCTAssertTrue(
+      app.staticTexts.matching(
+        NSPredicate(format: "label CONTAINS %@", "Streaming continues after suspension.")
+      ).firstMatch.waitForExistence(timeout: 3))
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Cypress packet", in: app)
+    XCTAssertTrue(app.keyboards.firstMatch.exists)
   }
 
   func testCommandMenuPreservesTheNoteAndReplacesThePreviousCommand() async throws {
@@ -136,7 +330,7 @@ final class HistoryInteractionTests: XCTestCase {
         composer.value as? String, "\(name) \(note)",
         "Selecting \(command.usage) must preserve the note"
       )
-      try await assertVisibleEditorText("Keep this note", in: composer)
+      try await assertVisibleEditorText("Keep this note", in: app)
     }
   }
 
@@ -238,10 +432,7 @@ final class HistoryInteractionTests: XCTestCase {
     let delete = app.keys["delete"]
     XCTAssertTrue(delete.exists)
     delete.tap()
-    let cleared = emptyEditor(composer)
-    XCTAssertEqual(
-      XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
-      "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Alpha bracket", in: app)
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
     XCTAssertTrue(select.waitForExistence(timeout: 3))
@@ -747,7 +938,12 @@ private actor InteractionPeer {
   private var settingsValue: NativeSettingsSnapshot?
   private var settingRequests: [NativeRequestSettings] = []
   private var submitted: [NativeRequestSubmit] = []
+  private var observations = 0
+  private var working = false
+  private var streamsOnSubmit = false
   private var commandValues: [SlashCommand] = []
+  func observationCount() -> Int { observations }
+  func streamRepliesOnSubmit() { streamsOnSubmit = true }
   func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }
   func commands(_ values: [SlashCommand]) { commandValues = values }
   func settings(_ value: NativeSettingsSnapshot) { settingsValue = value }
@@ -771,6 +967,7 @@ private actor InteractionPeer {
     if let observer { try await emit(.sources(.init(sources: states)), to: observer) }
   }
   func beginReply(_ text: String) async throws {
+    working = true
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }
   func reply(_ text: String, id: String = "concurrent-reply") async throws {
@@ -778,6 +975,7 @@ private actor InteractionPeer {
       continuation: false, entryId: id, finalChunk: true, role: .final, text: text)
     latest?.messages.append(message)
     try await emit(.answer(.init(entryId: id, text: text)), to: XCTUnwrap(observer))
+    working = false
     try await emit(.idle, to: XCTUnwrap(observer))
   }
   func hold(_ cursor: String) { held.insert(cursor) }
@@ -824,13 +1022,15 @@ private actor InteractionPeer {
       guard case .native(let command) = command else { return }
       switch command.request {
       case .observe(let request):
+        observations += 1
         observer = socket
         try await emit(
           .ready(
             .init(
               conversationId: "fixture-root",
               conversationSettings: settingsValue == nil ? nil : true,
-              inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model")), to: socket)
+              inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model",
+              working: working)), to: socket)
         try await emit(.history(try XCTUnwrap(initial)), to: socket)
         if !commandValues.isEmpty {
           try await emit(.commands(.init(commands: commandValues)), to: socket)
@@ -838,7 +1038,7 @@ private actor InteractionPeer {
         if request.sourceStatus == true, let sourceStates {
           try await emit(.sources(.init(sources: sourceStates)), to: socket)
         }
-        try await emit(.idle, to: socket)
+        if !working { try await emit(.idle, to: socket) }
       case .toolDetails(let request):
         let details = toolReplies[request.callId] ?? .unavailable(.init(callId: request.callId))
         try await emit(.toolDetails(.init(details: details)), to: socket)
@@ -858,7 +1058,9 @@ private actor InteractionPeer {
         try await emit(.done, to: socket)
       case .submit(let request):
         submitted.append(request)
+        if streamsOnSubmit { try await beginReply("A reply starts before acknowledgement. ") }
         try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
+        if streamsOnSubmit { try await beginReply("More text streams after acknowledgement. ") }
       case .history(let request):
         let cursor = request.cursor ?? "<latest>"
         requests.append(cursor)
