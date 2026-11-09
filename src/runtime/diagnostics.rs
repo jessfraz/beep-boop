@@ -291,6 +291,7 @@ impl BrowserCall {
         };
         let (outcome, is_error, owned_count) = match result {
             HostResult::Browser { response } => match response {
+                BrowserResponse::UserTabs { .. } => (BrowserOutcome::Ready, false, None),
                 BrowserResponse::Ready { is_error, tabs, .. } => {
                     (BrowserOutcome::Ready, *is_error, Some(tabs.len()))
                 }

@@ -294,6 +294,31 @@
         {
           "type": "object",
           "properties": {
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "tabs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/BrowserUserTab"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "user_tabs"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "tabs"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "is_error": {
               "type": "boolean"
             },
@@ -439,6 +464,26 @@
       "additionalProperties": false,
       "required": [
         "id",
+        "url",
+        "title"
+      ]
+    },
+    "BrowserUserTab": {
+      "type": "object",
+      "properties": {
+        "target_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target_id",
         "url",
         "title"
       ]
@@ -4501,6 +4546,10 @@
       "type": "object",
       "properties": {
         "browser": {
+          "type": "boolean",
+          "default": false
+        },
+        "browser_user_tabs": {
           "type": "boolean",
           "default": false
         },

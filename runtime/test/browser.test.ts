@@ -181,6 +181,13 @@ test("real Pi browser tools retain their host, reject worker overrides, and rele
             const result = context.messages.findLast((message) => message.role === "toolResult"); assert.ok(result?.role === "toolResult" && result.isError);
             assert.equal(effects.length, 0);
           } catch (error) { failure = error; }
+          return fauxAssistantMessage(fauxToolCall("browser_user_tabs", { host: "another-host" }), { stopReason: "toolUse" });
+        },
+        async (context) => {
+          try {
+            const result = context.messages.findLast(message => message.role === "toolResult"); assert.ok(result?.role === "toolResult" && result.isError);
+            assert.equal(effects.length, 0, "Discovery cannot transfer a worker to another host");
+          } catch (error) { failure = error; }
           return fauxAssistantMessage(fauxToolCall("browser_open", { url: "https://example.com/" }), { stopReason: "toolUse" });
         },
         async (context) => {
@@ -217,6 +224,40 @@ test("real Pi browser tools retain their host, reject worker overrides, and rele
       assert.deepEqual(effects.map((operation) => operation.action.type), ["open", "snapshot", "run_code", "release"]);
       assert.ok(effects.every((operation) => operation.session_id === effects[0]?.session_id));
       assert.equal((await app.browsers.binding(root.id.toString()))?.response?.type, "closed");
+    } finally { unbind(); }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("real Pi discovery and claim stay on the selected host and release borrowed control on yield", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-browser-claim-tools-")); const app = await open(directory);
+  const otherHost = { ...host, host_id: otherHostId, name: "other" };
+  const selected = { target_id: "invented-native-target", url: "https://example.com/account", title: "Signed-in fixture" };
+  try {
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools] }, BACKGROUND_CONTEXT);
+    const effects: BrowserRequest[] = [];
+    const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host, otherHost], default_host: host,
+      call: async command => {
+        assert.ok(command.type === "browser"); assert.equal(command.host_id, otherHostId);
+        const operation = command.request; effects.push(operation);
+        if (operation.action.type === "list_user_tabs") return { type: "browser", response: {
+          type: "user_tabs", session_id: operation.session_id, tabs: [selected] } };
+        if (operation.action.type === "claim_user_tab") assert.deepEqual(operation.action.tab, selected);
+        return operation.action.type === "release" ? { type: "browser", response: {
+          type: "closed", session_id: operation.session_id, tabs: [], output: "Borrowed fixture tab preserved" } } : ready(operation);
+      } });
+    try {
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("browser_user_tabs", { host: "other" }), { stopReason: "toolUse" }),
+        fauxAssistantMessage(fauxToolCall("browser_claim_tab", { tab: selected }), { stopReason: "toolUse" }),
+        fauxAssistantMessage(fauxToolCall("browser_user_tabs", {}), { stopReason: "toolUse" }),
+        fauxAssistantMessage("Existing fixture account checked."),
+      ]);
+      const result = await (await root.submit({ type: "input", content: "Use the existing fixture account on the other host." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+      assert.equal(result.status, "done");
+      assert.deepEqual(effects.map(operation => operation.action.type), ["list_user_tabs", "claim_user_tab", "list_user_tabs", "release"]);
+      assert.ok(effects.every(operation => operation.session_id === effects[0]?.session_id));
+      assert.equal((await app.browsers.binding(root.id.toString()))?.state, "released");
     } finally { unbind(); }
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

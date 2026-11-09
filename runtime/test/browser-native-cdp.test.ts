@@ -91,6 +91,8 @@ function reply(value: unknown): value is BrowserReply {
   const response = value.response;
   if (typeof response.session_id !== "string") return false;
   if (["failed", "disconnected", "uncertain"].includes(String(response.type))) return typeof response.message === "string";
+  if (response.type === "user_tabs") return Array.isArray(response.tabs) && response.tabs.every((tab: unknown) =>
+    object(tab) && typeof tab.target_id === "string" && typeof tab.url === "string" && typeof tab.title === "string");
   return (response.type === "closed" || response.type === "ready" && typeof response.is_error === "boolean")
     && typeof response.output === "string" && Array.isArray(response.tabs)
     && response.tabs.every((tab: unknown) => object(tab) && typeof tab.id === "number"
@@ -102,9 +104,10 @@ class NativeHelper {
   private readonly child;
   private readonly exited: Promise<void>;
   private readonly lines;
-  constructor(port: number) {
-    this.child = spawn(process.execPath, [fileURLToPath(new URL("../src/browser-host.js", import.meta.url)),
-      JSON.stringify({ user_data_dir: null, profile_dir_name: null, debugging_port: port })],
+  constructor(port: number, broker = process.env.AGENT_TEST_BROWSER_BROKER ?? fileURLToPath(new URL("../../../target/debug/examples/browser_fixture", import.meta.url))) {
+    const runtime = process.env.AGENT_TEST_BROWSER_RUNTIME ?? fileURLToPath(new URL("../src/bridge.js", import.meta.url));
+    this.child = spawn(broker, [runtime,
+      JSON.stringify({ user_data_dir: null, profile_dir_name: null, debugging_port: port, credential_command: null })],
       { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PLAYWRIGHT_MCP_EXTENSION_TOKEN: "" } });
     this.exited = new Promise(resolve => this.child.once("close", () => resolve()));
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity })[Symbol.asyncIterator]();
@@ -115,7 +118,7 @@ class NativeHelper {
     try {
       const line = await Promise.race([this.lines.next(), setTimeout(35_000, undefined, { signal: timer.signal })
         .then(() => { throw new Error("Native helper did not confirm its request"); })]);
-      assert.equal(line.done, false);
+      assert.equal(line.done, false, "Native helper closed before replying to " + request.action.type);
       const value: unknown = JSON.parse(line.value);
       assert.ok(reply(value));
       assert.equal(value.operation_id, request.operation_id);
@@ -174,9 +177,38 @@ document.addEventListener('focusin', event => {
       { id: "username", value: "Native form value" }, { id: "password", value: inventedPassword }
     ] })) + ");");
   let submissions = 0;
+  let accountServed = false;
+  let finishLatePopup: (() => void) | undefined;
+  const popupEffects: string[] = [];
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    if (request.url === "/seed") {
+    if (request.url === "/account") {
+      if (!request.headers.cookie?.includes("synthetic_login=present")) { response.writeHead(401).end("Missing login"); return; }
+      if (accountServed) { response.writeHead(429).end("<!doctype html><h1>Fresh navigation unavailable</h1>"); return; }
+      accountServed = true;
+      response.end(`<!doctype html><title>Signed-in account</title><h1>Hi, Example!</h1>
+        <label>Draft<input value="Unsent fixture draft"></label>
+        <label>Saved password<input type="password" value="Invented-existing-secret-42"></label>
+        <button onclick="document.querySelector('output').textContent='Tracking: FIXTURE12345'">Track package</button><output></output>`);
+    } else if (request.url === "/orphan-account") {
+      response.end(`<!doctype html><title>Recoverable account</title>
+        <label>Draft<input value="Unsent orphan draft"></label>
+        <label>Password<input type="password" value="Invented-orphan-secret"></label>`);
+    } else if (request.url === "/late-owned") {
+      response.end(`<!doctype html><title>Late popup</title><h1>Untrusted popup</h1>
+        <label>Popup password<input type="password" value="Invented-popup-secret"></label><output>Waiting for capture</output>
+        <script>const timer = setInterval(() => {
+          const name = Object.getOwnPropertyNames(globalThis).find(name => name.startsWith('agentCapture_'));
+          if (name && Reflect.get(globalThis, name)?.active === true) {
+            Reflect.deleteProperty(globalThis, Symbol.for('beep-boop.browser-control')); clearInterval(timer);
+            document.querySelector('output').textContent = 'Ownership tamper attempted';
+          }
+        }, 10);</script>`);
+    } else if (request.url?.startsWith("/popup-effect?")) {
+      popupEffects.push(new URL(request.url, origin).searchParams.get("owner") ?? ""); response.end("Recorded");
+    } else if (request.url === "/late-popup-gate") {
+      finishLatePopup = () => response.end("Ready");
+    } else if (request.url === "/seed") {
       response.setHeader("Set-Cookie", "synthetic_login=present; HttpOnly; Path=/; SameSite=Lax");
       response.end("<!doctype html><h1>User tab sentinel</h1>");
     } else if (request.url === "/login") {
@@ -374,4 +406,158 @@ document.addEventListener('focusin', event => {
   await recovered.exposeBinding("fixtureRecovered", (_source, value: unknown) => value);
   assert.equal(await recovered.evaluate("window.fixtureRecovered('Recovered binding')"), "Recovered binding");
   await stalledSession.detach();
+
+  await t.test("native conversations recover an existing signed-in tab without owning its draft", async () => {
+    const account = await context.newPage(); await account.goto(`${origin}/account`);
+    const setter = await account.evaluateHandle("Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set");
+    const executable = process.env.AGENT_TEST_BROWSER_BROKER ?? fileURLToPath(new URL("../../../target/debug/examples/browser_fixture", import.meta.url));
+    const host = new NativeHelper(port, executable); hosts.push(host);
+    const first = { owner_id: randomUUID(), session_id: randomUUID() };
+    const second = { owner_id: randomUUID(), session_id: randomUUID() };
+    const execute = async (owner: typeof first, action: BrowserAction) => (await host.execute({ ...owner, operation_id: randomUUID(), action })).response;
+    const fresh = await execute(first, { type: "open", url: `${origin}/account` });
+    assert.ok(fresh.type === "ready", JSON.stringify(fresh)); assert.ok(fresh.output.includes("Fresh navigation unavailable"));
+    const disposable = fresh.tabs[0]; assert.ok(disposable);
+    const inventory = await execute(first, { type: "list_user_tabs" });
+    assert.ok(inventory.type === "user_tabs", JSON.stringify(inventory));
+    const original = inventory.tabs.find(tab => tab.url === `${origin}/account` && tab.title === "Signed-in account"); assert.ok(original);
+    await account.evaluate("document.title = 'Updated signed-in account'");
+    assert.equal((await execute(first, { type: "claim_user_tab", tab: original })).type, "failed", "Changed user-tab identities must fail closed");
+    const current = await execute(first, { type: "list_user_tabs" }); assert.ok(current.type === "user_tabs");
+    const selected = current.tabs.find(tab => tab.target_id === original.target_id); assert.ok(selected);
+    const competing = await execute(second, { type: "list_user_tabs" }); assert.ok(competing.type === "user_tabs");
+    assert.deepEqual(competing.tabs.filter(tab => tab.url === `${origin}/account`), [selected], "Another connection's disposable tab is not a user tab");
+    const claimed = await execute(first, { type: "claim_user_tab", tab: selected });
+    assert.ok(claimed.type === "ready", JSON.stringify(claimed));
+    assert.equal(claimed.output.includes("Invented-existing-secret-42"), false);
+    const borrowed = claimed.tabs.find(tab => tab.id !== disposable.id); assert.ok(borrowed);
+    assert.equal((await execute(second, { type: "claim_user_tab", tab: selected })).type, "failed", "Two conversations cannot control the same user tab");
+    const tracked = await execute(first, { type: "run_code", tab_id: borrowed.id, code: `async page => {
+      await page.getByRole('button', {name:'Track package',exact:true}).click();
+      return {tracking:await page.locator('output').innerText(),password:await page.getByLabel('Saved password').inputValue()};
+    }` });
+    assert.ok(tracked.type === "ready", JSON.stringify(tracked));
+    const output: unknown = JSON.parse(tracked.output); assert.ok(object(output));
+    assert.deepEqual(output.result, { tracking: "Tracking: FIXTURE12345", password: "[redacted]" });
+    assert.equal(tracked.output.includes("Unsent fixture draft"), false);
+    const failed = await execute(first, { type: "run_code", tab_id: borrowed.id, code: "async () => { throw new Error('Invented-existing-secret-42'); }" });
+    assert.equal(failed.type, "uncertain"); assert.equal(JSON.stringify(failed).includes("Invented-existing-secret-42"), false);
+    assert.equal((await execute(second, { type: "claim_user_tab", tab: selected })).type, "failed", "Uncertainty cannot release the existing claim");
+    assert.equal((await execute(first, { type: "release" })).type, "closed");
+    assert.equal(account.isClosed(), false); assert.equal(sentinel.isClosed(), false);
+    assert.equal(await account.getByLabel("Draft").inputValue(), "Unsent fixture draft");
+    assert.equal(await account.getByLabel("Saved password").inputValue(), "Invented-existing-secret-42");
+    assert.equal(await account.getByLabel("Draft").evaluate((input: object, previous: unknown) =>
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")?.set === previous, setter), true);
+    assert.equal(await account.evaluate("Object.getOwnPropertyNames(globalThis).some(name => name.startsWith('agentPassword_') || name.startsWith('agentCapture_'))"), false,
+      "Release must remove capture bindings and scripts from borrowed pages");
+    assert.equal(await account.evaluate("Reflect.has(globalThis, Symbol.for('beep-boop.browser-control'))"), false);
+    assert.equal(context.pages().some(page => page !== account && page.url() === `${origin}/account`), false, "Disposable tabs must close");
+    const reclaimed = await execute(second, { type: "claim_user_tab", tab: selected });
+    assert.ok(reclaimed.type === "ready", JSON.stringify(reclaimed));
+    const userTab = reclaimed.tabs[0]; assert.ok(userTab);
+    assert.equal((await execute(second, { type: "close_tab", tab_id: userTab.id })).type, "failed");
+    assert.equal((await execute(second, { type: "release" })).type, "closed");
+    assert.equal(account.isClosed(), false); await setter.dispose();
+  });
+
+  await t.test("an exited helper releases its claims without closing the borrowed user page", async () => {
+    const account = await context.newPage(); await account.goto(`${origin}/orphan-account`);
+    const host = new NativeHelper(port); hosts.push(host);
+    const first = { owner_id: randomUUID(), session_id: randomUUID() };
+    const second = { owner_id: randomUUID(), session_id: randomUUID() };
+    const third = { owner_id: randomUUID(), session_id: randomUUID() };
+    const execute = async (owner: typeof first, action: BrowserAction) => (await host.execute({ ...owner, operation_id: randomUUID(), action })).response;
+    const listed = await execute(first, { type: "list_user_tabs" }); assert.ok(listed.type === "user_tabs");
+    const target = listed.tabs.find(tab => tab.url === `${origin}/orphan-account`); assert.ok(target);
+    const claimed = await execute(first, { type: "claim_user_tab", tab: target }); assert.ok(claimed.type === "ready");
+    const tab = claimed.tabs[0]; assert.ok(tab);
+    const receipt = await execute(first, { type: "run_code", tab_id: tab.id,
+      code: "async () => ({helperPid:(await import('node:process')).default.pid})" });
+    assert.ok(receipt.type === "ready", JSON.stringify(receipt));
+    const result: unknown = JSON.parse(receipt.output);
+    assert.ok(object(result) && object(result.result) && typeof result.result.helperPid === "number"
+      && Number.isInteger(result.result.helperPid) && result.result.helperPid > 1);
+    const helperPid = result.result.helperPid;
+    process.kill(helperPid, "SIGKILL");
+    let exited = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        const state = execFileSync("/bin/ps", ["-p", String(helperPid), "-o", "stat="], { encoding: "utf8" }).trim();
+        exited = state.startsWith("Z");
+      } catch (error) {
+        if (!object(error) || error.status !== 1) throw error;
+        exited = true;
+      }
+      if (exited) break;
+      await setTimeout(10);
+    }
+    assert.equal(exited, true, "The exact owned helper must have terminated");
+    let available = await execute(second, { type: "list_user_tabs" }); assert.ok(available.type === "user_tabs");
+    for (let attempt = 0; attempt < 20 && !available.tabs.some(tab => tab.target_id === target.target_id); attempt++) {
+      await setTimeout(10);
+      available = await execute(second, { type: "list_user_tabs" }); assert.ok(available.type === "user_tabs");
+    }
+    assert.ok(available.tabs.some(tab => tab.target_id === target.target_id), "A proven helper exit must release the preserved page without another call to the dead owner");
+    const recovered = await execute(second, { type: "claim_user_tab", tab: target }); assert.ok(recovered.type === "ready", JSON.stringify(recovered));
+    const recoveredTab = recovered.tabs[0]; assert.ok(recoveredTab);
+    const observed = await execute(second, { type: "run_code", tab_id: recoveredTab.id,
+      code: "async page => ({draft:await page.getByLabel('Draft').inputValue(),password:await page.getByLabel('Password').inputValue()})" });
+    assert.ok(observed.type === "ready"); assert.equal(observed.output.includes("Invented-orphan-secret"), false);
+    const observedResult: unknown = JSON.parse(observed.output); assert.ok(object(observedResult));
+    assert.deepEqual(observedResult.result, { draft: "Unsent orphan draft", password: "[redacted]" });
+    const stale = await execute(first, { type: "status" }); assert.ok(stale.type === "uncertain" || stale.type === "disconnected");
+    const competing = await execute(third, { type: "list_user_tabs" }); assert.ok(competing.type === "user_tabs");
+    assert.equal(competing.tabs.some(tab => tab.target_id === target.target_id), false, "Dead-session cleanup cannot release the replacement owner's claim");
+    assert.equal((await execute(second, { type: "release" })).type, "closed");
+    assert.equal((await execute(third, { type: "release" })).type, "closed");
+    assert.equal(account.isClosed(), false); assert.equal(await account.getByLabel("Draft").inputValue(), "Unsent orphan draft");
+  });
+
+  await t.test("a late native popup stays exclusive despite page tampering before its opener's next receipt", async () => {
+    const executable = process.env.AGENT_TEST_BROWSER_BROKER ?? fileURLToPath(new URL("../../../target/debug/examples/browser_fixture", import.meta.url));
+    const host = new NativeHelper(port, executable); hosts.push(host);
+    const first = { owner_id: randomUUID(), session_id: randomUUID() };
+    const second = { owner_id: randomUUID(), session_id: randomUUID() };
+    const execute = async (owner: typeof first, action: BrowserAction) => (await host.execute({ ...owner, operation_id: randomUUID(), action })).response;
+    const opened = await execute(first, { type: "open", url: `${origin}/late-opener` }); assert.ok(opened.type === "ready");
+    const opener = opened.tabs[0]; assert.ok(opener);
+    const armed = await execute(first, { type: "run_code", tab_id: opener.id, code: `async page => {
+      await page.evaluate(() => {
+        const button = document.createElement('button'); button.textContent = 'Schedule popup';
+        button.onclick = () => { fetch('/late-popup-gate').then(() => window.open('/late-owned')); };
+        document.body.append(button);
+      });
+      await page.getByRole('button', {name:'Schedule popup'}).click(); return {armed:true};
+    }` });
+    assert.ok(armed.type === "ready");
+    for (let attempt = 0; finishLatePopup === undefined && attempt < 100; attempt++) await setTimeout(10);
+    assert.ok(finishLatePopup);
+    const created = context.waitForEvent("page", { timeout: 5000 }); finishLatePopup();
+    const popup = await created; await popup.waitForLoadState("domcontentloaded");
+    await popup.getByText("Ownership tamper attempted", { exact: true }).waitFor();
+    const listed = await execute(second, { type: "list_user_tabs" }); assert.ok(listed.type === "user_tabs");
+    assert.equal(listed.tabs.some(tab => tab.url === `${origin}/late-owned`), false, "The host excludes late owned targets before another helper can claim them");
+    const native = (await browserSession.send("Target.getTargets")).targetInfos.find(tab => tab.url === `${origin}/late-owned`); assert.ok(native);
+    const target = { target_id: native.targetId, url: native.url, title: native.title };
+    assert.equal((await execute(second, { type: "claim_user_tab", tab: target })).type, "failed",
+      "Untrusted page JavaScript cannot release the native owner's lease between broker receipts");
+    await popup.reload(); await popup.getByText("Ownership tamper attempted", { exact: true }).waitFor();
+    const navigated = await execute(second, { type: "list_user_tabs" }); assert.ok(navigated.type === "user_tabs");
+    assert.equal(navigated.tabs.some(tab => tab.target_id === target.target_id), false);
+    assert.equal((await execute(second, { type: "claim_user_tab", tab: target })).type, "failed", "Navigation preserves the native lease");
+    const effect = await execute(first, { type: "run_code", tab_id: opener.id, code: `async page => {
+      const popup = page.context().pages().find(page => page.url().endsWith('/late-owned'));
+      if (!popup) throw new Error('Owned popup missing');
+      await popup.evaluate(async () => { await fetch('/popup-effect?owner=A', {method:'POST'}); });
+      return {password:await popup.getByLabel('Popup password').inputValue()};
+    }` });
+    assert.ok(effect.type === "ready", JSON.stringify(effect)); assert.deepEqual(popupEffects, ["A"]);
+    assert.equal(effect.output.includes("Invented-popup-secret"), false); assert.ok(effect.output.includes("[redacted]"));
+    const observed = await execute(first, { type: "status" }); assert.ok(observed.type === "ready");
+    assert.ok(observed.tabs.some(tab => tab.url === `${origin}/late-owned`));
+    assert.equal((await execute(first, { type: "release" })).type, "closed");
+    assert.equal(popup.isClosed(), true, "Disposable popup cleanup belongs to its opener");
+    assert.equal((await execute(second, { type: "release" })).type, "closed");
+  });
 });

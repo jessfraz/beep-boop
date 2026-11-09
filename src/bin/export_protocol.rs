@@ -33,11 +33,13 @@ fn main() -> Result<()> {
     HistoryImportReceipt::export_all(&config)?;
     agent_cli::browser::BrowserRequest::export_all(&config)?;
     agent_cli::browser::BrowserReply::export_all(&config)?;
+    agent_cli::browser::BrowserHelperInput::export_all(&config)?;
+    agent_cli::browser::BrowserNativeControlRequest::export_all(&config)?;
     agent_cli::browser::BrowserConfig::export_all(&config)?;
     agent_cli::browser::BrowserBinding::export_all(&config)?;
     fs::write(
         output.join("browser.schema.json"),
-        serde_json::to_string_pretty(&schema_for!(agent_cli::browser::BrowserRequest))?,
+        serde_json::to_string_pretty(&schema_for!(agent_cli::browser::BrowserHelperInput))?,
     )?;
     fs::write(
         output.join("request.schema.json"),

@@ -703,6 +703,36 @@
           "properties": {
             "type": {
               "type": "string",
+              "const": "list_user_tabs"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab": {
+              "$ref": "#/$defs/BrowserUserTab"
+            },
+            "type": {
+              "type": "string",
+              "const": "claim_user_tab"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "open"
             },
             "url": {
@@ -998,6 +1028,26 @@
         "session_id",
         "operation_id",
         "action"
+      ]
+    },
+    "BrowserUserTab": {
+      "type": "object",
+      "properties": {
+        "target_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target_id",
+        "url",
+        "title"
       ]
     },
     "BuiltinTrigger": {
@@ -6195,6 +6245,10 @@
       "type": "object",
       "properties": {
         "browser": {
+          "type": "boolean",
+          "default": false
+        },
+        "browser_user_tabs": {
           "type": "boolean",
           "default": false
         },

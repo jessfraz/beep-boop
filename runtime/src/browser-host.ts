@@ -15,6 +15,10 @@ import type { BrowserReply } from "./generated/BrowserReply.js";
 import type { BrowserRequest } from "./generated/BrowserRequest.js";
 import type { BrowserResponse } from "./generated/BrowserResponse.js";
 import type { BrowserTab } from "./generated/BrowserTab.js";
+import type { BrowserUserTab } from "./generated/BrowserUserTab.js";
+import type { BrowserHelperInput } from "./generated/BrowserHelperInput.js";
+import type { BrowserNativeControlAction } from "./generated/BrowserNativeControlAction.js";
+import type { BrowserNativeControlRequest } from "./generated/BrowserNativeControlRequest.js";
 
 const OUTPUT_LIMIT = 64 * 1024;
 const ACTION_TIMEOUT = 30_000;
@@ -30,6 +34,7 @@ export type BrowserHostOptions = {
   serverArguments?: readonly string[];
   extensionToken?: string;
   environment?: Record<string, string>;
+  nativeControl?: (targetId: string, action: BrowserNativeControlAction) => Promise<boolean>;
 };
 
 type ConnectionStage = "pairing" | "mcp_transport" | "extension_attach" | "endpoint_discovery"
@@ -41,7 +46,11 @@ class ConnectionFailure extends Error {
   constructor(readonly stage: ConnectionStage) { super(`Chrome connection failed at ${stage}`); }
 }
 
+class TabClaimConflict extends Error {}
+
 type OwnedTab = {
+  kind: "disposable" | "user";
+  targetId?: string;
   info: BrowserTab;
   page: Page;
   refs: Map<string, string>;
@@ -53,8 +62,9 @@ type OwnedTab = {
   onDialog: (dialog: Dialog) => void;
   onDialogClosed: (dialog: Dialog) => void;
   closing: boolean;
-  script?: { result?: unknown; logs: string[] };
   captureName: string;
+  captureInit?: Awaited<ReturnType<Page["addInitScript"]>>;
+  captureBinding?: Awaited<ReturnType<Page["exposeBinding"]>>;
   captureReady: Promise<void>;
 };
 
@@ -240,6 +250,7 @@ export class BrowserHost {
   private readonly passwords = new Set<string>();
   private passwordBytes = 0;
   private captureFailed = false;
+  private readonly discovered = new Map<string, BrowserUserTab>();
   private redaction: { token: string | undefined; pattern: RegExp } | undefined;
 
   constructor(private readonly config: Pick<BrowserConfig, "user_data_dir" | "profile_dir_name">
@@ -247,7 +258,7 @@ export class BrowserHost {
     private readonly options: BrowserHostOptions = {}) {}
 
   execute(request: BrowserRequest): Promise<BrowserReply> {
-    const repeatable = request.action.type === "status" || request.action.type === "snapshot" || request.action.type === "wait_for";
+    const repeatable = request.action.type === "status" || request.action.type === "snapshot" || request.action.type === "wait_for" || request.action.type === "list_user_tabs";
     if (!repeatable && this.operations.has(request.operation_id)) return Promise.resolve({ operation_id: request.operation_id,
       response: { type: "failed", session_id: request.session_id, message: "This browser operation ID was already used; its effect will not run again." } });
     if (!repeatable) this.operations.add(request.operation_id);
@@ -320,9 +331,24 @@ export class BrowserHost {
     return true;
   }
 
+  private async claimNativeControl(tab: OwnedTab): Promise<void> {
+    if (this.options.nativeControl === undefined) throw new Error("Native browser control requires the host broker");
+    const session = await tab.page.context().newCDPSession(tab.page);
+    try { tab.targetId = (await session.send("Target.getTargetInfo")).targetInfo.targetId; }
+    finally { await session.detach(); }
+    // The host reads these requests even between operations. Do not install
+    // capture or expose a usable handle until its shared ledger acknowledges.
+    if (!await this.options.nativeControl(tab.targetId, "acquire")) throw new TabClaimConflict();
+  }
+
+  private async releaseNativeControl(tab: OwnedTab): Promise<void> {
+    if (tab.targetId !== undefined && this.options.nativeControl !== undefined
+        && !await this.options.nativeControl(tab.targetId, "release")) throw new Error("Native browser control could not be released");
+  }
+
   private async prepareCapture(tab: OwnedTab): Promise<void> {
     const binding = "agentPassword_" + randomUUID().replaceAll("-", "");
-    await tab.page.exposeBinding(binding, (source, message: unknown) => {
+    tab.captureBinding = await tab.page.exposeBinding(binding, (source, message: unknown) => {
       if (this.closing || !this.owned.has(tab.info.id) || source.page !== tab.page) return false;
       if (!this.webFrame(source.frame)) return;
       if (object(message) && message.ready === true) return true;
@@ -333,7 +359,7 @@ export class BrowserHost {
     });
     const options: CaptureOptions = { binding, control: tab.captureName, maxValues: MAX_PASSWORD_VALUES,
       maxChars: MAX_PASSWORD_CHARS, protocols: [...WEB_DOCUMENT_PROTOCOLS] };
-    await tab.page.addInitScript(installPasswordCapture, options);
+    tab.captureInit = await tab.page.addInitScript(installPasswordCapture, options);
     for (const frame of tab.page.frames()) {
       if (this.webFrame(frame)) await frame.evaluate(installPasswordCapture, options);
     }
@@ -372,6 +398,7 @@ export class BrowserHost {
     try {
       await Promise.race([(async () => {
         await tab.captureReady;
+        await tab.captureInit?.dispose();
         for (const frame of tab.page.frames()) {
           if (!this.webFrame(frame)) continue;
           await frame.evaluate(async name => {
@@ -381,6 +408,7 @@ export class BrowserHost {
             if (typeof stop === "function") await stop();
           }, tab.captureName);
         }
+        await tab.captureBinding?.dispose();
       })(), delay(1000, undefined, { signal: timer.signal, ref: false }).then(() => {
         throw new Error("Password capture shutdown timed out");
       })]);
@@ -413,7 +441,9 @@ export class BrowserHost {
 
   private async connect(): Promise<Page | undefined> {
     if (this.browser !== undefined) return undefined;
-    if (this.config.debugging_port !== undefined && this.config.debugging_port !== null) return this.connectNative(this.config.debugging_port);
+    if (this.config.debugging_port !== undefined && this.config.debugging_port !== null) {
+      await this.connectNative(this.config.debugging_port); return undefined;
+    }
     const rawToken = this.options.extensionToken ?? process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
     // The extension's Copy button includes the environment assignment.
     const token = rawToken?.trim().replace(/^PLAYWRIGHT_MCP_EXTENSION_TOKEN=/, "");
@@ -481,11 +511,13 @@ export class BrowserHost {
     // Only direct creation and owned openers establish ownership. Install
     // privacy capture before returning a new Page to arbitrary scripts.
     context.newPage = async () => {
-      const tab = this.adopt(await newPage()); await tab.captureReady; return tab.page;
+      const tab = this.adopt(await newPage()); await tab.captureReady;
+      if (!this.owned.has(tab.info.id)) throw new Error("The new tab is controlled by another conversation");
+      return tab.page;
     };
   }
 
-  private async connectNative(port: number): Promise<Page> {
+  private async connectNative(port: number): Promise<void> {
     let stage: ConnectionStage = "browser_attach";
     try {
       if (!Number.isInteger(port) || port < 1 || port > 65535
@@ -501,28 +533,36 @@ export class BrowserHost {
       const context = browser.contexts()[0];
       if (context === undefined) throw new Error("Chrome default context is unavailable");
       this.trackCreatedPages(context);
-      stage = "page_creation";
-      return await context.newPage();
     } catch {
       await this.close().catch(() => {});
       throw new ConnectionFailure(stage);
     }
   }
 
-  private adopt(page: Page): OwnedTab {
+  private adopt(page: Page, kind: OwnedTab["kind"] = "disposable"): OwnedTab {
     const existing = [...this.owned.values()].find(tab => tab.page === page);
     if (existing !== undefined) return existing;
     if (this.nextId > 0xffff_ffff) throw new Error("Browser tab handles are exhausted");
     let notify = () => {};
     const dialogOpened = new Promise<void>(resolve => { notify = resolve; });
-    const tab: OwnedTab = { info: { id: this.nextId++, url: page.url(), title: "" }, page, refs: new Map(),
+    const tab: OwnedTab = { kind, info: { id: this.nextId++, url: page.url(), title: "" }, page, refs: new Map(),
       dialogOpened, notifyDialog: notify,
       popup: popup => { if (this.owned.has(tab.info.id)) this.adopt(popup); },
       onDialog: dialog => { tab.dialog = dialog; tab.notifyDialog(); },
       onDialogClosed: dialog => this.dialogClosed(tab, dialog), closing: false,
       captureName: "agentCapture_" + randomUUID().replaceAll("-", ""), captureReady: Promise.resolve() };
     this.owned.set(tab.info.id, tab);
-    tab.captureReady = this.prepareCapture(tab).catch(() => { this.captureFailed = true; });
+    tab.captureReady = (async () => {
+      if (this.config.debugging_port !== undefined && this.config.debugging_port !== null) {
+        await this.claimNativeControl(tab);
+      }
+      await this.prepareCapture(tab);
+    })().catch(error => {
+      if (error instanceof TabClaimConflict) {
+        this.owned.delete(tab.info.id);
+        page.off("popup", tab.popup); page.off("dialog", tab.onDialog); page.off("dialogclosed", tab.onDialogClosed);
+      } else this.captureFailed = true;
+    });
     page.on("popup", tab.popup);
     page.on("dialog", tab.onDialog);
     page.on("dialogclosed", tab.onDialogClosed);
@@ -535,11 +575,60 @@ export class BrowserHost {
   }
 
   private async retain(tab: OwnedTab): Promise<void> {
-    await this.capturePasswords(tab); await this.stopCapture(tab);
+    await this.capturePasswords(tab); await this.releaseControl(tab);
+  }
+
+  private async releaseControl(tab: OwnedTab): Promise<void> {
+    await this.stopCapture(tab);
     this.owned.delete(tab.info.id);
     tab.page.off("popup", tab.popup);
     tab.page.off("dialog", tab.onDialog);
     tab.page.off("dialogclosed", tab.onDialogClosed);
+    await this.releaseNativeControl(tab);
+  }
+
+  private async userTabs(): Promise<BrowserUserTab[]> {
+    const session = await this.liveBrowser().newBrowserCDPSession();
+    try {
+      // Browser-level metadata remains readable even if an unrelated renderer
+      // is stalled. Incognito contexts and our controlled pages stay out.
+      const contexts: unknown = await session.send("Target.getBrowserContexts");
+      const result: unknown = await session.send("Target.getTargets");
+      if (!object(contexts) || !Array.isArray(contexts.browserContextIds)
+          || !object(result) || !Array.isArray(result.targetInfos)) throw new Error("Native tab inventory is unavailable");
+      const controlled = new Set([...this.owned.values()].map(tab => tab.targetId));
+      const tabs: BrowserUserTab[] = [];
+      for (const target of result.targetInfos) {
+        if (!object(target) || target.type !== "page" || typeof target.targetId !== "string"
+            || typeof target.url !== "string" || typeof target.title !== "string"
+            || contexts.browserContextIds.includes(target.browserContextId) || controlled.has(target.targetId)) continue;
+        if (!allowedUrl(target.url) || !/^https?:/.test(target.url)) continue;
+        tabs.push({ target_id: target.targetId, url: this.redact(target.url), title: this.redact(target.title) });
+      }
+      return tabs;
+    } finally { await session.detach(); }
+  }
+
+  private async claimUserTab(expected: BrowserUserTab): Promise<OwnedTab | undefined> {
+    const listed = this.discovered.get(expected.target_id);
+    if (listed?.url !== expected.url || listed.title !== expected.title) return undefined;
+    const current = (await this.userTabs()).find(tab => tab.target_id === expected.target_id);
+    if (current?.url !== expected.url || current.title !== expected.title) return undefined;
+    const context = this.liveBrowser().contexts()[0];
+    if (context === undefined) return undefined;
+    for (const page of context.pages()) {
+      if (page.url() !== expected.url) continue;
+      const session = await context.newCDPSession(page);
+      try {
+        const result: unknown = await session.send("Target.getTargetInfo");
+        if (object(result) && object(result.targetInfo) && result.targetInfo.targetId === expected.target_id) {
+          const tab = this.adopt(page, "user"); await tab.captureReady;
+          if (!this.owned.has(tab.info.id)) throw new TabClaimConflict();
+          return tab;
+        }
+      } finally { await session.detach(); }
+    }
+    return undefined;
   }
 
   private dialogClosed(tab: OwnedTab, dialog: Dialog): void {
@@ -565,8 +654,7 @@ export class BrowserHost {
   }
 
   private async state(tab: OwnedTab, message: string): Promise<string> {
-    const script = tab.script === undefined ? {} : { result: tab.script.result, logs: tab.script.logs };
-    if (tab.dialog !== undefined) return output(message, { ...script, dialog: { type: tab.dialog.type(),
+    if (tab.dialog !== undefined) return output(message, { dialog: { type: tab.dialog.type(),
       message: tab.dialog.message(), defaultValue: tab.dialog.defaultValue() } }, value => this.redact(value));
     const children = await tab.page.locator("body").ariaSnapshotJSON({ mode: "ai" });
     await this.capturePasswords(tab);
@@ -578,13 +666,12 @@ export class BrowserHost {
       if (Array.isArray(node.children)) for (const child of node.children) collect(child);
     };
     collect(children);
-    return output(message, { ...script, snapshot: { children } }, value => this.redact(value));
+    return output(message, { snapshot: { children } }, value => this.redact(value));
   }
 
-  private async runCode(tab: OwnedTab, code: string): Promise<void> {
+  private async runCode(tab: OwnedTab, code: string): Promise<unknown> {
     await this.capturePasswords(tab);
-    const script: { result?: unknown; logs: string[] } = { logs: [] };
-    const log = (...values: unknown[]) => { script.logs.push(format(...values)); };
+    const log = () => {};
     // This is the normal Playwright Page, with its full API. The VM provides
     // script scope, not a security sandbox; task authorization still applies.
     const invoke: unknown = runInNewContext(`(${code})`, {
@@ -594,12 +681,12 @@ export class BrowserHost {
       Request, Response, FormData, Blob, crypto, atob, btoa, structuredClone,
     }, { importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER });
     if (typeof invoke !== "function") throw new Error("Playwright code must be an async function receiving page");
-    tab.script = script;
     // Normal Playwright scripts await their operations and handle dialogs with
     // Page event handlers. Keep the host's native-input lease until completion.
     await tab.page.bringToFront();
-    script.result = await invoke(tab.page);
+    const result: unknown = await invoke(tab.page);
     await this.capturePasswords(tab);
+    return result;
   }
 
   private async effect(tab: OwnedTab, action: () => Promise<unknown>): Promise<void> {
@@ -631,19 +718,31 @@ export class BrowserHost {
     if (action.type === "status" && this.browser === undefined) return { type: "ready", session_id, tabs: [],
       output: output("The browser connection has not been opened."), is_error: false };
     if (action.type === "release") return this.release(session_id);
+    if ((action.type === "list_user_tabs" || action.type === "claim_user_tab") && this.config.debugging_port == null) return {
+      type: "failed", session_id, message: "Existing user tabs require a configured native Chrome debugging port." };
     try {
       const firstPage = await this.connect();
       const browser = this.liveBrowser();
       await this.refresh();
       this.liveBrowser();
+      if (action.type === "list_user_tabs") {
+        const tabs = await this.userTabs();
+        this.discovered.clear(); for (const tab of tabs) this.discovered.set(tab.target_id, tab);
+        return { type: "user_tabs", session_id, tabs };
+      }
       if (action.type === "status") return { type: "ready", session_id, tabs: this.tabs(),
         output: output("Current owned Chrome tabs."), is_error: false };
       let tab: OwnedTab;
+      let scriptResult: unknown;
       if (action.type === "open" || action.type === "new_tab") {
         const context = browser.contexts()[0];
         if (context === undefined) throw new Error("Browser context closed");
         tab = this.adopt(firstPage ?? await context.newPage());
         if (action.url !== "about:blank") await this.effect(tab, () => tab.page.goto(action.url, { waitUntil: "domcontentloaded" }));
+      } else if (action.type === "claim_user_tab") {
+        const claimed = await this.claimUserTab(action.tab);
+        if (claimed === undefined) return { type: "failed", session_id, message: "This user tab changed or was not listed by this connection. List user tabs again before claiming it." };
+        tab = claimed;
       } else {
         const owned = this.owned.get(action.tab_id);
         if (owned === undefined) return { type: "failed", session_id, message: "The owned tab was closed or removed. Its handle is no longer valid." };
@@ -654,6 +753,7 @@ export class BrowserHost {
           return { type: "ready", session_id, tabs: this.tabs(), output: output("The result tab was retained for the user and released from disposable task ownership."), is_error: false };
         }
         if (action.type === "close_tab") {
+          if (tab.kind === "user") return { type: "failed", session_id, message: "Claimed user tabs are preserved. Release the connection to return control." };
           await this.closeTab(tab);
           if (this.owned.size === 0) {
             await this.close();
@@ -672,7 +772,7 @@ export class BrowserHost {
         } else if (tab.dialog === undefined) {
           switch (action.type) {
             case "snapshot": break;
-            case "run_code": await this.runCode(tab, action.code); break;
+            case "run_code": scriptResult = await this.runCode(tab, action.code); break;
             case "navigate": await this.effect(tab, () => tab.page.goto(action.url, { waitUntil: "domcontentloaded" })); break;
             case "click":
               await tab.page.bringToFront();
@@ -697,10 +797,14 @@ export class BrowserHost {
         } else if (action.type !== "snapshot") return { type: "failed", session_id, message: "Handle the owned tab's current dialog before another action." };
       }
       await this.refresh();
-      const result = await this.state(tab, "Current Chrome page state.");
+      const result = action.type === "run_code"
+        ? output("Browser script completed.", { result: scriptResult }, value => this.redact(value))
+        : await this.state(tab, "Current Chrome page state.");
       this.liveBrowser();
       return { type: "ready", session_id, tabs: this.tabs(), output: result, is_error: false };
     } catch (error) {
+      if (error instanceof TabClaimConflict) return { type: "failed", session_id,
+        message: "This tab is controlled by another browser connection. Choose another tab or wait for that connection to release it." };
       if (action.type === "run_code" && !this.closing && !this.disconnected) {
         const timer = new AbortController();
         try {
@@ -755,14 +859,18 @@ export class BrowserHost {
         try { await session.send("Browser.getVersion"); } finally { await session.detach(); }
       }
       this.owned.delete(tab.info.id);
+      await this.releaseNativeControl(tab);
     } finally { tab.closing = false; tab.page.off("dialog", handle); }
   }
 
   private async release(session_id: string): Promise<BrowserResponse> {
     try {
-      for (const tab of [...this.owned.values()]) await this.closeTab(tab);
+      for (const tab of [...this.owned.values()]) {
+        if (tab.kind === "user") await this.releaseControl(tab);
+        else await this.closeTab(tab);
+      }
       return { type: "closed", session_id, tabs: this.tabs(),
-        output: output("Owned tabs were closed and the Chrome connection was released.") };
+        output: output("Disposable tabs were closed, user tabs were preserved and the Chrome connection was released.") };
     } catch (error) {
       return { type: "uncertain", session_id, message: `${this.failureDetail(error)} Owned tab cleanup could not be confirmed. Inspect Chrome before closing or repeating anything.` };
     } finally { await this.close(); }
@@ -776,25 +884,48 @@ async function main(): Promise<void> {
       || rawConfig.debugging_port !== undefined && rawConfig.debugging_port !== null
         && (typeof rawConfig.debugging_port !== "number" || !Number.isInteger(rawConfig.debugging_port)
           || rawConfig.debugging_port < 1 || rawConfig.debugging_port > 65535)) throw new Error("Invalid browser configuration");
+  const controls = new Map<string, { resolve(granted: boolean): void; reject(error: Error): void }>();
+  const disconnectControls = () => {
+    for (const pending of controls.values()) pending.reject(new Error("Native browser broker disconnected"));
+    controls.clear();
+  };
   const host = new BrowserHost({ user_data_dir: rawConfig.user_data_dir, profile_dir_name: rawConfig.profile_dir_name,
-    debugging_port: rawConfig.debugging_port ?? null });
+    debugging_port: rawConfig.debugging_port ?? null }, {
+    nativeControl: (targetId, action) => new Promise<boolean>((resolve, reject) => {
+      const request: BrowserNativeControlRequest = { native_control_id: randomUUID(), target_id: targetId, action };
+      controls.set(request.native_control_id, { resolve, reject });
+      process.stdout.write(JSON.stringify(request) + "\n");
+    }),
+  });
   const ajv = new Ajv2020({ strict: true });
   ajv.addFormat("uuid", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   ajv.addFormat("uint32", { type: "number", validate: (value: number) => Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff });
   const schema: unknown = JSON.parse(await readFile(new URL("../../src/generated/browser.schema.json", import.meta.url), "utf8"));
   if (!object(schema)) throw new Error("Invalid browser request schema");
-  const valid = ajv.compile<BrowserRequest>(schema);
-  const stop = () => { void host.close().finally(() => process.exit(0)); };
+  const valid = ajv.compile<BrowserHelperInput>(schema);
+  const stop = () => { disconnectControls(); void host.close().finally(() => process.exit(0)); };
   process.once("SIGTERM", stop); process.once("SIGINT", stop);
-  process.stdin.once("end", () => { void host.close(); });
+  process.stdin.once("end", disconnectControls);
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const active = new Set<Promise<void>>();
   try {
-    for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+    for await (const line of input) {
       const request: unknown = JSON.parse(line);
       if (!valid(request)) throw new Error("Invalid browser request");
-      const reply = await host.execute(request);
-      process.stdout.write(JSON.stringify(reply) + "\n");
+      if ("native_control_id" in request) {
+        const pending = controls.get(request.native_control_id);
+        if (pending === undefined) throw new Error("Native browser acknowledgement has no pending claim");
+        controls.delete(request.native_control_id); pending.resolve(request.granted); continue;
+      }
+      // Keep reading acknowledgements while execute awaits native ownership.
+      // BrowserHost's queue still serializes ordinary operations.
+      const running = (async () => {
+        try { process.stdout.write(JSON.stringify(await host.execute(request)) + "\n"); }
+        catch { process.exitCode = 1; input.close(); process.stdin.destroy(); }
+      })();
+      active.add(running); void running.then(() => active.delete(running));
     }
-  } finally { await host.close(); }
+  } finally { disconnectControls(); await host.close(); await Promise.all(active); }
 }
 
 if (process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url) {

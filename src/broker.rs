@@ -26,6 +26,7 @@ struct Peer {
     stop: watch::Sender<bool>,
     resume_agent: bool,
     browser: bool,
+    browser_user_tabs: bool,
 }
 struct Effect {
     command: HostCommand,
@@ -133,6 +134,10 @@ impl Broker {
                     .capabilities
                     .as_ref()
                     .is_some_and(|capabilities| capabilities.browser),
+                browser_user_tabs: node
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.browser_user_tabs),
             },
         );
         if let Err(error) = control(
@@ -182,25 +187,35 @@ impl Broker {
         if self.local.as_ref().is_some_and(|node| node.host_id == id) {
             return self.executor.execute_cancelled(command, cancelled).await;
         }
-        let sender = self
-            .peers
-            .lock()
-            .await
-            .get(id)
-            .map(|peer| (peer.calls.clone(), peer.resume_agent, peer.browser));
-        let Some((sender, resume_agent, browser)) = sender else {
+        let sender = self.peers.lock().await.get(id).map(|peer| {
+            (
+                peer.calls.clone(),
+                peer.resume_agent,
+                peer.browser,
+                peer.browser_user_tabs,
+            )
+        });
+        let Some((sender, resume_agent, browser, browser_user_tabs)) = sender else {
             return unavailable();
         };
-        if let HostCommand::Browser { request, .. } = &command
-            && !browser
-        {
-            return HostResult::Browser {
-                response: crate::browser::BrowserResponse::Failed {
-                    session_id: request.session_id,
-                    message: "Update Beep Boop on this host before using its Chrome browser tools."
-                        .into(),
-                },
-            };
+        if let HostCommand::Browser { request, .. } = &command {
+            let user_tabs = matches!(
+                request.action,
+                crate::browser::BrowserAction::ListUserTabs
+                    | crate::browser::BrowserAction::ClaimUserTab { .. }
+            );
+            if !browser || user_tabs && !browser_user_tabs {
+                return HostResult::Browser {
+                    response: crate::browser::BrowserResponse::Failed {
+                        session_id: request.session_id,
+                        message: if browser && user_tabs {
+                            "Update Beep Boop on this host before discovering or claiming existing Chrome tabs."
+                        } else {
+                            "Update Beep Boop on this host before using its Chrome browser tools."
+                        }.into(),
+                    },
+                };
+            }
         }
         if matches!(command, HostCommand::ResumeAgentWorker { .. }) && !resume_agent {
             return HostResult::Failed {
@@ -447,6 +462,7 @@ mod tests {
         task::JoinHandle,
         time::timeout,
     };
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn usage_stays_on_the_coordinator_and_rejects_an_unverified_account() {
@@ -496,6 +512,14 @@ mod tests {
     }
     impl Worker {
         async fn connect(broker: Arc<Broker>, runtime: Arc<Runtime>, id: &str) -> Self {
+            Self::connect_with_capabilities(broker, runtime, id, None).await
+        }
+        async fn connect_with_capabilities(
+            broker: Arc<Broker>,
+            runtime: Arc<Runtime>,
+            id: &str,
+            capabilities: Option<crate::protocol::WorkerCapabilities>,
+        ) -> Self {
             let (client, server) = tokio::io::duplex(65536);
             let (read, write) = tokio::io::split(server);
             let node = AgentNode {
@@ -513,7 +537,7 @@ mod tests {
                     model: Some(ModelSelection::default()),
                 },
                 machine: None,
-                capabilities: Default::default(),
+                capabilities,
             };
             let task = tokio::spawn(async move {
                 broker
@@ -661,6 +685,207 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(operation.await.unwrap(), HostResult::Written));
+        worker.close().await;
+        drop(broker);
+        close(runtime).await;
+    }
+
+    #[tokio::test]
+    async fn browser_capable_legacy_worker_rejects_new_tab_actions_and_keeps_ordinary_calls() {
+        let (_directory, runtime) = runtime().await;
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let id = "11111111-1111-4111-8111-111111111111";
+        let capabilities: crate::protocol::WorkerCapabilities =
+            serde_json::from_str(r#"{"resume_agent":true,"browser":true}"#).unwrap();
+        assert!(
+            !capabilities.browser_user_tabs,
+            "Missing legacy fields must default to unsupported"
+        );
+        let mut worker = Worker::connect_with_capabilities(
+            broker.clone(),
+            runtime.clone(),
+            id,
+            Some(capabilities),
+        )
+        .await;
+        let session_id = Uuid::new_v4();
+        let browser = |action| HostCommand::Browser {
+            host_id: id.into(),
+            request: crate::browser::BrowserRequest {
+                owner_id: "fixture-owner".into(),
+                session_id,
+                operation_id: Uuid::new_v4().to_string(),
+                action,
+            },
+        };
+        for action in [
+            crate::browser::BrowserAction::ListUserTabs,
+            crate::browser::BrowserAction::ClaimUserTab {
+                tab: crate::browser::BrowserUserTab {
+                    target_id: "fixture-target".into(),
+                    url: "https://example.com/account".into(),
+                    title: "Fixture account".into(),
+                },
+            },
+        ] {
+            let result = match timeout(Duration::from_secs(2), broker.execute(browser(action)))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    worker.close().await;
+                    drop(broker);
+                    close(runtime).await;
+                    panic!(
+                        "An unsupported action must fail before entering the old worker's effect stream"
+                    );
+                }
+            };
+            assert!(
+                matches!(result, HostResult::Browser { response: crate::browser::BrowserResponse::Failed { session_id: actual, message } }
+                if actual == session_id && message.contains("Update"))
+            );
+        }
+        for command in [
+            browser(crate::browser::BrowserAction::Open {
+                url: "https://example.com/".into(),
+            }),
+            effect(
+                id,
+                HostCommand::ReadFile {
+                    path: "/example/item".into(),
+                    offset: 0,
+                    limit: 10,
+                },
+            ),
+        ] {
+            let operation = {
+                let broker = broker.clone();
+                tokio::spawn(async move { broker.execute(command).await })
+            };
+            let RuntimeEventKind::HostCall { call_id, command } = event(&mut worker.reader).await
+            else {
+                panic!("Expected an ordinary worker call");
+            };
+            let result = match *command {
+                HostCommand::Browser { request, .. } => {
+                    assert!(matches!(
+                        request.action,
+                        crate::browser::BrowserAction::Open { .. }
+                    ));
+                    HostResult::Browser {
+                        response: crate::browser::BrowserResponse::Ready {
+                            session_id,
+                            tabs: Vec::new(),
+                            output: "Legacy browser ready".into(),
+                            is_error: false,
+                        },
+                    }
+                }
+                HostCommand::ReadFile { .. } => HostResult::File {
+                    content: "Ordinary worker still connected".into(),
+                    truncated: false,
+                },
+                _ => panic!("An unsupported action reached the legacy worker"),
+            };
+            write_frame(
+                &mut worker.writer,
+                &RuntimeCommand::HostReply { call_id, result },
+            )
+            .await
+            .unwrap();
+            assert!(!matches!(
+                operation.await.unwrap(),
+                HostResult::Failed { .. }
+            ));
+        }
+        worker.close().await;
+        drop(broker);
+        close(runtime).await;
+    }
+
+    #[tokio::test]
+    async fn negotiated_user_tab_support_forwards_both_actions_to_the_same_worker() {
+        let (_directory, runtime) = runtime().await;
+        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut worker = Worker::connect_with_capabilities(
+            broker.clone(),
+            runtime.clone(),
+            id,
+            Some(crate::protocol::WorkerCapabilities {
+                resume_agent: true,
+                browser: true,
+                browser_user_tabs: true,
+            }),
+        )
+        .await;
+        for action in [
+            crate::browser::BrowserAction::ListUserTabs,
+            crate::browser::BrowserAction::ClaimUserTab {
+                tab: crate::browser::BrowserUserTab {
+                    target_id: "fixture-target".into(),
+                    url: "https://example.com/account".into(),
+                    title: "Fixture account".into(),
+                },
+            },
+        ] {
+            let lists = matches!(action, crate::browser::BrowserAction::ListUserTabs);
+            let session_id = Uuid::new_v4();
+            let operation = {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    broker
+                        .execute(HostCommand::Browser {
+                            host_id: id.into(),
+                            request: crate::browser::BrowserRequest {
+                                owner_id: "fixture-owner".into(),
+                                session_id,
+                                operation_id: Uuid::new_v4().to_string(),
+                                action,
+                            },
+                        })
+                        .await
+                })
+            };
+            let RuntimeEventKind::HostCall { call_id, command } = event(&mut worker.reader).await
+            else {
+                panic!("Expected negotiated browser call");
+            };
+            let HostCommand::Browser { request, .. } = *command else {
+                panic!("Expected browser operation");
+            };
+            assert_eq!(
+                matches!(request.action, crate::browser::BrowserAction::ListUserTabs),
+                lists
+            );
+            let response = if lists {
+                crate::browser::BrowserResponse::UserTabs {
+                    session_id,
+                    tabs: Vec::new(),
+                }
+            } else {
+                crate::browser::BrowserResponse::Ready {
+                    session_id,
+                    tabs: Vec::new(),
+                    output: "Fixture tab selected".into(),
+                    is_error: false,
+                }
+            };
+            write_frame(
+                &mut worker.writer,
+                &RuntimeCommand::HostReply {
+                    call_id,
+                    result: HostResult::Browser { response },
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                operation.await.unwrap(),
+                HostResult::Browser { .. }
+            ));
+        }
         worker.close().await;
         drop(broker);
         close(runtime).await;

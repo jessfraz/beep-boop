@@ -88,6 +88,7 @@ pub async fn local_node(
         capabilities: Some(crate::protocol::WorkerCapabilities {
             resume_agent: true,
             browser: true,
+            browser_user_tabs: true,
         }),
         machine: crate::machines::observe(daemon).await.ok(),
     };

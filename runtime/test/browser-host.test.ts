@@ -883,7 +883,8 @@ test("run_code uses the real Page API for dialogs, frames and owned tab lifecycl
   assert.notEqual(successor.id, tab.id);
   const output: unknown = JSON.parse(completed.output); assert.ok(object(output));
   assert.deepEqual(output.result, { url: `${f.origin}/done?phase=run-code`, frameValue: "Inside the frame", childUrl: `${f.origin}/form?phase=script-child` });
-  assert.deepEqual(output.logs, ["script started", "script submitted"]);
+  assert.equal("logs" in output, false);
+  assert.equal("snapshot" in output, false);
   assert.equal(f.count(), 1);
   const form = new URLSearchParams(f.submittedBodies()[0]);
   assert.equal(form.get("name"), "Scripted owner"); assert.equal(form.get("choice"), "Second");
@@ -1239,4 +1240,35 @@ test("sandboxed srcdoc passwords remain private across owned browser operations"
   assert.ok(status.type === "ready", JSON.stringify(status));
   const released = (await f.host.execute(request({ type: "release" }))).response;
   assert.equal(released.type, "closed", JSON.stringify(released));
+});
+
+test("run_code preserves a filled form while returning only its redacted explicit result",
+  { skip: skipChrome, timeout: 60_000 }, async t => {
+  const f = await fixture(t), host = await f.nativeBroker(), request = requests();
+  const opened = (await host.execute(request({ type: "open", url: f.origin + "/password" }))).response;
+  assert.ok(opened.type === "ready"); const tab = opened.tabs[0]; assert.ok(tab);
+  const filled = (await host.execute(request({ type: "run_code", tab_id: tab.id, code: `async page => {
+    await page.getByLabel('Normal field').fill('Filled username');
+    await page.getByLabel('Password', {exact:true}).fill('Invented-script-result-secret');
+    console.log('Unrequested console output');
+    return {stage:'filled',password:await page.getByLabel('Password',{exact:true}).inputValue()};
+  }` }))).response;
+  assert.ok(filled.type === "ready", JSON.stringify(filled));
+  const output: unknown = JSON.parse(filled.output); assert.ok(object(output));
+  assert.deepEqual(output.result, { stage: "filled", password: "[redacted]" });
+  assert.equal("snapshot" in output, false); assert.equal("logs" in output, false);
+  assert.equal(filled.output.includes("Filled username"), false);
+  assert.equal(filled.output.includes("Unrequested console output"), false);
+  const snapshot = (await host.execute(request({ type: "snapshot", tab_id: tab.id }))).response;
+  assert.ok(snapshot.type === "ready", JSON.stringify(snapshot));
+  assert.ok(snapshot.output.includes("Filled username"));
+  assert.equal(snapshot.output.includes("Invented-script-result-secret"), false);
+  const retained = (await host.execute(request({ type: "run_code", tab_id: tab.id, code: `async page => ({
+    username:await page.getByLabel('Normal field').inputValue(),
+    passwordPresent:await page.getByLabel('Password',{exact:true}).inputValue()==='Invented-script-result-secret'
+  })` }))).response;
+  assert.ok(retained.type === "ready", JSON.stringify(retained));
+  const values: unknown = JSON.parse(retained.output); assert.ok(object(values));
+  assert.deepEqual(values.result, { username: "Filled username", passwordPresent: true });
+  assert.equal((await host.execute(request({ type: "release" }))).response.type, "closed");
 });

@@ -13,8 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    process::{ChildStdin, Command},
+    sync::{Mutex, mpsc, watch},
+    task::JoinHandle,
     time::timeout,
 };
 use ts_rs::TS;
@@ -51,6 +52,10 @@ pub struct BrowserRequest {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserAction {
     Status,
+    ListUserTabs,
+    ClaimUserTab {
+        tab: BrowserUserTab,
+    },
     Open {
         url: String,
     },
@@ -107,9 +112,21 @@ pub struct BrowserTab {
     pub title: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserUserTab {
+    pub target_id: String,
+    pub url: String,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserResponse {
+    UserTabs {
+        session_id: Uuid,
+        tabs: Vec<BrowserUserTab>,
+    },
     Ready {
         session_id: Uuid,
         tabs: Vec<BrowserTab>,
@@ -138,7 +155,8 @@ pub enum BrowserResponse {
 impl BrowserResponse {
     pub fn session_id(&self) -> Uuid {
         match self {
-            Self::Ready { session_id, .. }
+            Self::UserTabs { session_id, .. }
+            | Self::Ready { session_id, .. }
             | Self::Closed { session_id, .. }
             | Self::Disconnected { session_id, .. }
             | Self::Failed { session_id, .. }
@@ -152,6 +170,44 @@ impl BrowserResponse {
 pub struct BrowserReply {
     pub operation_id: String,
     pub response: BrowserResponse,
+}
+
+/// Private helper protocol. Native control must be acknowledged before a page
+/// enters the helper's usable tab inventory, including asynchronous popups.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserNativeControlAction {
+    Acquire,
+    Release,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNativeControlRequest {
+    pub native_control_id: Uuid,
+    pub target_id: String,
+    pub action: BrowserNativeControlAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNativeControlReply {
+    pub native_control_id: Uuid,
+    pub granted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(untagged)]
+pub enum BrowserHelperInput {
+    Operation(BrowserRequest),
+    NativeControl(BrowserNativeControlReply),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BrowserHelperOutput {
+    Operation(BrowserReply),
+    NativeControl(BrowserNativeControlRequest),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -174,15 +230,28 @@ pub struct BrowserBinding {
     pub response: Option<BrowserResponse>,
 }
 
+enum HelperShutdown {
+    Terminate,
+    Kill,
+}
+
 struct Process {
     session_id: Uuid,
-    child: Child,
-    input: Option<ChildStdin>,
-    output: FrameReader<BufReader<ChildStdout>>,
+    input: Arc<Mutex<Option<ChildStdin>>>,
+    replies: mpsc::UnboundedReceiver<Result<BrowserReply>>,
+    reader: Option<JoinHandle<()>>,
+    shutdown: mpsc::UnboundedSender<HelperShutdown>,
+    exited: watch::Receiver<bool>,
+    monitor: Option<JoinHandle<()>>,
 }
 
 impl Process {
-    fn start(runtime: &Path, config: &BrowserConfig, session_id: Uuid) -> Result<Self> {
+    fn start(
+        runtime: &Path,
+        config: &BrowserConfig,
+        session_id: Uuid,
+        claims: Arc<Mutex<HashMap<String, Uuid>>>,
+    ) -> Result<Self> {
         let helper = runtime.with_file_name("browser-host.js");
         ensure!(
             helper.is_file(),
@@ -210,63 +279,189 @@ impl Process {
             .kill_on_drop(false)
             .spawn()
             .context("Could not start the browser runtime")?;
-        let input = child.stdin.take().context("Browser runtime has no input")?;
+        let input = Arc::new(Mutex::new(Some(
+            child.stdin.take().context("Browser runtime has no input")?,
+        )));
         let output = child
             .stdout
             .take()
             .context("Browser runtime has no output")?;
+        let (sender, replies) = mpsc::unbounded_channel();
+        let (shutdown, mut signals) = mpsc::unbounded_channel();
+        let (exit, exited) = watch::channel(false);
+        let reader_exited = exited.clone();
+        let monitor_claims = claims.clone();
+        // This task owns Child through wait(), even when the connection is
+        // idle or its Process is dropped. EOF alone cannot prove control ended.
+        let monitor = tokio::spawn(async move {
+            let status = loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    Some(signal) = signals.recv() => match signal {
+                        HelperShutdown::Terminate => {
+                            if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                                unsafe { libc::kill(pid, libc::SIGTERM); }
+                            }
+                        }
+                        HelperShutdown::Kill => { let _ = child.start_kill(); }
+                    }
+                }
+            };
+            if status.is_ok() {
+                let mut claims = monitor_claims.lock().await;
+                // Publish under the ledger lock: a queued pipe frame cannot
+                // register another claim after this dead session is cleared.
+                let _ = exit.send(true);
+                claims.retain(|_, owner| *owner != session_id);
+            }
+        });
+        let writer = input.clone();
+        // Read while the helper is idle too. A popup must acquire the same
+        // ledger entry as an explicit claim before its first helper effect.
+        let reader = tokio::spawn(async move {
+            let mut output = FrameReader::new(BufReader::new(output));
+            let result: Result<()> = async {
+                while let Some(frame) = output.next_frame().await? {
+                    match serde_json::from_slice::<BrowserHelperOutput>(&frame)
+                        .context("Invalid browser helper frame")?
+                    {
+                        BrowserHelperOutput::Operation(reply) => {
+                            ensure!(
+                                reply.response.session_id() == session_id,
+                                "Browser helper session changed"
+                            );
+                            if sender.send(Ok(reply)).is_err() {
+                                break;
+                            }
+                        }
+                        BrowserHelperOutput::NativeControl(request) => {
+                            let granted = {
+                                let mut claims = claims.lock().await;
+                                if *reader_exited.borrow() {
+                                    false
+                                } else {
+                                    match request.action {
+                                        BrowserNativeControlAction::Acquire => {
+                                            if claims
+                                                .get(&request.target_id)
+                                                .is_none_or(|owner| *owner == session_id)
+                                            {
+                                                claims.insert(request.target_id, session_id);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        BrowserNativeControlAction::Release => {
+                                            if claims
+                                                .get(&request.target_id)
+                                                .is_some_and(|owner| *owner != session_id)
+                                            {
+                                                false
+                                            } else {
+                                                claims.remove(&request.target_id);
+                                                true
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            let mut line = serde_json::to_vec(&BrowserNativeControlReply {
+                                native_control_id: request.native_control_id,
+                                granted,
+                            })?;
+                            line.push(b'\n');
+                            let mut input = writer.lock().await;
+                            let input = input.as_mut().context("Browser connection is closed")?;
+                            input.write_all(&line).await?;
+                            input.flush().await?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = sender.send(Err(error));
+            }
+        });
         Ok(Self {
             session_id,
-            child,
-            input: Some(input),
-            output: FrameReader::new(BufReader::new(output)),
+            input,
+            replies,
+            reader: Some(reader),
+            shutdown,
+            exited,
+            monitor: Some(monitor),
         })
     }
 
-    async fn exchange(&mut self, request: &BrowserRequest) -> Result<BrowserResponse> {
-        let input = self
-            .input
-            .as_mut()
-            .context("Browser connection is closed")?;
-        let mut line = serde_json::to_vec(request)?;
-        line.push(b'\n');
-        input.write_all(&line).await?;
-        input.flush().await?;
-        let frame = self
-            .output
-            .next_frame()
-            .await?
-            .context("Browser runtime disconnected")?;
-        let reply: BrowserReply =
-            serde_json::from_slice(&frame).context("Invalid browser reply")?;
+    async fn exchange(&mut self, request: &BrowserRequest) -> Result<BrowserReply> {
+        {
+            let mut input = self.input.lock().await;
+            let input = input.as_mut().context("Browser connection is closed")?;
+            let mut line = serde_json::to_vec(request)?;
+            line.push(b'\n');
+            input.write_all(&line).await?;
+            input.flush().await?;
+        }
+        let reply = self
+            .replies
+            .recv()
+            .await
+            .context("Browser runtime disconnected")??;
         ensure!(
             reply.operation_id == request.operation_id
                 && reply.response.session_id() == request.session_id,
             "Browser reply belongs to another operation or connection"
         );
-        Ok(reply.response)
+        Ok(reply)
+    }
+
+    async fn wait_for_exit(&mut self) -> bool {
+        loop {
+            if *self.exited.borrow() {
+                return true;
+            }
+            if self.exited.changed().await.is_err() {
+                return false;
+            }
+        }
     }
 
     async fn close(&mut self) {
-        self.input.take();
-        if timeout(Duration::from_secs(5), self.child.wait())
-            .await
-            .is_err()
-        {
-            if let Some(pid) = self.child.id().and_then(|id| i32::try_from(id).ok()) {
-                // The helper handles SIGTERM by closing Pi's stdio transport,
-                // which reaps its own MCP process group.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
-            if timeout(Duration::from_secs(5), self.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = self.child.kill().await;
+        self.input.lock().await.take();
+        if !matches!(
+            timeout(Duration::from_secs(5), self.wait_for_exit()).await,
+            Ok(true)
+        ) {
+            let _ = self.shutdown.send(HelperShutdown::Terminate);
+            if !matches!(
+                timeout(Duration::from_secs(5), self.wait_for_exit()).await,
+                Ok(true)
+            ) {
+                let _ = self.shutdown.send(HelperShutdown::Kill);
+                let _ = self.wait_for_exit().await;
             }
         }
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.await;
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // The reader owns a writer clone for claim acknowledgements. Abort it
+        // so dropping the host still closes stdin and gives the helper EOF.
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+        // Keep the monitor alive to reap Child and release its session's claims.
     }
 }
 
@@ -276,6 +471,7 @@ pub struct BrowserHost {
     config: Option<BrowserConfig>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Process>>>>,
     native_input: Mutex<()>,
+    tab_claims: Arc<Mutex<HashMap<String, Uuid>>>,
 }
 
 impl Default for BrowserHost {
@@ -285,6 +481,7 @@ impl Default for BrowserHost {
             config: None,
             sessions: Mutex::new(HashMap::new()),
             native_input: Mutex::new(()),
+            tab_claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -296,6 +493,7 @@ impl BrowserHost {
             config,
             sessions: Mutex::new(HashMap::new()),
             native_input: Mutex::new(()),
+            tab_claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -323,7 +521,10 @@ impl BrowserHost {
                 message: "Browser operation was interrupted before it started.".into(),
             });
         }
-        if matches!(request.action, BrowserAction::Open { .. }) {
+        let opens = matches!(request.action, BrowserAction::Open { .. });
+        let discovers = matches!(request.action, BrowserAction::ListUserTabs);
+        let starts = opens || discovers && !sessions.contains_key(&request.owner_id);
+        if starts {
             if sessions.contains_key(&request.owner_id) {
                 return Ok(BrowserResponse::Failed { session_id: request.session_id,
                     message: "This conversation already owns a browser connection; inspect or release it before opening another.".into() });
@@ -336,7 +537,7 @@ impl BrowserHost {
                 .runtime
                 .as_deref()
                 .context("Browser runtime is unavailable")?;
-            let process = match Process::start(runtime, config, request.session_id) {
+            let process = match Process::start(runtime, config, request.session_id, self.tab_claims.clone()) {
                 Ok(process) => process,
                 Err(_) => return Ok(BrowserResponse::Failed {
                     session_id: request.session_id,
@@ -361,6 +562,7 @@ impl BrowserHost {
         let _native_input = if matches!(
             request.action,
             BrowserAction::Status
+                | BrowserAction::ListUserTabs
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::WaitFor { .. }
                 | BrowserAction::RetainTab { .. }
@@ -382,7 +584,7 @@ impl BrowserHost {
             }
         };
         if *cancelled.borrow() {
-            if matches!(request.action, BrowserAction::Open { .. }) {
+            if starts {
                 // Allocation can finish while an interrupt arrives. No browser
                 // action has started, so release the newly allocated helper.
                 live.close().await;
@@ -399,18 +601,35 @@ impl BrowserHost {
                 message: "Browser operation was interrupted before it started.".into(),
             });
         }
+        if let BrowserAction::ClaimUserTab { tab } = &request.action {
+            let claims = self.tab_claims.lock().await;
+            if claims
+                .get(&tab.target_id)
+                .is_some_and(|session| *session != request.session_id)
+            {
+                return Ok(BrowserResponse::Failed {
+                    session_id: request.session_id,
+                    message: "This tab is controlled by another conversation.".into(),
+                });
+            }
+        }
         let result = timeout(Duration::from_secs(150), live.exchange(request)).await;
         let result = match result {
-            Ok(result) => result,
+            Ok(Ok(mut reply)) => {
+                if let BrowserResponse::UserTabs { tabs, .. } = &mut reply.response {
+                    let claims = self.tab_claims.lock().await;
+                    tabs.retain(|tab| !claims.contains_key(&tab.target_id));
+                }
+                Ok(reply.response)
+            }
+            Ok(Err(error)) => Err(error),
             Err(error) => Err(error.into()),
         };
         let release = match &result {
             Ok(BrowserResponse::Closed { .. } | BrowserResponse::Disconnected { .. }) | Err(_) => {
                 true
             }
-            Ok(BrowserResponse::Failed { .. }) => {
-                matches!(request.action, BrowserAction::Open { .. })
-            }
+            Ok(BrowserResponse::Failed { .. }) => starts,
             _ => false,
         };
         if release {

@@ -1,28 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "BrowserRequest",
-  "type": "object",
-  "properties": {
-    "action": {
-      "$ref": "#/$defs/BrowserAction"
+  "title": "BrowserHelperInput",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/BrowserRequest"
     },
-    "operation_id": {
-      "type": "string"
-    },
-    "owner_id": {
-      "type": "string"
-    },
-    "session_id": {
-      "type": "string",
-      "format": "uuid"
+    {
+      "$ref": "#/$defs/BrowserNativeControlReply"
     }
-  },
-  "additionalProperties": false,
-  "required": [
-    "owner_id",
-    "session_id",
-    "operation_id",
-    "action"
   ],
   "$defs": {
     "BrowserAction": {
@@ -38,6 +23,36 @@
           "additionalProperties": false,
           "required": [
             "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "list_user_tabs"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tab": {
+              "$ref": "#/$defs/BrowserUserTab"
+            },
+            "type": {
+              "type": "string",
+              "const": "claim_user_tab"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab"
           ]
         },
         {
@@ -315,6 +330,68 @@
             "type"
           ]
         }
+      ]
+    },
+    "BrowserNativeControlReply": {
+      "type": "object",
+      "properties": {
+        "granted": {
+          "type": "boolean"
+        },
+        "native_control_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "native_control_id",
+        "granted"
+      ]
+    },
+    "BrowserRequest": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/BrowserAction"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner_id",
+        "session_id",
+        "operation_id",
+        "action"
+      ]
+    },
+    "BrowserUserTab": {
+      "type": "object",
+      "properties": {
+        "target_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target_id",
+        "url",
+        "title"
       ]
     }
   }

@@ -111,6 +111,8 @@ pub struct WorkerCapabilities {
     pub resume_agent: bool,
     #[serde(default)]
     pub browser: bool,
+    #[serde(default)]
+    pub browser_user_tabs: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
