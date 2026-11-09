@@ -183,7 +183,9 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
   }
 }
 
-enum UnavailablePeer: CaseIterable, Sendable { case closedTCP, missingUnixSocket }
+enum UnavailablePeer: CaseIterable, Sendable {
+  case closedTCP, occupiedLocalPort, missingUnixSocket
+}
 
 @Test(.timeLimit(.minutes(1)), arguments: UnavailablePeer.allCases)
 func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: UnavailablePeer)
@@ -194,9 +196,12 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
   defer { try? FileManager.default.removeItem(at: directory) }
   let socket: NWConnection
   let expectedFailures: [NWError]
+  var reservedListener: NWListener?
+  defer { reservedListener?.cancel() }
   switch peer {
-  case .closedTCP:
+  case .closedTCP, .occupiedLocalPort:
     let listener = try NWListener(using: .tcp, on: .any)
+    reservedListener = listener
     let listening = AsyncThrowingStream<Void, any Error>.makeStream()
     listener.stateUpdateHandler = { state in
       switch state {
@@ -208,14 +213,22 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     }
     listener.newConnectionHandler = { $0.cancel() }
     listener.start(queue: .global())
-    defer { listener.cancel() }
     for try await _ in listening.stream { break }
     let port = try #require(listener.port)
-    listener.cancel()
-    for try await _ in listening.stream {}
-    socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
-    // Network.framework may report the closed listener as refused or reset.
-    expectedFailures = [.posix(.ECONNREFUSED), .posix(.ECONNRESET)]
+    let parameters = NWParameters.tcp
+    if case .closedTCP = peer {
+      listener.cancel()
+      for try await _ in listening.stream {}
+      // Setup can fail while binding the client's local ephemeral port too.
+      // Preserve that original network failure, regardless of which side failed.
+      expectedFailures = [.posix(.ECONNREFUSED), .posix(.ECONNRESET), .posix(.EADDRINUSE)]
+    } else {
+      // Force the same OS failure seen under parallel CI without relying on
+      // the ephemeral allocator choosing a particular port.
+      parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
+      expectedFailures = [.posix(.EADDRINUSE)]
+    }
+    socket = NWConnection(host: .ipv4(.loopback), port: port, using: parameters)
   case .missingUnixSocket:
     socket = NWConnection(
       to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)

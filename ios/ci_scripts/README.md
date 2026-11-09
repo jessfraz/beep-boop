@@ -16,7 +16,7 @@ Configure one release workflow:
 | --- | --- |
 | Project | `ios/Agent.xcodeproj` |
 | Scheme | `Agent` |
-| Start condition | Branch Changes, exact branch `main`, any file in `/ios` |
+| Start condition | Branch Changes, exact branch `main`, production paths below |
 | Superseded builds | Auto-cancel enabled |
 | Environment | Xcode 26.6 (17F113), macOS 26.5.1 (25F80) |
 | Test action | iOS, `Agent`, Use Scheme Settings, **Required To Pass** |
@@ -39,9 +39,14 @@ Xcode's `error:` format, rather than reporting only the script's exit code.
 The public Cloud check may still show only the script status; inspect the
 action's full log for the emitted diagnostics.
 
-The `/ios` filter includes the app, generated native contracts, package tests
-and release scripts. CLI-only and runtime-only changes do not create a signed
-iOS build. Manual starts from `main` remain available.
+The release filter includes the complete `ios/Sources`, `ios/AgentApp`,
+`ios/ShareExtension` and `ios/Agent.xcodeproj` directories, shell hooks (`.sh`)
+under `ios/ci_scripts`, plus `ios/Package.swift`, `ios/Package.resolved`,
+`ios/App.xcconfig`, `ios/Shared.xcconfig` and `ios/TestFlightExport.plist`.
+New production files and shell hooks automatically trigger delivery. Changes
+confined to tests, CLI, runtime or documentation outside those production
+directories do not create a signed iOS build. GitHub still runs the native
+checks on every push. Manual starts from `main` remain available.
 
 Pin Xcode and host macOS together. Qualify both appearance audits on Cloud
 before advancing either version. The top form, revealed footer and empty main
