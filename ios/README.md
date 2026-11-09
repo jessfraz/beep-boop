@@ -208,7 +208,9 @@ per-test storage identities retain composer and endpoint-specific outbox files
 across relaunch. Foreground recovery and process relaunch are asserted separately
 from suspension, which XCTest can prevent and therefore report as skipped.
 Native interaction checks also rotate a static transcript at the live tail and
-while reading older messages. Expanded tool output must appear once, retaining
+while reading older messages. Incoming output preserves that older reading
+position; following resumes when scrolling back to the live tail.
+Expanded tool output must appear once, retaining
 richer previews when lazy details are truncated and keeping the truncation
 notice visible.
 

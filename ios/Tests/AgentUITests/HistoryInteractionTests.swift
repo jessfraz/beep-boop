@@ -324,7 +324,8 @@ final class HistoryInteractionTests: XCTestCase {
         continuation: false, entryId: "rotation-\(index)", finalChunk: true, role: .final,
         text: "Orchard section \(index). \(paragraph)")
     }
-    let app = try await launchMessages(messages)
+    let peer = InteractionPeer()
+    let app = try await launchMessages(messages, peer: peer)
     continueAfterFailure = true
     defer { XCUIDevice.shared.orientation = .portrait }
     let transcript = app.scrollViews["transcript"]
@@ -357,10 +358,24 @@ final class HistoryInteractionTests: XCTestCase {
     try await eventually(description: "older reading position after rotation") {
       earlier.isHittable && app.buttons["latest-messages"].exists
     }
+    try await peer.beginReply("An incoming update must preserve the older reading position.")
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    XCTAssertTrue(earlier.isHittable, app.debugDescription)
+    XCTAssertTrue(app.buttons["latest-messages"].exists)
     let screenshot = XCTAttachment(screenshot: app.screenshot())
     screenshot.name = "rotation-preserves-older-reading-position"
     screenshot.lifetime = .keepAlways
     add(screenshot)
+    for _ in 0..<8 {
+      if !app.buttons["latest-messages"].exists { break }
+      transcript.swipeUp(velocity: .fast)
+    }
+    XCTAssertFalse(app.buttons["latest-messages"].exists)
+    let fresh = "A fresh reply follows the reader's return to the live tail."
+    try await peer.reply(fresh, id: "after-reader-return")
+    XCTAssertTrue(app.staticTexts[fresh].waitForExistence(timeout: 3))
+    XCTAssertTrue(app.staticTexts[fresh].isHittable, app.debugDescription)
+    XCTAssertFalse(app.buttons["latest-messages"].exists)
   }
 
   func testForegroundAndRelaunchKeepNewTypingWithoutRestoringSentText() async throws {

@@ -21,6 +21,7 @@ public struct MainChatView: View {
   @FocusState private var composerFocused: Bool
   @State private var sourceDetails = false
   @State private var followsLatest = true
+  @State private var transcriptWidth: CGFloat = 0
   @State private var userScrolling = false
   @State private var atTop = false
   @State private var latestVisible = true
@@ -346,16 +347,21 @@ public struct MainChatView: View {
         atTop = current.top
         latestVisible = current.latest
         if current.latest && !model.rows.isEmpty { presentedLatest = true }
-        // Layout and keyboard changes must not stop following a live
-        // conversation. A person's scroll may leave the visible tail.
-        if userScrolling || current.latest { followsLatest = current.latest }
+        // Reflow preserves reading intent. A person's scroll can leave the
+        // live tail or return to it; explicit navigation sets its own intent.
+        if userScrolling { followsLatest = current.latest }
       }
       .onScrollGeometryChange(for: CGFloat.self) {
         $0.containerSize.width
-      } action: { previous, current in
-        // Rotation can reflow static history without a model revision.
-        // Initial layout and keyboard height changes keep their native anchor.
-        if previous > 0 && previous != current && followsLatest && !userScrolling {
+      } action: { _, current in
+        transcriptWidth = current
+      }
+      .task(id: transcriptWidth) {
+        guard transcriptWidth > 0 else { return }
+        // Apply a width change outside the geometry callback.
+        // SwiftUI cancels an obsolete width request or a removed transcript.
+        await Task.yield()
+        if !Task.isCancelled && followsLatest && !userScrolling {
           scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
         }
       }
@@ -363,7 +369,10 @@ public struct MainChatView: View {
         if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
       .onChange(of: notifications?.openedTarget) { _, target in
-        if target != nil { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+        if target != nil {
+          followsLatest = true
+          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+        }
       }
       .overlay(alignment: .bottomTrailing) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
