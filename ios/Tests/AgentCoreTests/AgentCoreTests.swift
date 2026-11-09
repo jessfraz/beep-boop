@@ -184,7 +184,7 @@ private func withLocalPeer(_ body: @Sendable (LineConnection, NWConnection) asyn
 }
 
 enum UnavailablePeer: CaseIterable, Sendable {
-  case closedTCP, occupiedLocalPort, missingUnixSocket
+  case closedTCP, nonSocketUnixPeer, missingUnixSocket
 }
 
 @Test(.timeLimit(.minutes(1)), arguments: UnavailablePeer.allCases)
@@ -196,12 +196,10 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
   defer { try? FileManager.default.removeItem(at: directory) }
   let socket: NWConnection
   let expectedFailures: [NWError]
-  var reservedListener: NWListener?
-  defer { reservedListener?.cancel() }
   switch peer {
-  case .closedTCP, .occupiedLocalPort:
+  case .closedTCP:
     let listener = try NWListener(using: .tcp, on: .any)
-    reservedListener = listener
+    defer { listener.cancel() }
     let listening = AsyncThrowingStream<Void, any Error>.makeStream()
     listener.stateUpdateHandler = { state in
       switch state {
@@ -215,20 +213,19 @@ func realNetworkTransportUnavailablePeerReleasesItsOriginalFailure(_ peer: Unava
     listener.start(queue: .global())
     for try await _ in listening.stream { break }
     let port = try #require(listener.port)
-    let parameters = NWParameters.tcp
-    if case .closedTCP = peer {
-      listener.cancel()
-      for try await _ in listening.stream {}
-      // Setup can fail while binding the client's local ephemeral port too.
-      // Preserve that original network failure, regardless of which side failed.
-      expectedFailures = [.posix(.ECONNREFUSED), .posix(.ECONNRESET), .posix(.EADDRINUSE)]
-    } else {
-      // Force the same OS failure seen under parallel CI without relying on
-      // the ephemeral allocator choosing a particular port.
-      parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
-      expectedFailures = [.posix(.EADDRINUSE)]
-    }
-    socket = NWConnection(host: .ipv4(.loopback), port: port, using: parameters)
+    listener.cancel()
+    for try await _ in listening.stream {}
+    // Setup can fail while binding the client's local ephemeral port too.
+    // Preserve that original network failure, regardless of which side failed.
+    expectedFailures = [.posix(.ECONNREFUSED), .posix(.ECONNRESET), .posix(.EADDRINUSE)]
+    socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+  case .nonSocketUnixPeer:
+    // A task-owned plain file cannot accept a connection. TCP listener ports
+    // can be shared with outgoing connections on Simulator.
+    let path = directory.appending(path: "not-a-socket")
+    try Data().write(to: path)
+    socket = NWConnection(to: .unix(path: path.path), using: .tcp)
+    expectedFailures = [.posix(.ENOTSOCK), .posix(.ECONNREFUSED)]
   case .missingUnixSocket:
     socket = NWConnection(
       to: .unix(path: directory.appending(path: "missing.sock").path), using: .tcp)
