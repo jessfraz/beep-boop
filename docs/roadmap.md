@@ -36,10 +36,14 @@ recovery; [history](history.md) describes import and retrieval.
   keyboard active through consecutive sends and use production persistence.
   Cold recovery uses admission identities to preserve newer notes and files
   after failed saves, queue retirement and storage relocation.
-  A physical-device recurrence after foregrounding remains unresolved; qualify
-  the full visible composer during reconnect and active responses before closing.
+  Simulator checks retain production startup and composer/outbox state across
+  relaunch.
+  Full visible-composer checks cover foreground recovery and active responses.
+  The reported intermittent visible-text recurrence remains unreproduced.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
+- [x] Retain the live tail and older reading position through native rotation.
+  Expanded tool cards show retained output once without losing truncated text.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
   controls through Global Nix. Background, CLI and main-agent collection have
   passed live checks, preserving active and dirty work.

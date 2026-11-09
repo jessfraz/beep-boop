@@ -294,7 +294,7 @@ struct ActivityItemView: View {
         } else {
           VStack(alignment: .leading, spacing: 8) {
             presentationDetails
-            if !model.row.text.isEmpty {
+            if !model.row.text.isEmpty && showsRetainedPreview {
               if model.row.tool != nil {
                 ToolText(title: "Output", text: model.row.text)
               } else {
@@ -389,6 +389,16 @@ struct ActivityItemView: View {
   private var availableDetails: ToolDetailsAvailable? {
     guard case .available(let value) = loaded else { return nil }
     return value
+  }
+
+  private var showsRetainedPreview: Bool {
+    guard model.row.presentation == nil, model.row.tool != nil,
+      case .text(let value)? = availableDetails?.output
+    else { return true }
+    if value.text.isEmpty { return true }
+    // Lazy detail limits are bytes; retained previews can contain more Unicode
+    // text. Prefer a containing copy, and keep distinct incomplete evidence.
+    return value.truncated && !value.text.utf8.starts(with: model.row.text.utf8)
   }
 
   private var shellExitCode: Int? {
@@ -528,7 +538,7 @@ struct ActivityItemView: View {
           ToolContent(title: "Input", content: value.input)
           ToolContent(
             title: "Output", content: value.output, name: value.name,
-            preview: model.row.presentation == nil ? nil : model.row.text)
+            preview: showsRetainedPreview ? model.row.text : nil)
         }
       }
     } else {
@@ -703,33 +713,34 @@ struct ToolContent: View {
   var preview: String? = nil
 
   var showsContent: Bool {
+    if case .text(let value) = content, value.text.isEmpty, !value.truncated { return false }
     guard let preview, !preview.isEmpty, case .text(let value) = content else { return true }
-    return value.truncated || !value.text.utf8.elementsEqual(preview.utf8)
+    return value.truncated
+      ? !preview.utf8.starts(with: value.text.utf8)
+      : !value.text.utf8.elementsEqual(preview.utf8)
   }
 
   var body: some View {
+    let process = name == "exec" ? ProcessOutput.decode(content) : nil
     if showsContent {
-      if name == "exec", let process = ProcessOutput.decode(content) {
+      if let process {
         if !process.stdout.isEmpty { ToolText(title: "Output", text: process.stdout) }
         if !process.stderr.isEmpty {
           ToolText(title: "Error output", text: process.stderr, error: true)
         }
         Text("Exit code \(process.exitCode)").font(.caption.weight(.medium))
           .foregroundStyle(process.exitCode == 0 ? Color.secondary : Color.red)
-        if process.truncated {
-          Text("Output truncated.").font(.caption).foregroundStyle(.secondary)
-        }
       } else {
         switch content {
         case .text(let value):
           ToolText(title: title, text: value.text)
-          if value.truncated {
-            Text("\(title) truncated.").font(.caption).foregroundStyle(.secondary)
-          }
         case .unavailable(let value):
           Text("\(title): \(value.reason.description)").font(.caption).foregroundStyle(.secondary)
         }
       }
+    }
+    if case .text(let value) = content, value.truncated || process?.truncated == true {
+      Text("\(title) truncated.").font(.caption).foregroundStyle(.secondary)
     }
   }
 }

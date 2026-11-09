@@ -177,7 +177,7 @@ import Testing
   }
 }
 
-@MainActor @Test func lazyRetainedOutputOnlyDeduplicatesAnExactCompletePreview() throws {
+@MainActor @Test func lazyRetainedOutputKeepsAdditionalEvidenceWithoutRepeatingThePreview() throws {
   let preview = String(repeating: "p", count: 32_768)
   let original = ToolDetails.available(
     .init(
@@ -197,7 +197,7 @@ import Testing
     )
     .showsContent)
   #expect(
-    ToolContent(
+    !ToolContent(
       title: "Output", content: .text(.init(text: preview, truncated: true)), preview: preview
     )
     .showsContent)
@@ -206,4 +206,11 @@ import Testing
       title: "Output", content: .unavailable(.init(reason: .lookupLimit)), preview: preview
     )
     .showsContent)
+  let unicodePreview = String(repeating: "é", count: 20_000) + " retained tail"
+  #expect(
+    !ToolContent(
+      title: "Output",
+      content: .text(.init(text: String(repeating: "é", count: 16_384), truncated: true)),
+      preview: unicodePreview
+    ).showsContent)
 }

@@ -21,6 +21,8 @@ final class RowModel: Identifiable {
 
 @MainActor @Observable
 final class ChatModel {
+  typealias SessionFactory = @Sendable (URL, SavedConversation?) -> CoordinatorSession
+
   private enum ComposerEvent: String {
     case active, inactive, restored, edited, sendRequested, sendIgnored, cleared, outboxSaved,
       localDraftRestored,
@@ -86,6 +88,7 @@ final class ChatModel {
     @Sendable (String, InputMode, [LocalAttachment], ComposerInputIdentity?) async -> Bool
   @ObservationIgnored private var draftStore: AttachmentStore?
   @ObservationIgnored private var retiredDraftFiles: [LocalAttachment] = []
+  @ObservationIgnored private let makeSession: SessionFactory
   @ObservationIgnored private var feedbackScreenshotID: String? { didSet { scheduleDraftSave() } }
 
   init(
@@ -96,13 +99,18 @@ final class ChatModel {
       @escaping @Sendable (String, InputMode, [LocalAttachment], ComposerInputIdentity?) async ->
       Bool = { _, _, _, _ in
         false
-      }
+      },
+    makeSession: SessionFactory? = nil
   ) {
     inspectedConversation = conversation
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
     self.outboxURL = outboxURL
+    self.makeSession =
+      makeSession ?? { url, conversation in
+        CoordinatorSession(outboxURL: url, inspecting: conversation)
+      }
     draftReady = persistence == nil
     self.admit = admit
   }
@@ -117,12 +125,13 @@ final class ChatModel {
   @ObservationIgnored private var active = true
 
   static func persistent(
-    in directory: URL = .applicationSupportDirectory.appending(path: "Agent")
+    in directory: URL = .applicationSupportDirectory.appending(path: "Agent"),
+    makeSession: SessionFactory? = nil
   ) -> ChatModel {
     ChatModel(
       draftStore: AttachmentStore(directory: directory.appending(path: "Drafts")),
       persistence: ComposerDraftStore(url: directory.appending(path: "Composer/draft.json")),
-      sharedInbox: try? SharedDraftInbox.configured())
+      sharedInbox: try? SharedDraftInbox.configured(), makeSession: makeSession)
   }
 
   func insertCommand(_ command: SlashCommand) {
@@ -287,9 +296,8 @@ final class ChatModel {
       }.joined()
       let directory = try FileManager.default.url(
         for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-      let session = CoordinatorSession(
-        outboxURL: directory.appending(path: "Agent/Outbox/\(key)/pending.json"),
-        inspecting: inspectedConversation)
+      let session = makeSession(
+        directory.appending(path: "Agent/Outbox/\(key)/pending.json"), inspectedConversation)
       guard self.generation == generation else { return }
       await connect(session: session, address: address)
     } catch { self.error = error.localizedDescription }

@@ -49,19 +49,20 @@ public struct MainChatView: View {
     relatedWork = []
     inspectRelated = nil
   }
-  // Previews and hosted rendering use the real screen with a seeded model,
-  // without taking ownership of a live connection or the user's saved address.
+  // Seeded screens attach by default. Integration fixtures can retain the
+  // screen's normal startup owner with isolated settings and storage.
   init(
     model: ChatModel, expansion: ActivityExpansion = ActivityExpansion(),
     details: ToolDetailsLoader? = nil, initialScrollTarget: String? = nil,
-    relatedWork: [SavedConversation] = [], inspectRelated: ((SavedConversation) -> Void)? = nil
+    relatedWork: [SavedConversation] = [], inspectRelated: ((SavedConversation) -> Void)? = nil,
+    managesConnection: Bool = false, notifications: AppNotifications? = nil
   ) {
     _model = State(initialValue: model)
     _activityExpansion = State(initialValue: expansion)
-    managesConnection = false
+    self.managesConnection = managesConnection
     detailLoader = details
     self.initialScrollTarget = initialScrollTarget
-    notifications = nil
+    self.notifications = notifications
     self.relatedWork = relatedWork
     self.inspectRelated = inspectRelated
     _followsLatest = State(initialValue: initialScrollTarget == nil)
@@ -348,6 +349,15 @@ public struct MainChatView: View {
         // Layout and keyboard changes must not stop following a live
         // conversation. A person's scroll may leave the visible tail.
         if userScrolling || current.latest { followsLatest = current.latest }
+      }
+      .onScrollGeometryChange(for: CGFloat.self) {
+        $0.containerSize.width
+      } action: { previous, current in
+        // Rotation can reflow static history without a model revision.
+        // Initial layout and keyboard height changes keep their native anchor.
+        if previous > 0 && previous != current && followsLatest && !userScrolling {
+          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+        }
       }
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }

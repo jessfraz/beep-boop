@@ -7,7 +7,7 @@ struct AgentApp: App {
   var body: some Scene {
     WindowGroup {
       #if DEBUG
-        if let fixture = InteractionFixture.fromEnvironment() {
+        if let fixture = InteractionFixture.fromEnvironment(notifications: notifications) {
           fixture
         } else {
           MainChatView(notifications: notifications)

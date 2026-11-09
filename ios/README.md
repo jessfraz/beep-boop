@@ -202,6 +202,16 @@ On macOS, a process-overlap regression exercises real draft saves and cold
 readback while native processes launch. File locks end with their transaction,
 including when a child temporarily inherits a descriptor before exec.
 
+Native UI checks use the screen's production startup and scene lifecycle. A
+DEBUG-only session factory redirects transport to an owned loopback peer;
+per-test storage identities retain composer and endpoint-specific outbox files
+across relaunch. Foreground recovery and process relaunch are asserted separately
+from suspension, which XCTest can prevent and therefore report as skipped.
+Native interaction checks also rotate a static transcript at the live tail and
+while reading older messages. Expanded tool output must appear once, retaining
+richer previews when lazy details are truncated and keeping the truncation
+notice visible.
+
 Rendering tests capture the production message rows
 in light, dark and large-text appearance using invented content. Markdown
 regressions assert code-fence boundaries, escaped pipes, table cells, inline

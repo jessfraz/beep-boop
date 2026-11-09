@@ -21,6 +21,7 @@ final class HistoryInteractionTests: XCTestCase {
     await peer.commands(commands)
     let app = XCUIApplication()
     app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchEnvironment["AGENT_INTERACTION_ID"] = UUID().uuidString
     app.launchArguments += ["-notificationsEnabled", "NO"]
     if let appearance { app.launchArguments += ["-appearance", appearance] }
     app.launch()
@@ -313,6 +314,95 @@ final class HistoryInteractionTests: XCTestCase {
       XCTAssertTrue(app.staticTexts[text].waitForExistence(timeout: 3), app.debugDescription)
       XCTAssertTrue(app.keyboards.firstMatch.exists)
     }
+  }
+
+  func testRotationKeepsTheLiveTailAndOlderReadingPosition() async throws {
+    let paragraph =
+      "The orchard inventory is ready for review. Each crate has a recorded destination and the next delivery can proceed once the remaining labels are checked."
+    let messages = (0..<60).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "rotation-\(index)", finalChunk: true, role: .final,
+        text: "Orchard section \(index). \(paragraph)")
+    }
+    let app = try await launchMessages(messages)
+    continueAfterFailure = true
+    defer { XCUIDevice.shared.orientation = .portrait }
+    let transcript = app.scrollViews["transcript"]
+    let latest = app.staticTexts.matching(
+      NSPredicate(format: "label == %@", messages.last!.text)
+    ).firstMatch
+    try await eventually(description: "initial live tail") { latest.isHittable }
+    XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 3))
+    for orientation in [UIDeviceOrientation.landscapeLeft, .portrait] {
+      XCUIDevice.shared.orientation = orientation
+      try await eventually(description: "live tail after rotation") {
+        latest.isHittable && !app.buttons["latest-messages"].exists
+      }
+    }
+    transcript.swipeDown()
+    XCTAssertTrue(app.buttons["latest-messages"].waitForExistence(timeout: 3))
+    // A shorter landscape viewport cannot retain every portrait row. Preserve
+    // the leading readable message rather than an arbitrary row near the bottom.
+    let top = app.navigationBars.firstMatch.frame.maxY
+    let bottom = app.descendants(matching: .any).matching(identifier: "messageComposer")
+      .firstMatch.frame.minY
+    let leading = try XCTUnwrap(
+      app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Orchard section "))
+        .allElementsBoundByIndex.first {
+          $0.isHittable && $0.frame.minY >= top && $0.frame.maxY <= bottom
+        }, app.debugDescription)
+    let earlier = app.staticTexts.matching(NSPredicate(format: "label == %@", leading.label))
+      .firstMatch
+    XCUIDevice.shared.orientation = .landscapeLeft
+    try await eventually(description: "older reading position after rotation") {
+      earlier.isHittable && app.buttons["latest-messages"].exists
+    }
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "rotation-preserves-older-reading-position"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+  }
+
+  func testForegroundAndRelaunchKeepNewTypingWithoutRestoringSentText() async throws {
+    let peer = InteractionPeer()
+    await peer.streamRepliesOnSubmit()
+    let app = try await launchMessages([], peer: peer)
+    let first = "Orchid beacon: the first admitted note."
+    continueAfterFailure = true
+    let second = "Maple lantern: keep the next unsent note across relaunch."
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    composer.typeText(first)
+    app.buttons["Send message"].tap()
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Orchid beacon", in: app)
+    composer.typeText(second)
+    try await returnToForeground(app, peer: peer)
+    try await assertVisibleEditorText("Maple lantern", excluding: "Orchid beacon", in: app)
+    app.terminate()
+    app.launch()
+    let restored = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", second), object: editor(app))
+    let result = await XCTWaiter.fulfillment(of: [restored], timeout: 5)
+    XCTAssertEqual(result, .completed, app.debugDescription)
+    guard result == .completed else { return }
+    try await assertVisibleEditorText("Maple lantern", excluding: "Orchid beacon", in: app)
+    try await eventually(description: "reopened production connection") {
+      app.buttons["Send message"].isEnabled
+    }
+    editor(app).tap()
+    app.buttons["Send message"].tap()
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Maple lantern", in: app)
+    try await eventually(description: "both inputs admitted once") {
+      await peer.inputs().count == 2
+    }
+    let inputs = await peer.inputs()
+    XCTAssertEqual(inputs.map(\.text), [first, second])
+    try await assertVisibleEditorText("Message Beep Boop", excluding: "Maple lantern", in: app)
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "production-startup-retained-composer-after-send"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
   }
 
   func testSendClearsVisibleTextAfterReturningToTheForeground() async throws {
@@ -701,6 +791,52 @@ final class HistoryInteractionTests: XCTestCase {
         predicate: NSPredicate(format: "value == %@", output.stdout), object: composer)
       XCTAssertEqual(XCTWaiter.wait(for: [pasted], timeout: 3), .completed, app.debugDescription)
       app.terminate()
+    }
+  }
+
+  func testExpandedGenericToolShowsRetainedOutputOnceAndKeepsTruncationNotice() async throws {
+    let output = "The orchard parcel labels are ready."
+    let additional = output + "\nA second retained label was verified."
+    let cases: [(content: ToolDetailContent, expected: String, truncated: Bool)] = [
+      (.text(.init(text: output, truncated: false)), output, false),
+      (.text(.init(text: additional, truncated: false)), additional, false),
+      (.text(.init(text: output, truncated: true)), output, true),
+      (.text(.init(text: "The orchard", truncated: true)), output, true),
+      (.text(.init(text: "", truncated: false)), output, false),
+      (.unavailable(.init(reason: .notRecorded)), output, false),
+    ]
+    for (index, value) in cases.enumerated() {
+      let details = ToolDetails.available(
+        .init(
+          callId: "single-output", input: .unavailable(.init(reason: .notRecorded)),
+          name: "lookup_labels", output: value.content,
+          status: .finished))
+      let app = try await launchMessages(
+        [
+          .init(
+            continuation: false, entryId: "single-output-entry", finalChunk: true, role: .tool,
+            text: output,
+            tool: .init(callId: "single-output", name: "lookup_labels", status: .finished))
+        ], toolDetails: ["single-output": details])
+      continueAfterFailure = true
+      let group = app.buttons["activity:tool:single-output"]
+      XCTAssertTrue(group.waitForExistence(timeout: 5))
+      group.tap()
+      app.buttons["activity-item:tool:single-output"].tap()
+      XCTAssertTrue(app.staticTexts["Finished"].waitForExistence(timeout: 5))
+      XCTAssertEqual(
+        app.staticTexts.matching(NSPredicate(format: "label == %@", value.expected)).count, 1)
+      if value.expected != output {
+        XCTAssertFalse(
+          app.staticTexts.matching(NSPredicate(format: "label == %@", output)).firstMatch.exists)
+      }
+      XCTAssertEqual(
+        app.staticTexts.matching(NSPredicate(format: "label == %@", "Output")).count, 1)
+      XCTAssertEqual(app.staticTexts["Output truncated."].exists, value.truncated)
+      let screenshot = XCTAttachment(screenshot: app.screenshot())
+      screenshot.name = "native-generic-output-once-\(index)"
+      screenshot.lifetime = .keepAlways
+      add(screenshot)
     }
   }
 
