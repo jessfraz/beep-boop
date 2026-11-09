@@ -549,6 +549,7 @@ final class HistoryInteractionTests: XCTestCase {
   }
 
   func testSendClearsTheFocusedDraftImmediatelyAfterAnAppSwitch() async throws {
+    try enableSimulatorAutocorrection()
     let peer = InteractionPeer()
     await peer.streamRepliesOnSubmit()
     let output = String(

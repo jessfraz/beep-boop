@@ -293,10 +293,13 @@ private func inspectionJob(
                 fast: false, modelId: "example-model", provider: .openai, reasoning: .high))))
         let model = await MainActor.run { ChatModel() }
         await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
-        let deadline = ContinuousClock.now + .seconds(3)
+        // Readiness uses the session's handshake budget, not a rendering deadline.
+        let deadline = ContinuousClock.now + .seconds(30)
         while await model.connection != .connected, ContinuousClock.now < deadline {
           try await Task.sleep(for: .milliseconds(20))
         }
+        try #require(await model.connection == .connected)
+        try #require(await model.settingsSupported)
         await model.refreshSettings()
         #expect(await model.conversationSettings != nil)
         try await Self.captureWork(
