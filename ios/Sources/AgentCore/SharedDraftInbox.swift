@@ -45,7 +45,7 @@ public struct SharedDraftInbox: Sendable {
     // it. A receipt left by a crashed consumer is made durable before the host
     // may retire its own UUID ledger entry.
     guard let lock = try? acquire() else { return false }
-    defer { try? lock.close() }
+    defer { release(lock) }
     guard exists(receipt(id)) else { return false }
     do {
       try synchronize(directory.appending(path: "Receipts"))
@@ -80,7 +80,7 @@ public struct SharedDraftInbox: Sendable {
     guard note.utf8.count <= 64 * 1024 else { throw SharedDraftError.invalidBatch }
     try Task.checkCancellation()
     let lock = try acquire()
-    defer { try? lock.close() }
+    defer { release(lock) }
     try recover()
     if exists(receipt(id)) { return id }
     let target = batchURL(id)
@@ -134,7 +134,7 @@ public struct SharedDraftInbox: Sendable {
   ) async throws -> Bool {
     try Task.checkCancellation()
     let lock = try acquire()
-    defer { try? lock.close() }
+    defer { release(lock) }
     try recover()
     let manifests = try FileManager.default.contentsOfDirectory(
       at: directory, includingPropertiesForKeys: nil
@@ -212,6 +212,12 @@ public struct SharedDraftInbox: Sendable {
       throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
     }
     return handle
+  }
+
+  private func release(_ lock: FileHandle) {
+    // Closing alone can leave a lock held by a child's pre-exec descriptor.
+    _ = flock(lock.fileDescriptor, LOCK_UN)
+    try? lock.close()
   }
 
   private func recover() throws {

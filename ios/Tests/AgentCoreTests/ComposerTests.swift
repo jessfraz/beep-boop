@@ -56,7 +56,8 @@ func commandInsertionPreservesTheDurableNoteAndReplacesOnlyKnownCommands(
   model.draft = draft
   model.insertCommand(feedback)
   #expect(model.draft == expected)
-  #expect(await model.saveDraft())
+  let saved = await model.saveDraft()
+  try #require(saved, "Draft save failed: \(model.draftError ?? "unknown error")")
   let restored = try await ComposerDraftStore(url: url).load(from: files)
   #expect(restored.draft.text == expected)
   #expect(restored.draft.mode == .followUp)

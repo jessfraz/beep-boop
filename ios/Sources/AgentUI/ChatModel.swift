@@ -149,7 +149,10 @@ final class ChatModel {
     let value = currentDraft
     Task { [weak self] in
       do { try await persistence.save(value, revision: revision) } catch {
-        if self?.persistentRevision == revision { self?.draftError = error.localizedDescription }
+        if let self, self.persistentRevision == revision {
+          self.draftError = error.localizedDescription
+          self.logComposer(.saveFailed, error: error)
+        }
       }
     }
   }
@@ -166,7 +169,7 @@ final class ChatModel {
       return true
     } catch {
       draftError = error.localizedDescription
-      logComposer(.saveFailed)
+      logComposer(.saveFailed, error: error)
       return false
     }
   }
@@ -421,11 +424,14 @@ final class ChatModel {
       }
     }
   }
-  private func logComposer(_ event: ComposerEvent) {
+  private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {
     let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-    // Only state and counts enter system logs; never draft text, files or addresses.
+    let failure = error.map { $0 as NSError }
+    let domain = failure?.domain ?? "none"
+    let code = failure?.code ?? 0
+    // Only state, counts and error metadata enter logs; never text, paths or addresses.
     composerLogger.notice(
-      "event=\(event.rawValue, privacy: .public) build=\(build, privacy: .public) generation=\(self.generation.uuidString, privacy: .public) revision=\(self.draftRevision) characters=\(self.draft.count) attachments=\(self.attachments.count) active=\(self.active) ready=\(self.draftReady) connected=\(self.connection == .connected) busy=\(self.busy) admitting=\(self.admitting) preparing=\(self.preparingAttachments) shared=\(self.pendingSharedImport)"
+      "event=\(event.rawValue, privacy: .public) build=\(build, privacy: .public) generation=\(self.generation.uuidString, privacy: .public) revision=\(self.draftRevision) characters=\(self.draft.count) attachments=\(self.attachments.count) active=\(self.active) ready=\(self.draftReady) connected=\(self.connection == .connected) busy=\(self.busy) admitting=\(self.admitting) preparing=\(self.preparingAttachments) shared=\(self.pendingSharedImport) errorDomain=\(domain, privacy: .public) errorCode=\(code)"
     )
   }
   func restore(_ id: String) async {

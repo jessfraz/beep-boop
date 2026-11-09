@@ -100,7 +100,14 @@ public actor ComposerDraftStore {
     let lockFD = open(url.appendingPathExtension("lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
     guard lockFD >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     defer { close(lockFD) }
-    guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else { throw SharedDraftError.busy }
+    guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+      let code = errno
+      if code == EWOULDBLOCK { throw SharedDraftError.busy }
+      throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+    }
+    // A spawned child may retain the descriptor until exec. End ownership at
+    // this transaction's boundary, rather than waiting for every copy to close.
+    defer { _ = flock(lockFD, LOCK_UN) }
     guard try contents() == savedData else {
       throw ComposerDraftError.staleOwner
     }

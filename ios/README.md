@@ -110,7 +110,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   Successful restoration removes the local recovery row and keeps server history.
 - Composer diagnostics use Apple's unified log subsystem `dev.jessfraz.Agent`,
   category `Composer`. They record the build, lifecycle, send/clear/admission
-  state and character/attachment counts, without message text or file paths.
+  state, character/attachment counts and failure domains/codes, without message
+  text or file paths.
   `/feedback` includes up to 15 minutes of current-process metadata in a
   private `Composer.log` attachment when a file slot is available. Collection
   includes the OS version, stops waiting after two seconds and reports empty
@@ -193,6 +194,9 @@ production coordinator and Pi database. On macOS the same Swift client stays
 alive across server restarts, preserving its draft and reconciling its outbox
 without duplicate input. Scripted peers remain in separate fault-injection
 tests.
+On macOS, a process-overlap regression exercises real draft saves and cold
+readback while native processes launch. File locks end with their transaction,
+including when a child temporarily inherits a descriptor before exec.
 
 Rendering tests capture the production message rows
 in light, dark and large-text appearance using invented content. Markdown
