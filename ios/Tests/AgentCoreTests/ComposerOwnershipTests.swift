@@ -218,7 +218,12 @@ func failedInitialComposerOrOutboxPersistenceDoesNotClaimTheDraft(
     await model.send()
     #expect(await model.draft == text)
     #expect(await fixture.count() == 0)
-    if outboxFailure { try FileManager.default.removeItem(at: outbox) }
+    if outboxFailure {
+      try FileManager.default.removeItem(at: outbox)
+      // Rejection restores the live draft in defer and schedules its autosave.
+      // Finish that owner before simulating a cold process with another store.
+      try #require(await model.saveDraft())
+    }
     let cold = await MainActor.run {
       ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
     }
