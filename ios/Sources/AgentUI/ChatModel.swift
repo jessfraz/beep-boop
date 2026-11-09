@@ -30,7 +30,7 @@ final class ChatModel {
   @ObservationIgnored private let composerLogger = Logger(
     subsystem: "dev.jessfraz.Agent", category: "Composer")
   private enum Admission {
-    case pending(text: String)
+    case pending(text: String, submission: ComposerSubmission?)
     case saved
   }
 
@@ -74,6 +74,8 @@ final class ChatModel {
   @ObservationIgnored private let persistence: ComposerDraftStore?
   @ObservationIgnored private let sharedInbox: SharedDraftInbox?
   @ObservationIgnored private var persistentRevision: UInt64 = 0
+  @ObservationIgnored private var composerID = UUID()
+  @ObservationIgnored private var outboxURL: URL?
   @ObservationIgnored private var consumedTransfers: Set<UUID> = []
   @ObservationIgnored private var changingDraft = false
   @ObservationIgnored private var restoringDraft = false
@@ -81,22 +83,26 @@ final class ChatModel {
   var admitting: Bool { admission != nil }
   @ObservationIgnored private var generation = UUID()
   @ObservationIgnored private var admit:
-    @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
+    @Sendable (String, InputMode, [LocalAttachment], ComposerInputIdentity?) async -> Bool
   @ObservationIgnored private var draftStore: AttachmentStore?
+  @ObservationIgnored private var retiredDraftFiles: [LocalAttachment] = []
   @ObservationIgnored private var feedbackScreenshotID: String? { didSet { scheduleDraftSave() } }
 
   init(
     inspecting conversation: SavedConversation? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
-    sharedInbox: SharedDraftInbox? = nil,
-    admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
-      false
-    }
+    sharedInbox: SharedDraftInbox? = nil, outboxURL: URL? = nil,
+    admit:
+      @escaping @Sendable (String, InputMode, [LocalAttachment], ComposerInputIdentity?) async ->
+      Bool = { _, _, _, _ in
+        false
+      }
   ) {
     inspectedConversation = conversation
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
+    self.outboxURL = outboxURL
     draftReady = persistence == nil
     self.admit = admit
   }
@@ -133,14 +139,22 @@ final class ChatModel {
   }
 
   private var currentDraft: ComposerDraft {
-    var text = draft
-    if case .pending(let submitted) = admission, !submitted.isEmpty {
-      // A crash before outbox admission must recover both unsent notes.
-      text = submitted + (text.isEmpty ? "" : "\n\n" + text)
+    var value = ComposerDraft(
+      text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
+      feedbackScreenshotID: feedbackScreenshotID, composerID: composerID)
+    if case .pending(let text, let submission) = admission {
+      if let submission {
+        let submittedIDs = Set(submission.attachments.map(\.id))
+        value.submission = submission
+        value.attachments.removeAll { submittedIDs.contains($0.id) }
+        if let id = value.feedbackScreenshotID, submittedIDs.contains(id) {
+          value.feedbackScreenshotID = nil
+        }
+      } else if !text.isEmpty {
+        value.text = text + (value.text.isEmpty ? "" : "\n\n" + value.text)
+      }
     }
-    return ComposerDraft(
-      text: text, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
-      feedbackScreenshotID: feedbackScreenshotID)
+    return value
   }
   private func scheduleDraftSave() {
     guard draftReady, !changingDraft, let persistence else { return }
@@ -165,6 +179,15 @@ final class ChatModel {
   @discardableResult func saveDraft() async -> Bool {
     do {
       try await persistDraft()
+      // The saved record no longer references these admitted copies. A failed
+      // checkpoint must keep them available for another restoration attempt.
+      if let store = draftStore {
+        let retired = retiredDraftFiles
+        retiredDraftFiles = []
+        for file in retired {
+          do { try await store.remove(file) } catch { retiredDraftFiles.append(file) }
+        }
+      }
       draftError = nil
       return true
     } catch {
@@ -190,6 +213,8 @@ final class ChatModel {
       attachments = restored.draft.attachments
       consumedTransfers = restored.draft.consumedTransfers
       feedbackScreenshotID = restored.draft.feedbackScreenshotID
+      composerID = restored.draft.composerID ?? composerID
+      retiredDraftFiles = restored.retiredAttachments
       persistentRevision = restored.revision
       changingDraft = false
       draftReady = true
@@ -272,7 +297,10 @@ final class ChatModel {
   func connect(session: CoordinatorSession, address: CoordinatorAddress) async {
     self.address = address
     self.session = session
-    admit = { text, mode, files in await session.submit(text, mode: mode, files: files) }
+    outboxURL = session.outboxURL
+    admit = { text, mode, files, composer in
+      await session.submit(text, mode: mode, files: files, composer: composer)
+    }
     rows = []
     error = nil
     observation = Task { [weak self] in
@@ -323,7 +351,8 @@ final class ChatModel {
     settingsRequest = nil
     settingsBusy = false
     settingsError = nil
-    admit = { _, _, _ in false }
+    admit = { _, _, _, _ in false }
+    outboxURL = nil
     await ownedSession?.disconnect()
   }
   func setActive(_ active: Bool) async {
@@ -353,7 +382,12 @@ final class ChatModel {
     var admitted = false
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outbox takes ownership.
-    admission = .pending(text: text)
+    var submission = outboxURL.map {
+      ComposerSubmission(
+        identity: .init(composerID: composerID), outboxURL: $0, text: text,
+        attachments: attachments, feedbackScreenshotID: feedbackScreenshotID)
+    }
+    admission = .pending(text: text, submission: submission)
     changingDraft = true
     draft = ""
     changingDraft = false
@@ -411,7 +445,13 @@ final class ChatModel {
       return
     }
     guard self.generation == generation else { return }
-    admitted = await admit(text, mode, files)
+    submission?.attachments = files
+    submission?.feedbackScreenshotID = feedbackScreenshotID
+    admission = .pending(text: text, submission: submission)
+    // The pending identity must be durable before the independent outbox can
+    // claim it. New typing and files remain separate from this submitted note.
+    guard await saveDraft(), self.generation == generation else { return }
+    admitted = await admit(text, mode, files, submission?.identity)
     if admitted {
       // The outbox owns this draft even if its connection has since stopped.
       admission = .saved
@@ -419,9 +459,8 @@ final class ChatModel {
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
-      if await saveDraft(), let store = draftStore {
-        for file in files { try? await store.remove(file) }
-      }
+      retiredDraftFiles.append(contentsOf: files)
+      _ = await saveDraft()
     }
   }
   private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {

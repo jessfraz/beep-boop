@@ -398,7 +398,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     let inputID = try #require(acknowledged.rows.last?.inputID)
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try savedInputs(at: outbox)
     #expect(saved.first?.attachments == [file.reference])
     // The pending copy has its own lifetime, independent of the picker/draft copy.
     try await store.remove(file)
@@ -421,7 +421,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(await fixture.count() == 1)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
   }
 }
 
@@ -441,7 +441,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(result.rows.first(where: { $0.role == .user })?.delivery == .saved)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
   }
 }
 
@@ -492,7 +492,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     try await store.remove(restoredFile)
     #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
   }
 }
 
@@ -593,7 +593,7 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
     let retired = try await until(session) { _ in true }
     #expect(!retired.rows.contains { $0.inputID == inputID })
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
     #expect(try Data(contentsOf: ownedFile.url) == bytes)
     #expect(await fixture.count() == 0, "Retirement never submits the restored draft")
   }
@@ -623,7 +623,7 @@ func reconciledInputInvalidatesRestorationWithoutDeletingTheSavedReplacement() a
     #expect(await session.commitRestoration(prepared) == .invalidated)
     #expect(await session.restore(inputID, to: store) == nil)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
     let saved = try await ComposerDraftStore(url: draftURL).load(from: store)
     #expect(saved.draft.attachments == prepared.attachments)
     #expect(try Data(contentsOf: #require(prepared.attachments.first).url) == bytes)
@@ -649,7 +649,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
     #expect(await session.submit("Keep this original") == true)
     let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
     let id = try #require(uncertain.rows.first(where: { $0.delivery == .uncertain })?.inputID)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try savedInputs(at: outbox)
     #expect(saved.map(\.inputId) == [id])
     #expect(await fixture.count() == 1, "An uncertain write must not be replayed automatically")
   }

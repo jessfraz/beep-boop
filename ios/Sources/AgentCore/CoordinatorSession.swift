@@ -83,6 +83,12 @@ public actor CoordinatorSession {
       try fields.encode(state, forKey: .deliveryState)
     }
   }
+  private struct Outbox: Codable {
+    var pending: [PendingInput]
+    // One receipt per persistent composer. A newer submission can replace it
+    // only after that composer's pending record has itself reached disk.
+    var composerInputs: [String: String]
+  }
   public nonisolated let updates: AsyncStream<ChatSnapshot>
   private let continuation: AsyncStream<ChatSnapshot>.Continuation
   private var snapshot = ChatSnapshot()
@@ -108,10 +114,11 @@ public actor CoordinatorSession {
   private var pending: [PendingInput] = []
   private let restorationOwner = UUID()
   private var outboxLoaded = false
+  private var composerInputs: [String: String] = [:]
   private var attemptedInputs: Set<String> = []
   private var generation = UUID()
   private var flush: Task<Void, Never>?
-  private let outboxURL: URL
+  public nonisolated let outboxURL: URL
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
   private let inspectedConversation: SavedConversation?
@@ -151,8 +158,9 @@ public actor CoordinatorSession {
     self.address = address
     if inspectedConversation == nil, !outboxLoaded {
       do {
-        pending = try JSONDecoder().decode(
-          [PendingInput].self, from: Data(contentsOf: outboxURL))
+        let saved = try Self.readOutbox(outboxURL)
+        pending = saved.pending
+        composerInputs = saved.composerInputs
       } catch let error as CocoaError where error.code == .fileReadNoSuchFile { pending = [] } catch
       {
         snapshot.error =
@@ -193,7 +201,8 @@ public actor CoordinatorSession {
   }
 
   @discardableResult public func submit(
-    _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = []
+    _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = [],
+    composer: ComposerInputIdentity? = nil
   ) async -> Bool {
     guard inspectedConversation == nil, actions.count < 32, snapshot.connection == .connected,
       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
@@ -233,25 +242,33 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: UUID().uuidString, mode: mode, origin: inputOrigins ? .ios : nil, text: text)
-    let durable = !control || feedback
-    if durable {
+      inputId: composer?.inputID.uuidString ?? UUID().uuidString, mode: mode,
+      origin: inputOrigins ? .ios : nil, text: text)
+    let queuesInput = !control || feedback
+    let previousComposers = composerInputs
+    if queuesInput {
       guard pending.count < 32 else {
         snapshot.error = "Resolve pending messages before sending more."
         publish()
         return false
       }
       pending.append(PendingInput(request))
+    }
+    if let composer { composerInputs[composer.composerID.uuidString] = request.inputId }
+    // Controls have no replayable payload, but their admitted composer identity
+    // must survive a failed draft checkpoint just like a queued message's.
+    if queuesInput || composer != nil {
       do { try saveOutbox() } catch {
-        pending.removeLast()
+        if queuesInput { pending.removeLast() }
+        composerInputs = previousComposers
         snapshot.error = "The on-device outbox could not be saved. Nothing was sent."
         publish()
         return false
       }
-      transcript.pending(request, delivery: .sending)
     }
+    if queuesInput { transcript.pending(request, delivery: .sending) }
     snapshot.error = nil
-    perform(.submit(request), inputID: durable ? request.inputId : nil)
+    perform(.submit(request), inputID: queuesInput ? request.inputId : nil)
     publish()
     return true
   }
@@ -1177,7 +1194,10 @@ public actor CoordinatorSession {
     try FileManager.default.createDirectory(
       at: outboxURL.deletingLastPathComponent(), withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700])
-    let data = try JSONEncoder().encode(pending)
+    let data =
+      try composerInputs.isEmpty
+      ? JSONEncoder().encode(pending)
+      : JSONEncoder().encode(Outbox(pending: pending, composerInputs: composerInputs))
     #if os(iOS)
       try data.write(to: outboxURL, options: [.atomic, .completeFileProtection])
     #else
@@ -1189,5 +1209,26 @@ public actor CoordinatorSession {
     var values = URLResourceValues()
     values.isExcludedFromBackup = true
     try url.setResourceValues(values)
+  }
+
+  private nonisolated static func readOutbox(_ url: URL) throws -> Outbox {
+    let data = try Data(contentsOf: url)
+    if let pending = try? JSONDecoder().decode([PendingInput].self, from: data) {
+      return Outbox(pending: pending, composerInputs: [:])
+    }
+    return try JSONDecoder().decode(Outbox.self, from: data)
+  }
+
+  /// Admission receipts survive placement and outbox retirement. The composer
+  /// checks its original endpoint's owner, even if settings now name another one.
+  public nonisolated static func ownsComposerInput(
+    _ identity: ComposerInputIdentity, outboxURL: URL
+  ) throws -> Bool {
+    do {
+      return try readOutbox(outboxURL).composerInputs[identity.composerID.uuidString]
+        == identity.inputID.uuidString
+    } catch let error as CocoaError
+      where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile
+    { return false }
   }
 }

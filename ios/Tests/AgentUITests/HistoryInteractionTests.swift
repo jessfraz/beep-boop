@@ -157,6 +157,141 @@ final class HistoryInteractionTests: XCTestCase {
       file: file, line: line)
   }
 
+  func testPagedHistoryKeepsFollowingTheLiveTailWhileTypingAndSending() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 180
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    await peer.streamRepliesOnSubmit()
+    let paragraph =
+      "An invented tool result records the parcel inventory and explains the next verification step. "
+    let toolText = String(String(repeating: paragraph, count: 100).prefix(8192))
+    let dialogue: (Int, Int) -> String = { page, part in
+      "Saffron history section \(page) part \(part). This invented conversation keeps the previous questions and answers available while new work arrives. The parcel inventory is consistent and the next task can proceed."
+    }
+    func page(_ index: Int) -> NativeEventHistory {
+      var messages: [HistoryMessage] = []
+      for row in 0..<20 {
+        let entry = String(1000 + index * 20 + row)
+        if row < 18 {
+          messages.append(
+            .init(
+              continuation: false, entryId: entry, finalChunk: true, role: .tool, text: toolText,
+              tool: .init(callId: "retained-call-\(entry)", name: "exec", status: .finished)))
+        } else {
+          messages.append(
+            .init(
+              continuation: false, entryId: entry, finalChunk: true,
+              role: row == 18 ? .user : .final, text: dialogue(index, row)))
+        }
+      }
+      return .init(
+        messages: messages, nextCursor: index > 0 ? "page-\(index - 1)" : nil, pageComplete: true)
+    }
+    let allPages = (0..<25).map(page)
+    let historyBytes = allPages.flatMap(\.messages).reduce(0) { $0 + $1.text.utf8.count }
+    XCTAssertEqual(allPages.flatMap(\.messages).count, 500)
+    XCTAssertLessThan(historyBytes, 4 * 1024 * 1024)
+    XCTAssertTrue(allPages.allSatisfy { $0.messages.count == 20 })
+    await peer.history(
+      initial: allPages[24],
+      pages: Dictionary(uniqueKeysWithValues: (0..<24).map { ("page-\($0)", allPages[$0]) }),
+      latest: allPages[24])
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    addTeardownBlock { @MainActor in app.terminate() }
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+    let recent = app.staticTexts.matching(NSPredicate(format: "label == %@", dialogue(24, 19)))
+      .firstMatch
+    XCTAssertTrue(recent.waitForExistence(timeout: 5))
+    for _ in 0..<100 {
+      if await peer.cursors().count == 24 { break }
+      let load = app.buttons["Load earlier messages"]
+      if load.exists && load.isHittable && load.isEnabled {
+        load.tap()
+      } else {
+        transcript.swipeDown(velocity: .fast)
+      }
+    }
+    try await eventually(description: "all 24 real earlier-page requests") {
+      await peer.cursors().count == 24
+    }
+    let loadedCursors = await peer.cursors()
+    XCTAssertEqual(loadedCursors, (0..<24).reversed().map { "page-\($0)" })
+    XCTAssertTrue(app.buttons["Load earlier messages"].waitForNonExistence(timeout: 5))
+    let earlier = app.staticTexts.matching(NSPredicate(format: "label == %@", dialogue(0, 18)))
+      .firstMatch
+    for _ in 0..<5 {
+      if earlier.exists && earlier.isHittable { break }
+      transcript.swipeDown()
+    }
+    XCTAssertTrue(earlier.isHittable, app.debugDescription)
+    for _ in 0..<40 {
+      if recent.exists && recent.isHittable && !app.buttons["latest-messages"].exists { break }
+      transcript.swipeUp(velocity: .fast)
+    }
+    XCTAssertTrue(
+      recent.isHittable, "Return to the retained live tail without replacing it through Latest")
+    XCTAssertFalse(app.buttons["latest-messages"].exists)
+    let composer = editor(app)
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    try await returnToForeground(app, peer: peer)
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    XCTAssertTrue(
+      recent.isHittable,
+      "The retained conversation must survive foreground reconciliation")
+    try await peer.beginReply(
+      "An invented reply starts while the large retained conversation is open. ")
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    let stream = Task.detached {
+      for index in 0..<160 {
+        try Task.checkCancellation()
+        try await peer.beginReply("Progress \(index): the parcel inventory remains consistent. ")
+        try await Task.sleep(for: .milliseconds(30))
+      }
+    }
+    defer { stream.cancel() }
+    let note = "Juniper parcel: send after foreground with a busy retained conversation."
+    for sendIndex in 0..<2 {
+      composer.typeText(note)
+      try await assertVisibleEditorText("Juniper parcel", in: app)
+      if sendIndex == 1 {
+        try await returnToForeground(app, peer: peer)
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        try await assertVisibleEditorText("Juniper parcel", in: app)
+      }
+      let send = app.buttons["Send message"]
+      XCTAssertTrue(send.waitForExistence(timeout: 3))
+      XCTAssertTrue(send.isEnabled)
+      send.tap()
+      try await assertVisibleEditorText("Message Beep Boop", excluding: "Juniper parcel", in: app)
+      XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+      XCTAssertTrue(app.keyboards.firstMatch.exists)
+      try await peer.beginReply(
+        "Another native stream update follows retained-history Send \(sendIndex). ")
+      try await assertVisibleEditorText("Message Beep Boop", excluding: "Juniper parcel", in: app)
+      let followsTail = app.buttons["latest-messages"].waitForNonExistence(timeout: 5)
+      if !followsTail {
+        let failure = XCTAttachment(screenshot: app.screenshot())
+        failure.name = "native-composer-window"
+        failure.lifetime = .keepAlways
+        add(failure)
+      }
+      XCTAssertTrue(followsTail, "Streaming must continue following the real live tail")
+    }
+    try await stream.value
+    let inputs = await peer.inputs()
+    XCTAssertEqual(inputs.map(\.text), [note, note])
+    let final = XCTAttachment(screenshot: app.screenshot())
+    final.name = "paged-retained-history-focused-composer-after-send"
+    final.lifetime = .keepAlways
+    add(final)
+  }
+
   func testSendClearsTheNativeComposerAndKeepsTheKeyboardForTheNextMessage() async throws {
     let app = try await launchMessages([])
     let composer = editor(app)
@@ -1033,7 +1168,7 @@ private actor InteractionPeer {
               conversationSettings: settingsValue == nil ? nil : true,
               inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model",
               working: working)), to: socket)
-        try await emit(.history(try XCTUnwrap(initial)), to: socket)
+        try await emitHistory(try XCTUnwrap(initial), to: socket)
         if !commandValues.isEmpty {
           try await emit(.commands(.init(commands: commandValues)), to: socket)
         }
@@ -1067,8 +1202,8 @@ private actor InteractionPeer {
         let cursor = request.cursor ?? "<latest>"
         requests.append(cursor)
         if held.contains(cursor) { await withCheckedContinuation { releases[cursor] = $0 } }
-        try await emit(
-          .history(try XCTUnwrap(request.cursor == nil ? latest : pages[cursor])), to: socket)
+        try await emitHistory(
+          try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
         try await emit(.done, to: socket)
       default: try await emit(.done, to: socket)
       }
@@ -1090,6 +1225,23 @@ private actor InteractionPeer {
       }
     }
   }
+  private func emitHistory(_ page: NativeEventHistory, to socket: NWConnection) async throws {
+    var batch: [HistoryMessage] = []
+    var characters = 0
+    for message in page.messages {
+      if characters + message.text.utf16.count > 65536 {
+        try await emit(
+          .history(.init(messages: batch, nextCursor: nil, pageComplete: false)), to: socket)
+        batch = []
+        characters = 0
+      }
+      batch.append(message)
+      characters += message.text.utf16.count
+    }
+    try await emit(
+      .history(.init(messages: batch, nextCursor: page.nextCursor, pageComplete: true)), to: socket)
+  }
+
   private func emit(_ event: NativeEvent, to socket: NWConnection) async throws {
     var data = try JSONEncoder().encode(event)
     data.append(10)

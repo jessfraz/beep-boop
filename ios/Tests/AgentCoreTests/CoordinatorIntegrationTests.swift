@@ -56,7 +56,7 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     #expect(user.delivery?.rawValue == "Sent")
     #expect(rows.filter { $0.role != .user }.allSatisfy { $0.delivery == nil })
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+      try savedInputs(at: outbox)
         .isEmpty)
   }
   func waitFor(

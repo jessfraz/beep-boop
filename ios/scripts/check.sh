@@ -142,7 +142,11 @@ import subprocess
 import sys
 
 bundle, summary, output = sys.argv[1:]
-failures = json.loads(Path(summary).read_text()).get("testFailures", [])
+summary_data = Path(summary).read_bytes()
+output = Path(output)
+output.mkdir(parents=True, exist_ok=True)
+(output / "summary.json").write_bytes(summary_data)
+failures = json.loads(summary_data).get("testFailures", [])
 test_ids = sorted({failure["testIdentifierString"] for failure in failures})
 status = 0
 for index, test_id in enumerate(test_ids):
@@ -152,7 +156,7 @@ for index, test_id in enumerate(test_ids):
         result = subprocess.run([
             "xcrun", "xcresulttool", "export", "attachments", "--path", bundle,
             "--test-id", test_id, "--filter", f"*.{extension}",
-            "--output-path", str(Path(output) / str(index) / extension),
+            "--output-path", str(output / str(index) / extension),
         ])
         status = status or result.returncode
 sys.exit(status)

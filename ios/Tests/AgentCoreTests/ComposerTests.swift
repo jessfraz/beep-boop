@@ -109,7 +109,7 @@ func failedDraftRestorationKeepsTheOriginalDurableOutbox() async throws {
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendClearsComposerBeforeAdmissionAndPreservesNewTyping() async {
   let gate = AdmissionGate()
-  let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
+  let model = ChatModel(admit: { text, _, _, _ in await gate.admit(text) })
   model.connection = .connected
   model.draft = "Original draft"
   let sending = Task { await model.send() }
@@ -129,7 +129,7 @@ func durableAdmissionDoesNotEraseANewerDraftWithIdenticalText(afterClearing: Boo
   try await withCoordinator { session, _, outbox in
     let gate = AdmissionGate()
     let model = await MainActor.run {
-      ChatModel(admit: { text, mode, files in
+      ChatModel(admit: { text, mode, files, _ in
         let admitted = await session.submit(text, mode: mode, files: files)
         #expect(admitted)
         return await gate.admit(text)
@@ -143,8 +143,7 @@ func durableAdmissionDoesNotEraseANewerDraftWithIdenticalText(afterClearing: Boo
     }
     let sending = Task { await model.send() }
     for await _ in gate.entered { break }
-    let pending = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let pending = try savedInputs(at: outbox)
     #expect(pending.count == 1)
     await MainActor.run {
       if afterClearing { model.draft = "" }
@@ -169,7 +168,7 @@ func savedAdmissionStaysRetiredWhenTheConnectionOwnerStops(newerDraft: Bool) asy
     let model = await MainActor.run {
       ChatModel(
         draftStore: files, persistence: ComposerDraftStore(url: draftURL),
-        admit: { text, mode, files in
+        admit: { text, mode, files, _ in
           let saved = await session.submit(text, mode: mode, files: files)
           #expect(saved)
           return await gate.admit(text)
@@ -185,8 +184,7 @@ func savedAdmissionStaysRetiredWhenTheConnectionOwnerStops(newerDraft: Bool) asy
     #expect(await model.saveDraft())
     let sending = Task { await model.send() }
     for await _ in gate.entered { break }
-    let saved = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try savedInputs(at: outbox)
     #expect(saved.count == 1)
     if newerDraft {
       await MainActor.run { model.draft = "The same text in a different draft" }
@@ -205,12 +203,12 @@ func savedAdmissionStaysRetiredWhenTheConnectionOwnerStops(newerDraft: Bool) asy
 
 @MainActor @Test(.timeLimit(.minutes(1)))
 func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async {
-  let model = ChatModel(admit: { _, _, _ in false })
+  let model = ChatModel(admit: { _, _, _, _ in false })
   model.connection = .connected
   model.draft = "Not saved"
   await model.send()
   #expect(model.draft == "Not saved")
-  let admitted = ChatModel(admit: { _, _, _ in true })
+  let admitted = ChatModel(admit: { _, _, _, _ in true })
   admitted.connection = .connected
   admitted.draft = "Saved original"
   await admitted.send()
@@ -228,7 +226,7 @@ func sendingKeepsItsPersistedBackupUntilAdmissionFinishes(admitted: Bool, newTex
   let gate = AdmissionGate()
   let model = ChatModel(
     draftStore: files, persistence: ComposerDraftStore(url: url),
-    admit: { text, _, _ in await gate.admit(text) })
+    admit: { text, _, _, _ in await gate.admit(text) })
   await model.restoreDraft()
   model.connection = .connected
   model.draft = "Original draft"
@@ -255,7 +253,7 @@ func sendingKeepsItsPersistedBackupUntilAdmissionFinishes(admitted: Bool, newTex
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping(stopping: Bool) async {
   let gate = AdmissionGate()
-  let model = ChatModel(admit: { text, _, _ in await gate.admit(text) })
+  let model = ChatModel(admit: { text, _, _, _ in await gate.admit(text) })
   model.connection = .connected
   model.draft = "Original draft"
   let sending = Task { await model.send() }
@@ -272,7 +270,7 @@ func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactEvidence() async throws 
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let model = ChatModel(
-    draftStore: AttachmentStore(directory: root), admit: { _, _, _ in false })
+    draftStore: AttachmentStore(directory: root), admit: { _, _, _, _ in false })
   model.connection = .connected
   model.draft = "/feedback The text is clipped"
   var captures = 0
@@ -303,7 +301,7 @@ func feedbackPreservesUserFilesAndReservesTheLastSlotForItsScreenshot() async th
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let model = ChatModel(
-    draftStore: AttachmentStore(directory: root), admit: { _, _, _ in false })
+    draftStore: AttachmentStore(directory: root), admit: { _, _, _, _ in false })
   model.connection = .connected
   for index in 0..<(AttachmentLimits.maximumCount - 1) {
     await model.attach(data: Data([1]), name: "Note-\(index).txt", mediaType: "text/plain")
@@ -326,7 +324,7 @@ func attachmentOnlyAdmissionPreservesFilesAndNewTyping(admitted: Bool) async thr
   let gate = AdmissionGate()
   let model = ChatModel(
     draftStore: AttachmentStore(directory: root),
-    admit: { text, _, files in
+    admit: { text, _, files, _ in
       #expect(text.isEmpty)
       #expect(files.count == 1)
       return await gate.admit(text)

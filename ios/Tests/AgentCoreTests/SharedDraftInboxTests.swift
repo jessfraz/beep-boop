@@ -655,7 +655,7 @@ import UniformTypeIdentifiers
     let url = root.appending(path: "Composer/draft.json")
     let model = ChatModel(
       draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _ in
+      admit: { _, _, _, _ in
         Issue.record("Import must never send")
         return false
       })
@@ -721,7 +721,7 @@ import UniformTypeIdentifiers
     #expect(!inbox.acknowledged(id))
     let model = ChatModel(
       draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _ in
+      admit: { _, _, _, _ in
         Issue.record("Recovery must never autosend")
         return false
       })
@@ -779,7 +779,7 @@ import UniformTypeIdentifiers
     let url = root.appending(path: "Composer/draft.json")
     let model = ChatModel(
       draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _ in
+      admit: { _, _, _, _ in
         Issue.record("Recovery must never autosend")
         return false
       })

@@ -5,6 +5,15 @@ import Testing
 
 @testable import AgentCore
 
+func savedInputs(at outbox: URL) throws -> [NativeRequestSubmit] {
+  struct Record: Decodable { let pending: [NativeRequestSubmit] }
+  let data = try Data(contentsOf: outbox)
+  if let requests = try? JSONDecoder().decode([NativeRequestSubmit].self, from: data) {
+    return requests
+  }
+  return try JSONDecoder().decode(Record.self, from: data).pending
+}
+
 func send(_ data: Data, on connection: NWConnection) async throws {
   try await withCheckedThrowingContinuation {
     (continuation: CheckedContinuation<Void, any Error>) in

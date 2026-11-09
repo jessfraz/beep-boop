@@ -20,7 +20,7 @@
         let entered = AsyncStream<Void>.makeStream()
         let admission = AsyncStream<Bool>.makeStream()
         defer { admission.continuation.finish() }
-        let model = ChatModel(admit: { _, _, _ in
+        let model = ChatModel(admit: { _, _, _, _ in
           entered.continuation.yield(())
           for await result in admission.stream { return result }
           return false

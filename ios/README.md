@@ -76,7 +76,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   4 MiB of display text remain in memory. The coordinator retains full history.
   **Latest** returns to a fresh recent page, retaining concurrent replies and
   pending messages. It stays available if paging evicted recent history;
-  otherwise it disappears at the bottom.
+  otherwise it disappears at the bottom. Live output stays at the bottom through
+  keyboard and composer size changes; scrolling up preserves the reading position.
 - Consecutive tool calls and summaries share a compact disclosure. Progress
   messages stay visible. Expand activity to read every supplied summary or
   inspect a command's arguments, output, errors and status.
@@ -101,10 +102,13 @@ required for sharing on a phone; an unsigned build does not establish that.
 - The unsent composer saves its note, delivery mode and attachment references
   together. Reopening restores that draft; importing or restoring never sends it.
   Choosing a command preserves the note and replaces only a known command prefix.
-  Send clears the stored value bound to the editor immediately. A separate
-  admission snapshot retains its saved backup until the outbox owns it.
-  Local rejection restores it, preserving newer typing.
-  A saved message stays retired if its connection closes during admission.
+  Send clears the stored value bound to the editor immediately. The submitted
+  copy and newer draft checkpoint separately under a stable input identity.
+  Recovery checks the original endpoint's retained receipt, so admitted text
+  stays retired after a failed save or connection change. Newer typing and files
+  survive. Controls retain receipts without becoming replayable inputs.
+  Ownership paths are relative to the composer record, allowing storage to move.
+  Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft before
   retiring the original. Failed preparation removes partial attachment copies.
   Successful restoration removes the local recovery row and keeps server history.
@@ -208,8 +212,9 @@ content, successful native rendering and Dynamic Type height growth. Full-chat
 captures cover grouped activity, opened reasoning and command details alongside
 the real header and composer. Screenshots are review artifacts, not golden-image
 comparisons.
-CI exports PNG and text attachments from each failing test into a separate
-artifact. Complete result bundles retain the recordings and remaining evidence.
+CI retains the native failure summary and each failing test's PNG and text
+attachments in a separate artifact. Complete bundles retain the recordings and
+remaining evidence.
 Nested block-container layout, remote image previews, math and diagrams remain
 outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.

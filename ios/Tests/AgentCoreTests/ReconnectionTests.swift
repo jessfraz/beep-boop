@@ -261,7 +261,7 @@ private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubm
     let input = try #require(await fixture.submitted().first)
     let originalID = try #require(model.rows.first?.id)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
+      try savedInputs(at: outbox) == [
         input
       ])
     switch reconnect {
@@ -285,7 +285,7 @@ private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubm
     #expect(model.draft.isEmpty, "A stale restore action cannot recreate an accepted input")
     #expect(model.attachments.isEmpty)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
+      try savedInputs(at: outbox) == [
         input
       ])
     await model.retry(input.inputId)
@@ -501,8 +501,7 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
       original.row.delivery == .saved, "A lost action socket cannot undo the accepted receipt")
     let originalID = original.id
     let submitted = try #require(await fixture.submitted().first)
-    let pending = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let pending = try savedInputs(at: outbox)
     #expect(pending == [submitted])
     try await waitForReconnectFixture { await fixture.observedIDs().count == 2 }
     #expect(await fixture.observedIDs().last == [submitted.inputId])
@@ -521,7 +520,7 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
     #expect(model.rows.map(\.row.text) == [submitted.text])
     #expect(await fixture.submitted().count == 1)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try savedInputs(at: outbox).isEmpty)
   }
 }
 

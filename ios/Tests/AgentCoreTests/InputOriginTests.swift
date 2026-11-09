@@ -12,8 +12,7 @@ func newNativeInputsAdvertiseIOSOnlyWhenTheCurrentConnectionSupportsOrigins(adve
     await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.submit("A deliberately unsent-until-admitted native message"))
-    let requests = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let requests = try savedInputs(at: outbox)
     #expect(requests.count == 1)
     #expect(requests.first?.origin == (advertised == true ? .ios : nil))
   }
@@ -33,8 +32,7 @@ func reconnectDoesNotReuseOriginCapabilityOrRewriteAnOlderPendingInput() async t
     await session.connect(address)
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.submit("New input on a legacy connection"))
-    let requests = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let requests = try savedInputs(at: outbox)
     #expect(requests.last?.origin == nil)
   }
 }

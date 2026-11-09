@@ -50,7 +50,7 @@ import UniformTypeIdentifiers
     defer { try? FileManager.default.removeItem(at: root) }
     let store = AttachmentStore(directory: root.appending(path: "Draft"))
     let calls = ImportSubmissions()
-    let model = ChatModel(draftStore: store) { _, _, _ in
+    let model = ChatModel(draftStore: store) { _, _, _, _ in
       await calls.submitted()
       return true
     }

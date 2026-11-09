@@ -305,9 +305,11 @@ public struct MainChatView: View {
       .scrollDismissesKeyboard(.interactively)
       .scrollBounceBehavior(.always, axes: .vertical)
       .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
+      // Keep the live bottom through keyboard and composer size changes.
+      .defaultScrollAnchor(followsLatest ? .bottom : nil, for: .sizeChanges)
       .scrollPosition(
         id: Binding(
-          get: { visibleItem },
+          get: { followsLatest ? nil : visibleItem },
           set: { item in
             // Structural controls have no transcript row ID. Keep the real
             // reading anchor when a paging control temporarily leads.

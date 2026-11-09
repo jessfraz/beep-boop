@@ -34,6 +34,8 @@ recovery; [history](history.md) describes import and retrieval.
   until outbox admission. Preserve newer typing and restore local rejections;
   connection changes cannot resurrect saved text. Native tests keep the
   keyboard active through consecutive sends and use production persistence.
+  Cold recovery uses admission identities to preserve newer notes and files
+  after failed saves, queue retirement and storage relocation.
   A physical-device recurrence after foregrounding remains unresolved; qualify
   the full visible composer during reconnect and active responses before closing.
 - [x] Use shared typed cells for live and imported messages, with Codex-style

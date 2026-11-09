@@ -13,21 +13,53 @@ private enum ComposerDraftError: Error, LocalizedError {
   }
 }
 
+public struct ComposerInputIdentity: Codable, Sendable, Equatable {
+  public let composerID: UUID
+  public let inputID: UUID
+  public init(composerID: UUID, inputID: UUID = UUID()) {
+    self.composerID = composerID
+    self.inputID = inputID
+  }
+}
+
+public struct ComposerSubmission: Sendable, Equatable {
+  public let identity: ComposerInputIdentity
+  public let outboxURL: URL
+  public var text: String
+  public var attachments: [LocalAttachment]
+  public var feedbackScreenshotID: String?
+  public init(
+    identity: ComposerInputIdentity, outboxURL: URL, text: String,
+    attachments: [LocalAttachment], feedbackScreenshotID: String? = nil
+  ) {
+    self.identity = identity
+    self.outboxURL = outboxURL
+    self.text = text
+    self.attachments = attachments
+    self.feedbackScreenshotID = feedbackScreenshotID
+  }
+}
+
 public struct ComposerDraft: Sendable, Equatable {
   public var text: String
   public var mode: InputMode
   public var attachments: [LocalAttachment]
   public var consumedTransfers: Set<UUID>
   public var feedbackScreenshotID: String?
+  public var composerID: UUID?
+  public var submission: ComposerSubmission?
   public init(
     text: String = "", mode: InputMode = .steer, attachments: [LocalAttachment] = [],
-    consumedTransfers: Set<UUID> = [], feedbackScreenshotID: String? = nil
+    consumedTransfers: Set<UUID> = [], feedbackScreenshotID: String? = nil,
+    composerID: UUID? = nil, submission: ComposerSubmission? = nil
   ) {
     self.text = text
     self.mode = mode
     self.attachments = attachments
     self.consumedTransfers = consumedTransfers
     self.feedbackScreenshotID = feedbackScreenshotID
+    self.composerID = composerID
+    self.submission = submission
   }
 }
 
@@ -35,6 +67,13 @@ public struct ComposerDraft: Sendable, Equatable {
 /// A queued save of an older editor revision may never overwrite a newer save.
 /// Each composer owner uses its own store instance.
 public actor ComposerDraftStore {
+  private struct Submission: Codable {
+    let identity: ComposerInputIdentity
+    let outboxPath: String
+    let text: String
+    let attachments: [AttachmentRef]
+    let feedbackScreenshotID: String?
+  }
   private struct Record: Codable {
     let revision: UInt64
     let text: String
@@ -42,6 +81,8 @@ public actor ComposerDraftStore {
     let attachments: [AttachmentRef]
     let consumedTransfers: Set<UUID>
     let feedbackScreenshotID: String?
+    let composerID: UUID?
+    let submission: Submission?
   }
   private static let maximumRecordBytes = 512 * 1024
   private let url: URL
@@ -51,44 +92,83 @@ public actor ComposerDraftStore {
   public init(url: URL) { self.url = url }
 
   public func load(from store: AttachmentStore) async throws -> (
-    draft: ComposerDraft, revision: UInt64
+    draft: ComposerDraft, revision: UInt64, retiredAttachments: [LocalAttachment]
   ) {
-    guard let data = try contents() else { return (ComposerDraft(), 0) }
+    guard let data = try contents() else { return (ComposerDraft(), 0, []) }
     let record = try JSONDecoder().decode(Record.self, from: data)
-    guard record.attachments.count <= AttachmentLimits.maximumCount,
-      Set(record.attachments.map(\.id)).count == record.attachments.count,
+    let submitted = record.submission
+    let references = (submitted?.attachments ?? []) + record.attachments
+    guard references.count <= AttachmentLimits.maximumCount,
+      Set(references.map(\.id)).count == references.count,
+      submitted.map({ !$0.outboxPath.isEmpty && !$0.outboxPath.hasPrefix("/") }) ?? true,
+      submitted.map({ $0.identity.composerID == record.composerID }) ?? true,
+      submitted.map({ value in
+        value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
+      }) ?? true,
       record.feedbackScreenshotID.map({ id in record.attachments.contains { $0.id == id } }) ?? true
     else { throw ComposerDraftError.invalidRecord }
+    let owned =
+      try submitted.map {
+        try CoordinatorSession.ownsComposerInput(
+          $0.identity,
+          outboxURL: url.deletingLastPathComponent().appending(path: $0.outboxPath)
+            .standardizedFileURL)
+      } ?? false
     var files: [LocalAttachment] = []
-    for reference in record.attachments {
+    for reference in (owned ? [] : submitted?.attachments ?? []) + record.attachments {
       guard let file = try await store.existing(reference) else { throw AttachmentError.changed }
       files.append(file)
+    }
+    var retired: [LocalAttachment] = []
+    if owned {
+      for reference in submitted?.attachments ?? [] {
+        if let file = try? await store.existing(reference) { retired.append(file) }
+      }
     }
     // Rehydration awaits another actor. Do not adopt an older record if a
     // different owner changed the metadata while its files were verified.
     guard try contents() == data else { throw ComposerDraftError.staleOwner }
     savedData = data
     savedRevision = max(savedRevision ?? record.revision, record.revision)
+    var text = record.text
+    if let submitted, !owned, !submitted.text.isEmpty {
+      text = submitted.text + (text.isEmpty ? "" : "\n\n" + text)
+    }
     return (
       ComposerDraft(
-        text: record.text, mode: record.mode, attachments: files,
+        text: text, mode: record.mode, attachments: files,
         consumedTransfers: record.consumedTransfers,
-        feedbackScreenshotID: record.feedbackScreenshotID), record.revision
+        feedbackScreenshotID: record.feedbackScreenshotID
+          ?? (owned ? nil : submitted?.feedbackScreenshotID),
+        composerID: record.composerID), record.revision, retired
     )
   }
 
   /// Returns false only when a newer complete record already owns the disk.
   @discardableResult public func save(_ draft: ComposerDraft, revision: UInt64) throws -> Bool {
-    guard draft.attachments.count <= AttachmentLimits.maximumCount else {
+    let references = (draft.submission?.attachments ?? []) + draft.attachments
+    guard references.count <= AttachmentLimits.maximumCount else {
       throw AttachmentError.tooMany
     }
-    guard Set(draft.attachments.map(\.id)).count == draft.attachments.count,
+    guard Set(references.map(\.id)).count == references.count,
+      draft.submission.map({ $0.identity.composerID == draft.composerID }) ?? true,
+      draft.submission.map({ value in
+        value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
+      }) ?? true,
       draft.feedbackScreenshotID.map({ id in draft.attachments.contains { $0.id == id } }) ?? true
     else { throw ComposerDraftError.invalidRecord }
+    let submission =
+      try draft.submission.map {
+        Submission(
+          identity: $0.identity, outboxPath: try relativeOutboxPath($0.outboxURL), text: $0.text,
+          attachments: $0.attachments.map(\.reference),
+          feedbackScreenshotID: $0.feedbackScreenshotID)
+      }
     let record = Record(
       revision: revision, text: draft.text, mode: draft.mode,
       attachments: draft.attachments.map(\.reference), consumedTransfers: draft.consumedTransfers,
-      feedbackScreenshotID: draft.feedbackScreenshotID)
+      feedbackScreenshotID: draft.feedbackScreenshotID, composerID: draft.composerID,
+      submission: submission)
     let data = try JSONEncoder().encode(record)
     guard data.count <= Self.maximumRecordBytes else { throw ComposerDraftError.tooLarge }
     let directory = url.deletingLastPathComponent()
@@ -144,6 +224,17 @@ public actor ComposerDraftStore {
     defer { close(fd) }
     guard fsync(fd) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     needsSynchronization = false
+  }
+
+  private func relativeOutboxPath(_ owner: URL) throws -> String {
+    guard owner.isFileURL else { throw ComposerDraftError.invalidRecord }
+    // Anchor ownership to this record's current location. iOS can move the
+    // entire data container between launches without changing its contents.
+    let base = url.deletingLastPathComponent().standardizedFileURL.pathComponents
+    let target = owner.standardizedFileURL.pathComponents
+    let common = zip(base, target).prefix { $0 == $1 }.count
+    return (Array(repeating: "..", count: base.count - common) + target.dropFirst(common))
+      .joined(separator: "/")
   }
 
   private func contents() throws -> Data? {
