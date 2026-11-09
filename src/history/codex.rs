@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -1724,8 +1724,13 @@ impl Connection {
             .checked_add(1)
             .context("Codex request IDs exhausted")?;
         self.reusable = false;
-        self.write(&RpcRequest { id, method, params }).await?;
-        timeout(Duration::from_secs(900), async {
+        // Inventory normally returns in under a second. A wedged listing must
+        // yield a coverage gap and let other hosts continue; full history pages
+        // retain their longer budget. The caller adds the owning host context.
+        let deadline = Duration::from_secs(if method == "thread/list" { 30 } else { 900 });
+        let started = Instant::now();
+        timeout(deadline, async {
+            self.write(&RpcRequest { id, method, params }).await?;
             loop {
                 let mut bytes = Vec::new();
                 loop {
@@ -1770,7 +1775,13 @@ impl Connection {
             }
         })
         .await
-        .context("Codex history read exceeded its command deadline")?
+        .with_context(|| {
+            format!(
+                "Codex {method} exceeded its {}s command deadline ({}ms elapsed)",
+                deadline.as_secs(),
+                started.elapsed().as_millis()
+            )
+        })?
     }
 }
 fn unsupported(error: &anyhow::Error) -> bool {
@@ -2754,6 +2765,155 @@ try{
             .map(|line| serde_json::from_str::<Call>(line).unwrap().pid)
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(pids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_inventory_expires_without_shortening_full_history_reads() {
+        use crate::history::codex::{NativeRead, ReadParams};
+
+        #[derive(serde::Serialize)]
+        struct Message {
+            id: &'static str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct Call {
+            pid: u32,
+            method: String,
+        }
+        #[derive(Deserialize)]
+        struct Original {
+            text: String,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = fixture(directory.path(), &provider_fixture(vec![]));
+        std::fs::write(directory.path().join("block"), b"block").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let original = "Full retained history. ".repeat(50_000);
+        let reader = fixture(
+            other.path(),
+            &provider_fixture(vec![
+                serde_json::to_value(Message {
+                    id: "original-message",
+                    kind: "agentMessage",
+                    text: original.clone(),
+                })
+                .unwrap(),
+            ]),
+        );
+        let _: NativeRead = reader
+            .rpc(
+                "thread/read",
+                ReadParams {
+                    thread_id: "thread-a",
+                    include_turns: false,
+                },
+            )
+            .await
+            .unwrap();
+        let reader_pid = reader
+            .connection
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .child
+            .id()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGSTOP) }, 0);
+        let listing = tokio::time::timeout(
+            Duration::from_secs(35),
+            blocked.request(HistoryRequest::List {
+                archived: false,
+                cursor: None,
+            }),
+        );
+        let full_read = tokio::time::timeout(
+            Duration::from_secs(35),
+            reader.rpc::<_, NativeRead>(
+                "thread/read",
+                ReadParams {
+                    thread_id: "thread-a",
+                    include_turns: true,
+                },
+            ),
+        );
+        let control = async {
+            let blocked_pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls")) {
+                        for call in calls
+                            .lines()
+                            .map(|line| serde_json::from_str::<Call>(line).unwrap())
+                        {
+                            if call.method == "thread/list" {
+                                return call.pid;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Stop the real fixture after it received the request, before its
+            // delayed reply. Both child pipes remain open throughout the wait.
+            assert_eq!(unsafe { libc::kill(blocked_pid as i32, libc::SIGSTOP) }, 0);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            assert_eq!(unsafe { libc::kill(blocked_pid as i32, libc::SIGCONT) }, 0);
+            assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGCONT) }, 0);
+            blocked_pid
+        };
+        let (listed, read, blocked_pid) = tokio::join!(listing, full_read, control);
+        let error = listed
+            .expect("A blocked inventory must settle before the long history deadline")
+            .expect_err("A stopped native child cannot confirm its inventory");
+        assert!(error.to_string().contains("thread/list"), "{error:#}");
+        assert!(error.to_string().contains("30s"), "{error:#}");
+        assert!(error.to_string().contains("ms elapsed"), "{error:#}");
+        let read = read.unwrap().unwrap();
+        let retained: Original =
+            serde_json::from_value(read.thread.turns[0].items[0].clone()).unwrap();
+        assert_eq!(retained.text, original);
+        assert!(
+            matches!(
+                reader
+                    .request(HistoryRequest::List {
+                        archived: false,
+                        cursor: None
+                    })
+                    .await
+                    .unwrap(),
+                HistoryResponse::List { .. }
+            ),
+            "Another native history host must remain usable"
+        );
+        std::fs::remove_file(directory.path().join("block")).unwrap();
+        assert!(matches!(
+            blocked
+                .request(HistoryRequest::List {
+                    archived: false,
+                    cursor: None
+                })
+                .await
+                .unwrap(),
+            HistoryResponse::List { .. }
+        ));
+        let replacement_pid = blocked
+            .connection
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .child
+            .id()
+            .unwrap();
+        assert_ne!(
+            replacement_pid, blocked_pid,
+            "A timed-out stream cannot supply a later request's receipt"
+        );
     }
 
     #[tokio::test]
