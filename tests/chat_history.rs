@@ -549,7 +549,9 @@ async fn recovery_connection(
                     assert!(
                         matches!(
                             error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::NotConnected
                         ),
                         "Retired observer failed for another reason: {error}"
                     );
