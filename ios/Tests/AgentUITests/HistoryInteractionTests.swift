@@ -432,7 +432,7 @@ final class HistoryInteractionTests: XCTestCase {
       ("Juniper parcel", "Juniper parcel\nA note typed after returning to the foreground."),
       ("Cedar signal", "Cedar signal\nAnother note after the next foreground transition."),
       (
-        "Sending must collapse",
+        "Granite return",
         """
         A longer note fills the native editor.
         Its first lines scroll out of view.
@@ -546,6 +546,60 @@ final class HistoryInteractionTests: XCTestCase {
       ).firstMatch.waitForExistence(timeout: 3))
     try await assertVisibleEditorText("Message Beep Boop", excluding: "Cypress packet", in: app)
     XCTAssertTrue(app.keyboards.firstMatch.exists)
+  }
+
+  func testSendClearsTheFocusedDraftImmediatelyAfterAnAppSwitch() async throws {
+    let peer = InteractionPeer()
+    await peer.streamRepliesOnSubmit()
+    let output = String(
+      repeating: "The invented inventory result keeps its recorded quantities. ", count: 120)
+    let messages = (0..<480).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "retained-\(index)", finalChunk: true,
+        role: index.isMultiple(of: 10) ? .final : .tool,
+        text: index.isMultiple(of: 10) ? "Recorded inventory section \(index)." : output,
+        tool: index.isMultiple(of: 10)
+          ? nil : .init(callId: "retained-call-\(index)", name: "exec", status: .finished))
+    }
+    let app = try await launchMessages(messages, peer: peer)
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+    defer { settings.terminate() }
+    var expected: [String] = []
+    for _ in 0..<3 {
+      for character in "The parcel is teh" {
+        app.keys[character == " " ? "space" : String(character)].tap()
+      }
+      try await eventually(description: "pending correction before the app switch") {
+        self.action("the", app: app).exists
+      }
+      let text = try XCTUnwrap(composer.value as? String)
+      expected.append(text)
+      let observations = await peer.observationCount()
+      settings.activate()
+      XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+      app.activate()
+      try await eventually(description: "resumed conversation observer") {
+        await peer.observationCount() > observations
+      }
+      // Keep the existing editor focused across the switch and send. A new
+      // editor tap can settle the keyboard state that this test exercises.
+      let send = app.buttons["Send message"]
+      try await eventually(description: "send available after the app switch") { send.isEnabled }
+      send.tap()
+      try await eventually(description: "the resumed draft admitted once") {
+        await peer.inputs().count == expected.count
+      }
+      try await assertVisibleEditorText("Message Beep Boop", excluding: "The parcel", in: app)
+      let inputs = await peer.inputs()
+      XCTAssertEqual(inputs.map(\.text), expected)
+      XCTAssertTrue(app.keyboards.firstMatch.exists)
+      try await peer.beginReply("The admitted note is being processed.")
+      try await assertVisibleEditorText("Message Beep Boop", excluding: "The parcel", in: app)
+    }
   }
 
   func testCommandMenuPreservesTheNoteAndReplacesThePreviousCommand() async throws {

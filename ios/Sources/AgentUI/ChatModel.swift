@@ -379,15 +379,20 @@ final class ChatModel {
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
   }
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
+    await startSend(screenshot: screenshot)?.value
+  }
+
+  /// Snapshot and clear on the button's event, before scheduling any async work.
+  @discardableResult
+  func startSend(screenshot: (@MainActor () throws -> Data)? = nil) -> Task<Void, Never>? {
     logComposer(.sendRequested)
     guard canSend
     else {
       logComposer(.sendIgnored)
-      return
+      return nil
     }
     let text = draft
     let generation = generation
-    var admitted = false
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outbox takes ownership.
     var submission = outboxURL.map {
@@ -400,75 +405,79 @@ final class ChatModel {
     draft = ""
     changingDraft = false
     logComposer(.cleared)
-    defer {
-      admission = nil
-      if !admitted, !text.isEmpty {
-        // Local rejection has no outbox row. Preserve both the original and
-        // anything typed while admission or attachment preparation was pending.
-        draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
-        logComposer(.localDraftRestored)
-      }
-    }
     let mode = mode
     let admit = admit
-    var files = attachments
-    do {
-      if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
-        feedbackScreenshotID == nil, let screenshot
-      {
-        guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
-        // Capture once. A failed admission retains this exact image.
-        let data = try screenshot()
-        let file = try await attachmentStore().stage(
-          data: data, name: "Feedback.png", mediaType: "image/png")
-        guard self.generation == generation else {
-          try? await draftStore?.remove(file)
-          return
+    let originalFiles = attachments
+    return Task {
+      var admitted = false
+      defer {
+        admission = nil
+        if !admitted, !text.isEmpty {
+          // Local rejection has no outbox row. Preserve both the original and
+          // anything typed while admission or attachment preparation was pending.
+          draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
+          logComposer(.localDraftRestored)
         }
-        guard attachments.count < AttachmentLimits.maximumCount else {
-          try? await draftStore?.remove(file)
-          throw AttachmentError.tooMany
-        }
-        attachments.append(file)
-        files.append(file)
-        feedbackScreenshotID = file.id
-        // Feedback owns private evidence, not transcript messages. Preserve the
-        // screenshot and user files even when log access or staging fails.
-        if attachments.count < AttachmentLimits.maximumCount {
-          let diagnostics = await ComposerDiagnostics.export()
-          if let log = try? await attachmentStore().stage(
-            data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
-          {
-            if self.generation == generation, attachments.count < AttachmentLimits.maximumCount {
-              attachments.append(log)
-              files.append(log)
-            } else {
-              try? await draftStore?.remove(log)
+      }
+      var files = originalFiles
+      do {
+        if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
+          feedbackScreenshotID == nil, let screenshot
+        {
+          guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
+          // Capture once. A failed admission retains this exact image.
+          let data = try screenshot()
+          let file = try await attachmentStore().stage(
+            data: data, name: "Feedback.png", mediaType: "image/png")
+          guard self.generation == generation else {
+            try? await draftStore?.remove(file)
+            return
+          }
+          guard attachments.count < AttachmentLimits.maximumCount else {
+            try? await draftStore?.remove(file)
+            throw AttachmentError.tooMany
+          }
+          attachments.append(file)
+          files.append(file)
+          feedbackScreenshotID = file.id
+          // Feedback owns private evidence, not transcript messages. Preserve the
+          // screenshot and user files even when log access or staging fails.
+          if attachments.count < AttachmentLimits.maximumCount {
+            let diagnostics = await ComposerDiagnostics.export()
+            if let log = try? await attachmentStore().stage(
+              data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
+            {
+              if self.generation == generation, attachments.count < AttachmentLimits.maximumCount {
+                attachments.append(log)
+                files.append(log)
+              } else {
+                try? await draftStore?.remove(log)
+              }
             }
           }
         }
+      } catch {
+        self.error = error.localizedDescription
+        return
       }
-    } catch {
-      self.error = error.localizedDescription
-      return
-    }
-    guard self.generation == generation else { return }
-    submission?.attachments = files
-    submission?.feedbackScreenshotID = feedbackScreenshotID
-    admission = .pending(text: text, submission: submission)
-    // The pending identity must be durable before the independent outbox can
-    // claim it. New typing and files remain separate from this submitted note.
-    guard await saveDraft(), self.generation == generation else { return }
-    admitted = await admit(text, mode, files, submission?.identity)
-    if admitted {
-      // The outbox owns this draft even if its connection has since stopped.
-      admission = .saved
-      logComposer(.outboxSaved)
-      let sentIDs = Set(files.map(\.id))
-      attachments.removeAll { sentIDs.contains($0.id) }
-      if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
-      retiredDraftFiles.append(contentsOf: files)
-      _ = await saveDraft()
+      guard self.generation == generation else { return }
+      submission?.attachments = files
+      submission?.feedbackScreenshotID = feedbackScreenshotID
+      admission = .pending(text: text, submission: submission)
+      // The pending identity must be durable before the independent outbox can
+      // claim it. New typing and files remain separate from this submitted note.
+      guard await saveDraft(), self.generation == generation else { return }
+      admitted = await admit(text, mode, files, submission?.identity)
+      if admitted {
+        // The outbox owns this draft even if its connection has since stopped.
+        admission = .saved
+        logComposer(.outboxSaved)
+        let sentIDs = Set(files.map(\.id))
+        attachments.removeAll { sentIDs.contains($0.id) }
+        if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
+        retiredDraftFiles.append(contentsOf: files)
+        _ = await saveDraft()
+      }
     }
   }
   private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {

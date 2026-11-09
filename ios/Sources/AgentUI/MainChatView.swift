@@ -18,7 +18,11 @@ public struct MainChatView: View {
   private let inspectRelated: ((SavedConversation) -> Void)?
   @Environment(\.dismiss) private var dismiss
   @State private var settings = false
-  @FocusState private var composerFocused: Bool
+  #if os(iOS)
+    @State private var composerFocused = false
+  #else
+    @FocusState private var composerFocused: Bool
+  #endif
   @State private var sourceDetails = false
   @State private var followsLatest = true
   @State private var transcriptWidth: CGFloat = 0
@@ -32,6 +36,7 @@ public struct MainChatView: View {
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
+    @State private var composerEditor = ComposerEditor()
   #endif
   @AppStorage("coordinatorAddress") private var host = ""
   @AppStorage("coordinatorPort") private var port = "43187"
@@ -411,7 +416,8 @@ public struct MainChatView: View {
       && model.attachments.isEmpty
   }
   private var composer: some View {
-    VStack(spacing: 6) {
+    @Bindable var model = model
+    return VStack(spacing: 6) {
       if !model.attachments.isEmpty {
         HStack {
           Text("Unsent attachments").font(.caption).foregroundStyle(.secondary)
@@ -475,27 +481,42 @@ public struct MainChatView: View {
         .disabled(
           !model.draftReady || model.preparingAttachments || model.admitting
             || model.attachments.count >= AttachmentLimits.maximumCount)
-        TextField(
-          model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up", text: $model.draft,
-          axis: .vertical
-        )
-        .disabled(!model.draftReady)
-        .focused($composerFocused)
-        .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
-        .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
-          "Message the coordinator")
-        Button {
-          let stop = showsStop
-          Task {
-            if stop {
-              await model.interrupt()
-            } else {
-              #if os(iOS)
-                await model.send(screenshot: capture.png)
-              #else
-                await model.send()
-              #endif
+        #if os(iOS)
+          ComposerTextView(
+            text: $model.draft,
+            focused: Binding(get: { composerFocused }, set: { composerFocused = $0 }),
+            enabled: model.draftReady, editor: composerEditor
+          )
+          .overlay(alignment: .topLeading) {
+            if model.draft.isEmpty {
+              Text(model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up")
+                .foregroundStyle(.secondary).allowsHitTesting(false)
             }
+          }
+          .padding(.vertical, 11).padding(.horizontal, 2)
+        #else
+          TextField(
+            model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up", text: $model.draft,
+            axis: .vertical
+          )
+          .disabled(!model.draftReady)
+          .focused($composerFocused)
+          .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
+          .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
+            "Message the coordinator")
+        #endif
+        Button {
+          if showsStop {
+            Task { await model.interrupt() }
+          } else {
+            #if os(iOS)
+              composerEditor.submit { text in
+                model.draft = text
+                return model.startSend(screenshot: capture.png) != nil
+              }
+            #else
+              model.startSend()
+            #endif
           }
         } label: {
           Group {

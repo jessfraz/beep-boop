@@ -28,6 +28,30 @@ private actor AdmissionGate {
   }
 }
 
+@MainActor @Test(.timeLimit(.minutes(1)))
+func buttonSubmissionSnapshotsAndClearsBeforeReturning() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    await fixture.loseInputAcknowledgements()
+    let model = await MainActor.run { ChatModel() }
+    await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
+    try await waitForComposerState { model.connection == .connected }
+    let text = "Copy this note before clearing the visible editor."
+    let started = await MainActor.run {
+      model.draft = text
+      let started = model.startSend()
+      #expect(model.draft.isEmpty)
+      #expect(model.admitting)
+      model.draft = text
+      return started
+    }
+    let sending = try #require(started)
+    await sending.value
+    #expect(await model.draft == text, "New identical typing belongs to the next message")
+    #expect(try savedInputs(at: outbox).map(\.text) == [text])
+    await model.stop()
+  }
+}
+
 @MainActor
 @Test(arguments: [
   ("", "/feedback "),

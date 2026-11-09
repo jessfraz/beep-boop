@@ -102,8 +102,11 @@ required for sharing on a phone; an unsigned build does not establish that.
 - The unsent composer saves its note, delivery mode and attachment references
   together. Reopening restores that draft; importing or restoring never sends it.
   Choosing a command preserves the note and replaces only a known command prefix.
-  Send clears the stored value bound to the editor immediately. The submitted
-  copy and newer draft checkpoint separately under a stable input identity.
+  The composer uses a plain native `UITextView`. Send copies its text and
+  clears the visible buffer synchronously, keeping the keyboard active.
+  Admission starts in that same button event; asynchronous persistence and
+  delivery remain outside the editor. The submitted copy and newer draft
+  checkpoint separately under a stable input identity.
   Recovery checks the original endpoint's retained receipt, so admitted text
   stays retired after a failed save or connection change. Newer typing and files
   survive. Controls retain receipts without becoming replayable inputs.

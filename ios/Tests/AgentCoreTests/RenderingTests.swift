@@ -15,6 +15,68 @@
   // Hosted captures share one scene and must own its key window serially.
   @Suite(.serialized) struct NativeRenderingTests {
     #if os(iOS)
+      @Test @MainActor
+      func nativeComposerCopiesAndClearsWithoutWaitingForAnotherRunLoop() async throws {
+        let editor = ComposerEditor()
+        var draft = "A restored unsent note"
+        var focused = false
+        let content = ComposerTextView(
+          text: Binding(get: { draft }, set: { draft = $0 }),
+          focused: Binding(get: { focused }, set: { focused = $0 }),
+          enabled: true, editor: editor)
+        let host = UIHostingController(rootView: content)
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previous?.makeKey()
+        }
+        window.layoutIfNeeded()
+        let view = try #require(editor.view)
+        #expect(view.text == draft)
+        #expect(view.becomeFirstResponder())
+        let text = "An uncommitted parcel note"
+        view.selectedRange = NSRange(location: 0, length: view.text.utf16.count)
+        view.setMarkedText(text, selectedRange: NSRange(location: text.utf16.count, length: 0))
+        #expect(view.markedTextRange != nil)
+        var submitted: String?
+        #expect(
+          editor.submit {
+            submitted = $0
+            draft = ""
+            return true
+          })
+        // No await, layout pass or focus change may be needed to clear glyphs.
+        #expect(submitted == text)
+        #expect(view.text.isEmpty)
+        #expect(view.markedTextRange == nil)
+        #expect(view.isFirstResponder)
+        view.insertText(text)
+        #expect(view.text == text)
+        #expect(draft == text)
+        #expect(!editor.submit { _ in false })
+        #expect(view.text == text)
+        #expect(view.isFirstResponder)
+        #expect(
+          editor.submit { _ in
+            draft = ""
+            return true
+          })
+        // A local rejection may restore the identical copy before SwiftUI's
+        // next update. It must still reach the already-cleared native view.
+        host.rootView = ComposerTextView(
+          text: .constant(text), focused: .constant(true), enabled: true, editor: editor)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(editor.view === view)
+        #expect(view.text == text)
+        #expect(view.isFirstResponder)
+      }
+
       @Test(arguments: [false, true]) @MainActor
       func sendingClearsNativeMarkedTextWithoutDismissingTheKeyboard(stopping: Bool) async throws {
         let entered = AsyncStream<Void>.makeStream()
@@ -51,7 +113,6 @@
         #expect(editor.becomeFirstResponder())
         let text = "The test parcel is ready"
         editor.setMarkedText(text, selectedRange: NSRange(location: text.utf16.count, length: 0))
-        try await Task.sleep(for: .milliseconds(100))
         #expect(model.draft == text)
         #expect(editor.markedTextRange != nil)
         let sending = Task { await model.send() }

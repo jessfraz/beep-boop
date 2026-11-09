@@ -38,8 +38,10 @@ recovery; [history](history.md) describes import and retrieval.
   after failed saves, queue retirement and storage relocation.
   Simulator checks retain production startup and composer/outbox state across
   relaunch.
-  Full visible-composer checks cover foreground recovery and active responses.
-  The reported intermittent visible-text recurrence remains unreproduced.
+  The native text view copies and clears its buffer in the Send event, before
+  asynchronous admission work. Native checks cover marked text, consecutive
+  sends, foreground recovery and active responses. Distributed-app verification
+  of the reported recurrence remains open.
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Retain the live tail and older reading position through native rotation.
