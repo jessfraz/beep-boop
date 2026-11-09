@@ -49,7 +49,7 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
   controls through Global Nix. Background, CLI and main-agent collection have
   passed live checks, preserving active and dirty work.
-- [ ] Run scheduled tasks and their child agents without Rex terminals, retaining
+- [x] Run scheduled tasks and their child agents without Rex terminals, retaining
   conversation identity, host tools, live views, steering and isolated stop.
 - [x] Verify failed scheduled occurrences settle after recovery on their
   existing tasks, clearing scheduler errors while preserving unresolved work.
@@ -101,7 +101,7 @@ recovery; [history](history.md) describes import and retrieval.
   passed fresh password/TOTP sign-in with 1Password enabled, authenticated
   access, independent connections without browser approval clicks, and owned
   tab cleanup after the Beep Boop service restarted.
-- [ ] Reuse existing signed-in user tabs with exclusive control and preserved
+- [x] Reuse existing signed-in user tabs with exclusive control and preserved
   drafts; return explicit browser-script results without automatic page dumps.
 - [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
   ordinary browser relaunch and interruption recovery with autofill enabled.

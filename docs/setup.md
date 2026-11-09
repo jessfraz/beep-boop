@@ -371,11 +371,14 @@ and exact completed reply. Pi owns these records; inspecting them starts no
 work. Older runs without a retained execution reference show unavailable
 timing rather than treating admission as completion. `--json` retains the
 typed result for scripts.
+An active retry shows its current running state. Its previous work failure
+remains saved but is not advertised as current while that exact work executes.
+Planner failures, backoff and blocked work remain visible.
 
 `retry` resumes an existing execution parked after Pi's restart limit. It keeps
 the same task, occurrence and checkpoints, and does not admit another run or
-move recurring timers. A parked model generation requires its existing worker
-to reconnect and load its guidance and tools first. Unknown jobs and jobs
+move recurring timers. A parked model generation resumes with current guidance
+and tools when its execution host is connected. Unknown jobs and jobs
 without a parked execution are rejected. Use `run` for a separate new pass.
 
 On iOS, Connection → Jobs and work lists applied jobs and saved conversations.

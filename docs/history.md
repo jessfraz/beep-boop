@@ -54,7 +54,9 @@ vector backlog nor attachment retries block the other work. Interrupted or
 failed final indexing resumes from the retained corpus before the next fresh
 import. Explicit `--host` selection starts a fresh walk of those hosts when no
 import is active. Concurrent commands join the running import; closing its CLI
-leaves it running. `--embedding-host` accepts an announced name or native host
+leaves it running. Inventory requests have a shorter deadline than transcript
+reads. A stalled host leaves an explicit coverage gap while other hosts
+continue. `--embedding-host` accepts an announced name or native host
 ID. Source reads and the Pi/search databases stay with their existing owners.
 Indexing uses that worker while connected, falls back to coordinator compute
 when unavailable, and uses the worker again after it returns. Vector-space
