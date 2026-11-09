@@ -384,6 +384,8 @@ export class BackgroundScheduler {
   }
   private async errors(state: State | undefined, inspected?: HarnessInspection): Promise<Map<string, string>> {
     const inspection = inspected ?? await this.session.inspect(BACKGROUND_CONTEXT);
+    const running = new Set(inspection.tasks.filter(task => task.record.kind === "agent.background" && task.state.kind === "running")
+      .map(task => task.record.id));
     const blocked = new Map<NativeTaskId, Extract<TaskInspection["state"], { kind: "blocked" }>>();
     for (const task of inspection.tasks) if (task.record.kind === "agent.background" && task.state.kind === "blocked") {
       blocked.set(task.record.id, task.state);
@@ -394,7 +396,11 @@ export class BackgroundScheduler {
       const error = trigger.task === null ? undefined : blocked.get(trigger.task);
       const workError = lane?.active === null || lane?.active === undefined ? undefined : blocked.get(lane.active);
       const paused = workError ?? error;
-      let message = trigger.error;
+      // Keep the saved attempt's diagnostic, but do not publish it as current
+      // while that exact work is executing. Job lanes are shared by schedules.
+      const executing = lane?.active !== null && lane?.active !== undefined && running.has(lane.active) &&
+        (trigger.key.type === "builtin" || lane.last_run?.task === lane.active && lane.last_run.schedule_id === trigger.key.schedule_id);
+      let message = trigger.error_scope === "work" && executing ? null : trigger.error;
       if (paused !== undefined) {
         if (paused.reason !== "restart_limit") message = `Background work is blocked by its native task definition (${paused.reason})`;
         else if (trigger.key.type === "builtin" && trigger.key.name === "history") {

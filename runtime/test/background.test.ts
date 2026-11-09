@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { TaskInspection } from "@earendil-works/pi-durable";
 import { SourceJournal } from "../src/sources.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import type { ScheduledJobStatus } from "../src/generated/ScheduledJobStatus.js";
@@ -231,6 +232,69 @@ test("an occurrence's native actor memo and immutable snapshot survive a failed 
     clock.advance(60_000); await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
     assert.deepEqual(attempts[1], original); assert.equal((await app.tasks.list()).length, 1);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("running retries stop publishing retained work failures across reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-background-retry-status-")), clock = new FakeClock(), held = gate();
+  const unavailable = "Coordinator background execution is unavailable; its input is retained";
+  const plannerError = "Example planner is unavailable", workError = "Example work needs reconciliation";
+  const example = exampleJob(), job = { ...example, schedules: [...example.schedules, { ...example.schedules[0]!, id: "planner" }] };
+  const other = { ...exampleJob(), id: "other-review" };
+  let attempts = 0;
+  const overrides = {
+    plan: async (...[cadence, after, now]: Parameters<typeof planned>) => {
+      if (cadence.type === "calendar" && cadence.schedule.id === "planner") throw new Error(plannerError);
+      return planned(cadence, after, now);
+    },
+    runJob: async (occurrence: ScheduledOccurrence, signal: AbortSignal) => {
+      if (occurrence.job.id === other.id) throw new Error(workError);
+      attempts += 1;
+      if (attempts === 1) throw new Error(unavailable);
+      await untilReleased(held.promise, signal);
+    },
+  };
+  let app = await openBackground(directory, clock, overrides);
+  const errors = () => app.scheduler.status().then(status => status.errors.map(error => error.message).sort());
+  try {
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [job, other] });
+    await pump(async () => (await errors()).includes(plannerError));
+    await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: "daily", request_id: "retained-retry" });
+    await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "other-work" });
+    await pump(async () => (await errors()).length === 3);
+    const before = await app.scheduler.getJob(job.id);
+    assert.deepEqual(before.last_run?.state, { status: "retrying", at: START + 60_000, message: unavailable });
+    const original = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task =>
+      task.record.kind === "agent.background" && task.record.memos?.job_actor_task_id === before.task_id);
+    assert.ok(original);
+
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await openBackground(directory, clock, overrides);
+    assert.deepEqual(await errors(), [unavailable, plannerError, workError].sort(), "Backoff diagnostics survive reopen");
+    await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
+    clock.advance(60_000);
+    await pump(async () => attempts === 2 && (await app.scheduler.getJob(other.id)).last_run?.state.status === "retrying");
+    for (let reopen = 0; reopen < 2; reopen += 1) {
+      const current = await app.scheduler.getJob(job.id);
+      assert.deepEqual(current.last_run?.state, { status: "running" });
+      assert.equal(current.schedules[0]?.error, null, "The healthy retry cannot advertise its previous unavailable attempt");
+      assert.equal(current.schedules[1]?.error, plannerError, "Another schedule's planner failure remains visible");
+      assert.equal((await app.scheduler.listJobs()).find(item => item.job.id === job.id)?.schedules[0]?.error, null);
+      assert.deepEqual(await errors(), [plannerError, workError].sort(), "Other planner and backoff failures remain actionable");
+      const native: TaskInspection["record"] | undefined = await app.session.getTask(original.record.id, BACKGROUND_CONTEXT);
+      assert.equal(native?.state.status, "running");
+      assert.deepEqual(native?.input, original.record.input);
+      if (reopen === 0) {
+        await app.session.close(BACKGROUND_CONTEXT);
+        app = await openBackground(directory, clock, overrides);
+        assert.ok((await errors()).includes(unavailable), "The retained diagnostic is preserved while its owner is stopped");
+        await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
+        await pump(() => attempts === 3);
+      }
+    }
+    held.release();
+    await pump(async () => (await app.scheduler.getJob(job.id)).last_run?.state.status === "completed");
+    assert.equal((await app.scheduler.getJob(job.id)).schedules[0]?.error, null);
+  } finally { held.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("job-only synchronization diffs definitions without altering built-in source deadlines", async () => {
