@@ -65,6 +65,7 @@ struct Arguments {
     /// Connect to a coordinator through Tailscale or an existing SSH host.
     #[arg(long, global = true)]
     coordinator: Option<String>,
+    /// Emit one typed event per JSON line; a response may contain multiple events.
     #[arg(long, global = true)]
     json: bool,
     /// Use the plain line interface in an interactive terminal.

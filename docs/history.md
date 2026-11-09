@@ -25,6 +25,11 @@ receipts or maintenance controls by exact native entry ID; `visible` reverses
 the classification. Originals stay intact. Reloaded views use the
 classification; already printed terminal scrollback cannot be rewritten.
 
+`--json` emits newline-delimited events. A history page can span several
+`history` events; read all of them through `page_complete` and use the final
+`next_cursor` for older entries. Message chunks retain their `entry_id`,
+`continuation` and `final_chunk` fields.
+
 Run import again to catch up. Completed reliable source versions are skipped;
 partial reads resume their committed cursor. Current paginated Codex stores
 retain a host-specific change position after EOF, so later runs transfer only

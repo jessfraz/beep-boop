@@ -241,7 +241,7 @@ pub async fn self_address(port: u16, daemon: &Daemon) -> Result<SocketAddr> {
 pub async fn validate_peer(peer: SocketAddr, policy: &PeerPolicy, daemon: &Daemon) -> Result<()> {
     tailnet_v4(peer.ip())?;
     let status: Status = invoke(daemon, &["status", "--json"]).await?;
-    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
+    let whois = peer_identity(peer, daemon).await?;
     authorize(&status, peer, &whois, policy)
 }
 
@@ -257,7 +257,7 @@ pub(crate) async fn validate_connection(
         local.ip() == IpAddr::V4(current_address(&status)?),
         "Coordinator listener is no longer the active Tailscale address"
     );
-    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
+    let whois = peer_identity(peer, daemon).await?;
     authorize(&status, peer, &whois, policy)
 }
 
@@ -265,7 +265,7 @@ pub async fn connect(peer: SocketAddr, policy: &PeerPolicy, daemon: &Daemon) -> 
     tailnet_v4(peer.ip())?;
     let status: Status = invoke(daemon, &["status", "--json"]).await?;
     let address = current_address(&status)?;
-    let whois: Whois = invoke(daemon, &["whois", "--json", &peer.to_string()]).await?;
+    let whois = peer_identity(peer, daemon).await?;
     authorize(&status, peer, &whois, policy)?;
     let socket = scoped_socket(address)?;
     socket.bind(SocketAddr::new(address.into(), 0))?;
@@ -410,6 +410,16 @@ fn bind_interface(_socket: &TcpSocket, _interface: &Interface) -> Result<()> {
     anyhow::bail!("Tailscale interface binding is unsupported on this platform")
 }
 
+async fn peer_identity(peer: SocketAddr, daemon: &Daemon) -> Result<Whois> {
+    invoke(daemon, &["whois", "--json", &peer.to_string()])
+        .await
+        .with_context(|| {
+            format!(
+                "The selected Tailscale network could not identify peer {peer}; check the active tailnet and daemon"
+            )
+        })
+}
+
 async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T> {
     const MAX_BYTES: u64 = 1024 * 1024;
     let mut child = daemon
@@ -433,9 +443,11 @@ async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T
             bytes.len() as u64 <= MAX_BYTES,
             "Tailscale identity response exceeded its size limit"
         );
+        let status = child.wait().await?;
         ensure!(
-            child.wait().await?.success(),
-            "Tailscale identity read failed"
+            status.success(),
+            "Tailscale {} identity read failed ({status})",
+            args.first().copied().unwrap_or("metadata")
         );
         serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("Tailscale returned invalid identity metadata"))
