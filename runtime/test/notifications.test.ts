@@ -16,7 +16,11 @@ import { fileURLToPath } from "node:url";
 import type { ApnsConfig } from "../src/generated/ApnsConfig.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { HistoryStore } from "../src/history.js";
-import { DEFAULT_MODEL } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
+import { BackgroundScheduler } from "../src/background.js";
+import { TaskStore } from "../src/tasks.js";
+import type { HostResult } from "../src/generated/HostResult.js";
+import type { RuntimeRequest } from "../src/generated/RuntimeRequest.js";
 import { ApnsClient, notificationDeliveryKey, NotificationDeliveries, Notifications, NotificationState } from "../src/notifications.js";
 import { validEvent } from "../src/protocol.js";
 import { history, UserNoticeEntry } from "../src/transcript.js";
@@ -54,7 +58,7 @@ async function app(directory: string, config: ApnsConfig, origin: string, before
     { models: createModels(), registry, identity: { attribution: null }, ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }) }, BACKGROUND_CONTEXT);
   await session.root(BACKGROUND_CONTEXT); await beforeStart?.(session);
   const notifications = new Notifications(session, registry, config, origin); await notifications.start();
-  return { session, notifications };
+  return { session, notifications, registry };
 }
 async function fixture(t: TestContext, beforeStart?: (session: Harness) => Promise<void>, clock?: FakeClock) {
   const directory = await mkdtemp(join(tmpdir(), "agent-notifications-")); await chmod(directory, 0o700);
@@ -328,8 +332,33 @@ test("a retained device token has one installation owner after reinstall", { tim
   assert.deepEqual(await app.notifications.request({ type: "status", installation_id: first }), { configured: true, registered: false });
 });
 
-test("the actual coordinator bridge resumes a configured outbox without another chat or background request", { timeout: 10_000 }, async (t) => {
-  const f = await fixture(t), app = f.current.value;
+for (const bind of [false, true]) test(`configured outbox recovery keeps restored background work owned until ${bind ? "transport binding" : "EOF"}`, { timeout: 15_000 }, async (t) => {
+  const clock = new FakeClock(Date.now() - 60_000), f = await fixture(t, undefined, clock);
+  let app = f.current.value;
+  const indexing = gate(), planning = gate(); let holdTimers = false;
+  const untilStopped = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+    const abort = () => reject(new Error("The original fixture owner closed"));
+    if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+  });
+  const scheduler = new BackgroundScheduler(app.session, app.registry, new TaskStore(app.session, new ConversationModels(createModels())), {
+    async plan(cadence, _after, now, signal) {
+      if (holdTimers) { planning.resolve(); await untilStopped(signal); }
+      assert.equal(cadence.type, "interval");
+      return { due: now, next: now + (cadence.type === "interval" ? cadence.seconds : 60) * 1000 };
+    },
+    async refreshSources() {}, async triageSources() {}, async collectResources() {}, async runJob() {},
+    async indexHistory(signal) { indexing.resolve(); await untilStopped(signal); },
+  });
+  await new HistoryStore(app.session).import({ host_id: first, thread: { id: "retained-background-history", title: "Retained history", cwd: "/example",
+    created_at: 1, updated_at: 1, version: "one", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
+    items: [{ id: "original", turn_id: "original", kind: "agentMessage", role: "assistant", text: "Retained source evidence", version: "one", order: 0,
+      timestamp_ms: 1, data: { type: "agentMessage", text: "Retained source evidence", phase: "final_answer" }, assets: [] }], next_cursor: null, gaps: [], complete: true });
+  await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null }); await indexing.promise;
+  holdTimers = true; clock.advance(60_000); await planning.promise;
+  const original = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.kind === "agent.background" &&
+    object(task.record.input) && task.record.input.type === "work" && object(task.record.input.work) && task.record.input.work.type === "history");
+  assert.ok(original);
+  await f.reopen(); app = f.current.value;
   await app.notifications.request({ type: "register", installation_id: first, token });
   const entry = await append(app.session);
   await until(app.session, t.signal, async () => (await delivery(app.session, first, entry))?.state === "queued");
@@ -346,20 +375,40 @@ http2.connect = (authority, ...options) => {
 };
 syncBuiltinESMExports();
 `, { mode: 0o600 });
-  const done = gate(), delivered = gate();
+  const done = gate(), delivered = gate(), statuses = new Map<number, ReturnType<typeof gate>>(), embeddings: string[] = [];
   f.replies.send = (stream) => { stream.respond({ ":status": 200 }); stream.end(); delivered.resolve(); };
   const child = spawn(process.execPath, ["--no-warnings", "--import", preload, fileURLToPath(new URL("../src/bridge.js", import.meta.url)), f.directory],
     { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "", AGENT_APNS_CONFIG: JSON.stringify(f.config), AGENT_TEST_APNS_ORIGIN: f.origin } });
-  const closed = new Promise<void>((resolve) => child.once("close", () => resolve())), lines = createInterface({ input: child.stdout });
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("close", (code, signal) => resolve({ code, signal }))), lines = createInterface({ input: child.stdout });
   const frames: RuntimeEvent[] = []; let errors = "";
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
-  const abort = () => { const error = new Error("Configured coordinator did not resume notification delivery: " + errors); done.reject(error); delivered.reject(error); };
+  const abort = () => { const error = new Error("Configured coordinator did not resume notification delivery: " + errors); done.reject(error); delivered.reject(error); for (const reply of statuses.values()) reply.reject(error); };
   t.signal.addEventListener("abort", abort, { once: true }); child.once("close", abort);
   lines.on("line", (line) => {
     const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame)); frames.push(frame);
     if (frame.event.type === "failure") { const error = new Error(frame.event.message); done.reject(error); delivered.reject(error); }
     else if (frame.id === 1 && frame.event.type === "done") done.resolve();
+    else if (frame.event.type === "job_status") statuses.get(frame.id)?.resolve();
+    else if (frame.event.type === "host_call") {
+      assert.equal(frame.id, 2, "Restored work must use the bound background request's receipt owner");
+      const command = frame.event.command; let result: HostResult;
+      if (command.type === "embed") {
+        embeddings.push(...command.texts);
+        result = { type: "embeddings", batch: { space: { id: "startup-ownership", model_revision: "fixture", model_digest: "fixture", dimensions: 3,
+          pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: command.texts.map(() => [1, 0, 0]) } };
+      } else if (command.type === "background" && command.request.type === "plan") {
+        result = { type: "background", response: { type: "plan", plan: { due: null, next: command.request.now + 60_000 } } };
+      } else { assert.fail(`Unexpected background host effect ${command.type}`); }
+      child.stdin.write(JSON.stringify({ version: 1, id: frame.id, command: { type: "host_reply", call_id: frame.event.call_id, result } } satisfies RuntimeRequest) + "\n");
+    }
   });
+  const status = async (id: number) => {
+    const reply = gate(); statuses.set(id, reply);
+    child.stdin.write(JSON.stringify({ version: 1, id, command: { type: "job_status" } } satisfies RuntimeRequest) + "\n");
+    await reply.promise; statuses.delete(id);
+    const frame = frames.findLast(frame => frame.id === id && frame.event.type === "job_status");
+    assert.ok(frame?.event.type === "job_status"); return frame.event.status;
+  };
   try {
     child.stdin.write(JSON.stringify({ version: 1, id: 1, command: { type: "configure_coordinator", bootstrap: { node: null,
       settings: { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] } } } }) + "\n");
@@ -368,6 +417,29 @@ syncBuiltinESMExports();
     assert.deepEqual(f.requests[0].body.agent, { conversation_id: ROOT_CONVERSATION_ID.toString(), entry_id: entry.id.toString() });
     assert.equal(frames.some((frame) => ["host_call", "answer", "input_accepted"].includes(frame.event.type)), false,
       "Notification recovery must not ask a model, admit input or allocate a Rex worker");
+    const waiting = await status(3);
+    assert.deepEqual(waiting.errors, [], "Restored work must wait for its transport without recording a failed attempt");
+    assert.ok(waiting.pending > 0, "The same admitted background work must remain owned while notification delivery continues");
+    if (bind) {
+      child.stdin.write(JSON.stringify({ version: 1, id: 2, command: { type: "run_background", settings: {
+        poll_interval_seconds: 60, sources: false, jobs: null } } } satisfies RuntimeRequest) + "\n");
+      let current = await status(4);
+      for (let id = 5; current.pending > 0 && id < 1000; id += 1) current = await status(id);
+      assert.equal(current.pending, 0); assert.deepEqual(current.errors, []);
+      assert.equal(embeddings.filter(text => text.includes("Retained source evidence")).length, 1,
+        "The original history task must index its retained evidence once after binding");
+    }
+    child.off("close", abort); child.stdin.end(); assert.deepEqual(await closed, { code: 0, signal: null });
+    await f.reopen(); app = f.current.value;
+    const recovered = await app.session.getTask(original.record.id, BACKGROUND_CONTEXT); assert.ok(recovered);
+    if (bind) {
+      assert.equal(recovered.state.status, "terminal");
+      if (recovered.state.status === "terminal") assert.equal(recovered.state.outcome.status, "completed");
+    } else {
+      assert.equal(recovered.state.status, "pending");
+      if (recovered.state.status === "pending") assert.deepEqual(recovered.state.checkpoint, { phase: "execute", attempt: 0 });
+    }
+    assert.equal(f.requests.length, 1, "Transport binding and cleanup cannot replay the notification");
   } finally {
     t.signal.removeEventListener("abort", abort); child.off("close", abort); lines.close(); child.kill("SIGKILL"); await closed;
   }

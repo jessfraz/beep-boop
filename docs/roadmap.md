@@ -30,7 +30,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Retain attachments before Pi admission without filesystem work on the
   shared commit queue; retention failures admit no input.
 - [x] Carry native invocation cancellation through background host effects,
-  preserving issued receipts and isolating unrelated execution lanes.
+  preserving issued receipts and isolating unrelated execution lanes. Restored
+  phases wait for their transport while notification recovery proceeds.
 - [x] Preserve typed storage, provider and native failures, plus host-delivery
   certainty. Reconnect reconciles uncertain inputs without resending them.
 - [x] Coalesce source-status reads and make retrieval close terminal for queued

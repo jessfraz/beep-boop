@@ -488,8 +488,10 @@ absence of a connection cannot establish whether an external action completed.
 
 Source refreshes, history indexing, resource collection and scheduled jobs use
 the same native Pi background task definition and its durable sleeps. Each has
-its own execution lane. Search reads published history without waiting for
-indexing. Rust validates jobs and
+its own execution lane and cancellation lifetime. Restored phases wait for the
+service transport before callbacks or failure bookkeeping. Notification recovery
+proceeds independently while that transport attaches. Search reads published
+history without waiting for indexing. Rust validates jobs and
 calculates occurrences; Pi owns the timer and atomic admission. Job sync owns
 only job triggers. Replacing a timer fences its generation while retaining
 independently owned admitted work and the original workflow/model snapshot.

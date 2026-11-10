@@ -111,6 +111,20 @@ let backgroundOwner: number | undefined;
 let backgroundSources = false;
 let backgroundAvailable = false;
 let stopBackground: (() => void) | undefined;
+const backgroundWaiters = new Set<() => void>();
+/** Notification recovery resumes Pi before Rust attaches. Keep background
+ * callbacks waiting for their receipt owner, with the native invocation's lifetime. */
+function waitForBackground(signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  if (backgroundAvailable) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const dispose = () => { backgroundWaiters.delete(ready); signal.removeEventListener("abort", aborted); };
+    const ready = () => { dispose(); resolve(); };
+    const aborted = () => { dispose(); reject(signal.reason); };
+    backgroundWaiters.add(ready); signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+  });
+}
 function backgroundCall(command: import("./generated/HostCommand.js").HostCommand, signal: AbortSignal) {
   if (backgroundOwner === undefined) throw new TaskError("The coordinator background transport is unavailable");
   return hostRequests.call(backgroundOwner, command, signal);
@@ -182,6 +196,7 @@ async function openApplication(): Promise<Application> {
   });
   const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
+    ready: waitForBackground,
     async plan(cadence, after, now, signal) {
       const result = await backgroundCall({ type: "background", request: { type: "plan", cadence, after, now } }, signal);
       signal.throwIfAborted();
@@ -426,6 +441,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         backgroundOwner = id;
         backgroundAvailable = true;
         backgroundSources = command.settings.sources;
+        for (const ready of backgroundWaiters) ready();
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
           const application = await app();

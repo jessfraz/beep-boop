@@ -37,6 +37,7 @@ type NativeTask = Task<BackgroundTaskInput, BackgroundCheckpoint, null, object>;
 export const JobRunReceiptEntry = defineEntry<JobRunReceipt>("agent.job_run");
 
 export type BackgroundCallbacks = {
+  ready?(signal: AbortSignal): Promise<void>;
   plan(cadence: BackgroundCadence, after: number | null, now: number, signal: AbortSignal): Promise<OccurrencePlan>;
   refreshSources(signal: AbortSignal): Promise<void>;
   triageSources(signal: AbortSignal): Promise<void>;
@@ -91,6 +92,8 @@ export class BackgroundScheduler {
       phases: {
         tick: async (task, runtime, context) => {
           if (task.input.type !== "trigger") throw new Error("Background timer has execution input");
+          await callbacks.ready?.(runtime.signal);
+          runtime.signal.throwIfAborted();
           const input = task.input, cursor = task.state.checkpoint.cursor, observedAt = runtime.now();
           let plan: OccurrencePlan;
           try { plan = await callbacks.plan(input.cadence, cursor, observedAt, runtime.signal); }
@@ -130,6 +133,8 @@ export class BackgroundScheduler {
         },
         execute: async (task, runtime, context) => {
           if (task.input.type !== "work") throw new Error("Background execution has timer input");
+          await callbacks.ready?.(runtime.signal);
+          runtime.signal.throwIfAborted();
           const input = task.input;
           try {
             switch (input.work.type) {
