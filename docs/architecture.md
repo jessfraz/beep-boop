@@ -80,6 +80,10 @@ not admit a second writer.
 The supervisor reads Pi events while command writes are pending. One frame owns
 its write offset, and the bounded command queue provides backpressure. Shutdown
 has an independent signal so a saturated pipe cannot prevent cleanup.
+Initialization owns one ten-minute budget across admission, migration and node
+registration. Shutdown can interrupt it before listeners bind, reaping the
+runtime before releasing writer ownership. Ordinary metadata keeps its
+fifteen-second deadline.
 
 Rust derives request lifetime and supported controls once from the typed
 command. The CLI, service and runtime supervisor share that classification.

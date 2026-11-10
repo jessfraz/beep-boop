@@ -72,6 +72,34 @@ test("migration retains pending legacy outcomes without a stored outcome coverag
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("migration of handled originals does not allocate a pending source index", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-state-handled-migration-")), app = await openStateStorage(join(directory, "session.sqlite"));
+  try {
+    await seedLegacy(app, 70, 1024);
+    await app.session.commit(async tx => {
+      for (const record of (await tx.doc(LegacySources)).events) record.decision = { type: "dismissed", reason: "Handled before migration" };
+    }, BACKGROUND_CONTEXT);
+    const original = await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT); assert.ok(original);
+    const state = original.sources[0]; assert.ok(state);
+    await app.sources.prepare();
+    assert.equal(await app.storage.findDocument({ kind: "agent.source.pending", scope: { kind: "session" },
+      key: JSON.stringify(["mail", "fixture"]) }, "current", BACKGROUND_CONTEXT), undefined,
+    "Already-handled originals must not materialize a pending source index");
+    assert.deepEqual(await app.sources.events({ limit: 100 }), [...original.events].reverse());
+    const event = { id: "new-live-original", version: "one", source: { provider: "mail", account: "fixture", thread_id: "new-live-thread" },
+      title: "One pending original", text: "New evidence after migration" };
+    const page = { source: state.source, events: [event], checkpoint: { value: "next" }, coverage: { status: "complete" } } satisfies Parameters<typeof app.sources.admit>[0];
+    await app.sources.admit(page, state.checkpoint); await app.sources.admit(page, page.checkpoint);
+    const pending = await app.sources.events({ pending: true }); assert.equal(pending.length, 1);
+    assert.deepEqual(pending[0]?.event, event);
+    const key = pending[0]?.key; assert.ok(key);
+    await app.sources.decide([key], { type: "dismissed", reason: "Handled once" });
+    await app.sources.decide([key], { type: "dismissed", reason: "Handled once" });
+    assert.deepEqual(await app.sources.events({ pending: true }), []);
+    assert.deepEqual(await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT), original);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("cold point lookups and hot task admission materialize only their owned records", async t => {
   const directory = await mkdtemp(join(tmpdir(), "agent-state-point-read-")), path = join(directory, "session.sqlite");
   let app = await openStateStorage(path);

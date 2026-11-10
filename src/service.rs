@@ -138,6 +138,7 @@ async fn serve_with_transport(
     bootstrap: Option<CoordinatorBootstrap>,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
+    tokio::pin!(shutdown);
     // Claim the writer before deciding an old socket is stale.
     let background = bootstrap
         .as_ref()
@@ -158,19 +159,18 @@ async fn serve_with_transport(
         }
     };
     if let Some(bootstrap) = bootstrap {
-        let host_ids = bootstrap
-            .node
-            .as_ref()
-            .map(|node| node.host_id.clone())
-            .into_iter()
-            .collect();
-        if let Err(error) = async {
-            crate::broker::control(&owner, RuntimeCommand::ConfigureCoordinator { bootstrap })
-                .await?;
-            crate::broker::control(&owner, RuntimeCommand::SetConnectedNodes { host_ids }).await
-        }
-        .await
-        {
+        let initialized = tokio::select! {
+            biased;
+            result = &mut shutdown => {
+                if let Ok(ShutdownReason::Signal(signal)) = &result {
+                    owner.record_shutdown(*signal);
+                }
+                owner.close().await?;
+                return result.map(|_| ());
+            }
+            result = crate::broker::initialize(&owner, bootstrap) => result,
+        };
+        if let Err(error) = initialized {
             owner.close().await?;
             return Err(error);
         }
@@ -204,7 +204,6 @@ async fn serve_with_transport(
         let broker = broker.clone();
         tokio::spawn(async move { crate::background::run(runtime, broker, settings).await })
     });
-    tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -615,6 +614,7 @@ mod reset_tests;
 #[cfg(test)]
 mod tests {
     mod ownership;
+    mod startup;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
     use crate::service::{

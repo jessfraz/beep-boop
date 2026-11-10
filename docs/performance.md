@@ -123,6 +123,9 @@ owns the SQLite schema and atomic commit boundary.
 Startup migrates legacy documents in batches of at most 32 records or 4 MiB,
 retaining the exact old records. Each batch is independently durable and resumes
 after interruption. A record larger than the budget owns its own batch.
+The native insertion result distinguishes new records from existing ones, so
+fresh records skip redundant index scans. Already handled originals do not
+create pending-work indexes.
 Migrated startup checks only the completion markers. The runtime regressions
 close Pi during both migrations, reopen the file, and verify ownership,
 versions, decisions and relinking. Cold point reads and hot admission also have
@@ -148,13 +151,16 @@ summaries measured:
 
 | Operation | Legacy documents | Keyed documents |
 | --- | ---: | ---: |
-| Cold task and source-status read | 385 ms | 0.47 ms |
-| Task admission, median | 86.7 ms | 5.0 ms |
-| Task admission, p95 | 124.8 ms | 9.3 ms |
-| Source admission, median | 12.4 ms | 7.0 ms |
-| First readiness, including migration | 394 ms | 6,342 ms |
+| Cold task and source-status read | 385 ms | 0.49 ms |
+| Task admission, median | 86.7 ms | 5.1 ms |
+| Task admission, p95 | 124.8 ms | 11.1 ms |
+| Source admission, median | 12.4 ms | 4.9 ms |
+| First readiness, including migration | 394 ms | 5,717 ms |
 
 The one-time migration trades startup work for bounded normal reads and writes.
-Subsequent Harness reopen took 0.85 ms, followed by the 0.47 ms point read.
+Subsequent Harness reopen took 0.93 ms, followed by the 0.49 ms point read.
 These local observations are not CI latency thresholds. The CI regressions
 verify bounded materialization and persistence, not machine-specific timings.
+Migration cost depends on record count as well as retained bytes. Qualify a
+consistent snapshot before activation and allow a maintenance window for the
+first open. Later starts read only the completion markers.

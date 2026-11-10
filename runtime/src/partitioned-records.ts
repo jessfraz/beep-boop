@@ -31,9 +31,10 @@ export class PartitionedRecords<T extends JsonObject> {
     if (!(await tx.doc(this.membership, this.bucket(key), null)).keys.includes(key)) return undefined;
     return (await tx.doc(this.records, key, null)).value ?? undefined;
   }
-  async insertIn(tx: Tx, key: string, value: T): Promise<Draft<T>> {
+  async insertIn(tx: Tx, key: string, value: T): Promise<{ value: Draft<T>; inserted: boolean }> {
     const slot = await tx.doc(this.records, key, null);
-    if (slot.value === null) {
+    const inserted = slot.value === null;
+    if (inserted) {
       const directory = await tx.doc(this.directory);
       if (this.emptyLegacy) directory.complete = true;
       (await tx.doc(this.pages, String(Math.floor(directory.count / PAGE_SIZE)), null)).keys.push(key);
@@ -42,7 +43,7 @@ export class PartitionedRecords<T extends JsonObject> {
       Object.assign(slot, { value });
     }
     if (slot.value === null) throw new Error("Partitioned record was not admitted");
-    return slot.value;
+    return { value: slot.value, inserted };
   }
   async get(session: Harness, key: string): Promise<T | undefined> {
     return (await session.snapshot(this.records, key, BACKGROUND_CONTEXT))?.value ?? undefined;
@@ -69,11 +70,11 @@ export class PartitionedRecords<T extends JsonObject> {
     }
   }
   prepare(session: Harness, legacy: () => Promise<readonly T[]>, key: (value: T) => string,
-    indexed?: (tx: Tx, value: Draft<T>) => Promise<void>): Promise<void> {
+    indexed?: (tx: Tx, value: Draft<T>, inserted: boolean) => Promise<void>): Promise<void> {
     return this.preparing ??= this.migrate(session, legacy, key, indexed).catch((error: unknown) => { this.preparing = undefined; throw error; });
   }
   private async migrate(session: Harness, legacy: () => Promise<readonly T[]>, key: (value: T) => string,
-    indexed?: (tx: Tx, value: Draft<T>) => Promise<void>): Promise<void> {
+    indexed?: (tx: Tx, value: Draft<T>, inserted: boolean) => Promise<void>): Promise<void> {
     const saved = await session.snapshot(this.directory, BACKGROUND_CONTEXT);
     if (saved?.complete) return;
     const values = await legacy();
@@ -93,7 +94,7 @@ export class PartitionedRecords<T extends JsonObject> {
           const value = values[index];
           if (value !== undefined) {
             const saved = await this.insertIn(tx, key(value), structuredClone(value));
-            await indexed?.(tx, saved);
+            await indexed?.(tx, saved.value, saved.inserted);
           }
         }
         directory.migrated = end; directory.complete = end === values.length;

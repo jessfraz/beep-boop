@@ -196,7 +196,7 @@ export class TaskStore {
     // catchup. Read through once; the migration never overwrites a keyed owner.
     const legacy = (await tx.doc(Tasks)).tasks.find(task => task.id === id);
     if (legacy === undefined) return undefined;
-    const copied = await this.recordsStore.insertIn(tx, id, legacy); await this.indexTaskIn(tx, copied); return copied;
+    const { value: copied } = await this.recordsStore.insertIn(tx, id, legacy); await this.indexTaskIn(tx, copied); return copied;
   }
   useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
   useHistory(history: HistoryStore): void { this.histories = history; }
@@ -687,7 +687,7 @@ export class TaskStore {
     if (input.outcome.trim().length === 0) throw new TaskError("A task outcome is required");
     const id = await this.histories.adopt(imported.thread.id, input.id, input.evidence, async (tx, native, record) => {
       if (await this.taskIn(tx, input.id) !== undefined) throw new TaskError("This task ID already belongs to another conversation");
-      const task = await this.recordsStore.insertIn(tx, input.id, { id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
+      const { value: task } = await this.recordsStore.insertIn(tx, input.id, { id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         sources: [{ provider: "codex", account: "local", thread_id: record.thread.id }, ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now() });
       await this.indexTaskIn(tx, task);
@@ -750,7 +750,7 @@ export class TaskStore {
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
-    const saved = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
+    const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     return { id, native: conversation.id };
   }
   async create(input: TaskCreate): Promise<TaskRecord> {

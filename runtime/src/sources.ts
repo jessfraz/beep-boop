@@ -111,13 +111,14 @@ export class SourceJournal {
       }
     }, BACKGROUND_CONTEXT);
     await this.records.prepare(this.session, async () => legacy?.events ?? [], record => record.key,
-      (tx, record) => this.indexIn(tx, record));
+      (tx, record, inserted) => this.indexIn(tx, record, inserted));
   }
-  private async indexIn(tx: Tx, record: StoredEvent): Promise<void> {
+  private async indexIn(tx: Tx, record: StoredEvent, inserted = false): Promise<void> {
     const related = await tx.doc(Related, relatedKey(record), null);
-    if (!related.keys.includes(record.key)) related.keys.push(record.key);
+    if (inserted || !related.keys.includes(record.key)) related.keys.push(record.key);
+    if (inserted && record.decision !== null) return;
     const pending = await tx.doc(Pending, streamKey(record.event.source), null);
-    const index = pending.items.findIndex(item => item.key === record.key);
+    const index = inserted ? -1 : pending.items.findIndex(item => item.key === record.key);
     if (record.decision !== null) { if (index >= 0) pending.items.splice(index, 1); }
     else if (index < 0) {
       const occurred_at = record.occurred_at ?? record.event.occurred_at;
@@ -155,7 +156,7 @@ export class SourceJournal {
     }
     const record = await this.records.insertIn(tx, key, { key, event, outcome,
       decision: settled ? { type: "dismissed", reason: "Already handled by the coordinator" } : null });
-    await this.indexIn(tx, record);
+    await this.indexIn(tx, record.value, record.inserted);
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
     const state = { ...outcomeState(), checked_at: Date.now() };
     if (previous === undefined) journal.sources.push(state); else Object.assign(previous, state);
@@ -326,7 +327,7 @@ export class SourceJournal {
           }
         } else {
           const record = await this.records.insertIn(tx, key, { key, event, decision: null });
-          await this.indexIn(tx, record); records.set(key, record); new_events += 1;
+          await this.indexIn(tx, record.value, record.inserted); records.set(key, record.value); new_events += 1;
         }
       }
       const previous = journal.sources.find((state) => sameSource(state.source, batch.source));

@@ -15,6 +15,10 @@ checks succeed. Publication is limited to pushes and manual runs on `main` in
 `jessfraz/beep-boop`. Pull requests only read the public cache. Other refs do not
 publish.
 
+Qualify the final Git revision. Packaged checks include test fixtures, so
+concurrent test edits change the output even when production code is identical.
+Compare the release and Global Nix output paths before rollout.
+
 The existing read-only Cachix action installs the client without enabling
 post-build uploads. The final explicit `cachix push` receives only the immutable
 output from `nix build .#beep-boop`, uploading that package's runtime closure to

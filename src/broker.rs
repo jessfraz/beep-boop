@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use tokio::{
     io::{AsyncRead, AsyncWrite, BufReader},
     sync::{Mutex, mpsc, oneshot, watch},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use uuid::Uuid;
 
@@ -433,9 +433,47 @@ fn target(command: &HostCommand) -> Option<&str> {
     }
 }
 
+/// Durable migrations run before the first coordinator request can complete.
+/// Startup owns one bounded budget; connected-node metadata keeps its deadline.
+pub(crate) async fn initialize(runtime: &Runtime, bootstrap: CoordinatorBootstrap) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let host_ids = bootstrap
+        .node
+        .as_ref()
+        .map(|node| node.host_id.clone())
+        .into_iter()
+        .collect();
+    control_until(
+        runtime,
+        RuntimeCommand::ConfigureCoordinator { bootstrap },
+        deadline,
+    )
+    .await
+    .context("Coordinator initialization failed")?;
+    control_until(
+        runtime,
+        RuntimeCommand::SetConnectedNodes { host_ids },
+        deadline,
+    )
+    .await
+    .context("Coordinator initialization failed")
+}
+
 pub async fn control(runtime: &Runtime, command: RuntimeCommand) -> Result<()> {
-    let mut call = runtime.request(command).await?;
-    let result = timeout(Duration::from_secs(15), async {
+    control_until(runtime, command, Instant::now() + Duration::from_secs(15))
+        .await
+        .context("Coordinator metadata update failed")
+}
+
+async fn control_until(
+    runtime: &Runtime,
+    command: RuntimeCommand,
+    deadline: Instant,
+) -> Result<()> {
+    let mut call = timeout_at(deadline, runtime.request(command))
+        .await
+        .context("Coordinator control admission timed out")??;
+    let result = timeout_at(deadline, async {
         loop {
             match call
                 .events
@@ -453,7 +491,7 @@ pub async fn control(runtime: &Runtime, command: RuntimeCommand) -> Result<()> {
         }
     })
     .await
-    .context("Coordinator metadata update timed out");
+    .context("Coordinator control request timed out");
     runtime.detach(call.request_id).await;
     result?
 }

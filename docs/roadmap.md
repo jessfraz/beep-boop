@@ -37,7 +37,8 @@ recovery; [history](history.md) describes import and retrieval.
   indexing, lazy opens and late embedding replies.
 - [x] Partition retained task and source bodies in native Pi documents, with
   resumable migration, bounded read/write regressions and real SQL-plan and
-  growth benchmarks. Legacy records remain intact.
+  growth benchmarks. Legacy records remain intact. Initialization has its own
+  bounded budget and remains cancellable before listeners bind.
 - [x] Use narrow process results and validate native execution bindings before
   host effects while retaining process limits and cleanup ownership.
 - [x] Share Rust/Swift tool-merge traces across live, restored and sparse updates,
