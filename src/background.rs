@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
+    host::effects::{Admission, Capacity, HostEffects},
     jobs::{self, JobSchedule, OccurrencePlan, ScheduledJob, TimezoneId, UtcMillis},
     protocol::SourceState,
     sources::{SourceBatch, SourceCheckpoint, SourceConfig},
@@ -21,44 +22,48 @@ pub async fn run(
     let mut call = runtime
         .request(RuntimeCommand::RunBackground { settings })
         .await?;
-    let mut effects = tokio::task::JoinSet::new();
-    let mut cancellations = std::collections::HashMap::new();
+    let mut effects = HostEffects::new(Capacity::Unbounded);
     let result = async { loop {
         tokio::select! {
             event = call.events.recv() => match event.context("Background transport closed")? {
                 RuntimeEventKind::HostCall { call_id, command } => {
                     let broker = broker.clone();
-                    let (cancel, cancelled) = tokio::sync::watch::channel(false);
-                    ensure!(cancellations.insert(call_id.clone(), cancel).is_none(), "A background host call ID is already running");
-                    effects.spawn(async move { (call_id, broker.execute_cancelled(*command, cancelled).await) });
+                    if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
+                        broker.execute_cancelled(*command, cancelled).await
+                    })? {
+                        runtime.reply(call.request_id, reply.call_id, reply.result).await?;
+                    }
                 }
                 RuntimeEventKind::HostCancel { call_id } => {
-                    if let Some(cancel) = cancellations.get(&call_id) { let _ = cancel.send(true); }
+                    effects.cancel(&call_id);
                 }
                 RuntimeEventKind::Done => break Ok(()),
                 RuntimeEventKind::Failure { message, .. } => break Err(anyhow::anyhow!(message)),
                 _ => {}
             },
-            effect = effects.join_next(), if !effects.is_empty() => {
-                let (id, result) = effect.context("Background effect queue closed")??;
-                cancellations.remove(&id);
-                runtime.reply(call.request_id, id, result).await?;
+            effect = effects.next(), if !effects.is_empty() => {
+                let reply = effect?.context("Background effect queue closed")?;
+                runtime.reply(call.request_id, reply.call_id, reply.result).await?;
             }
             _ = runtime.stopped() => break Ok(()),
+            _ = runtime.stopping() => break Ok(()),
         }
     } }.await;
-    for cancel in cancellations.values() {
-        let _ = cancel.send(true);
-    }
-    // Processes must exit and external writes must return their real receipts
-    // before the background owner releases their executor.
-    while let Some(effect) = effects.join_next().await {
-        if let Ok((id, result)) = effect {
-            let _ = runtime.reply(call.request_id, id, result).await;
-        }
+    let mut draining = effects.shutdown();
+    let mut drained = Ok(());
+    while let Some(reply) = draining.next().await {
+        let delivery = match reply {
+            Ok(reply) => {
+                runtime
+                    .reply(call.request_id, reply.call_id, reply.result)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        drained = drained.and(delivery);
     }
     runtime.detach(call.request_id).await;
-    result
+    result.and(drained)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

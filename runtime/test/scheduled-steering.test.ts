@@ -41,7 +41,7 @@ async function open(directory: string) {
   environment.setConnected([binding.host_id]);
   const catalog = new ConversationCatalog(harness, histories, tasks), sources = new SourceJournal(harness, tasks);
   const services = { harness, tasks, histories, inference, environment, catalog, sources };
-  const views = new ConversationViews(async () => services, () => {});
+  const views = new ConversationViews(async () => services, () => () => {});
   return { ...services, storage, views };
 }
 function occurrence(id: string, cwd: string, model = DEFAULT_MODEL): ScheduledOccurrence {

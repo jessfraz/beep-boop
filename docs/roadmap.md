@@ -23,6 +23,13 @@ recovery; [history](history.md) describes import and retrieval.
   while another worker's host effect is held. Ready observers and workers do
   not consume startup capacity; the real bridge regression covers 64 observers,
   bounded initialization, replies at capacity, recovery and detach cleanup.
+- [x] Derive request lifecycle and valid controls from the Rust command type;
+  share host-effect ownership and the CLI's client context across transports.
+  Shutdown drains issued writes before releasing the runtime. Regression tests
+  cover worker interruption, read-only observers, effect capacity and receipts.
+- [x] Share bounded snapshot-to-live observation for main and saved chats,
+  preserving event order and suppressing publications throughout view cleanup.
+  Overflow reports recovery without retaining an unbounded history buffer.
 - [x] Test native outbox recovery against the production coordinator and Pi
   storage across reconnects and server restarts, without fake peers. CI runs
   the wire test on both platforms and the Swift client on macOS.

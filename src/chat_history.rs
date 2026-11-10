@@ -41,10 +41,12 @@ impl Job {
                 let mut seen: HashSet<String> = cursor.iter().cloned().collect();
                 loop {
                     let events = match exchange(
-                        &config,
-                        coordinator.as_deref(),
-                        &script,
-                        &directory,
+                        crate::ClientContext {
+                            config: &config,
+                            coordinator: coordinator.as_deref(),
+                            script: &script,
+                            directory: &directory,
+                        },
                         RuntimeCommand::ReadConversation {
                             conversation_id: conversation_id.clone(),
                             cursor: cursor.clone(),

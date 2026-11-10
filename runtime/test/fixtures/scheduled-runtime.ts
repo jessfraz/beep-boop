@@ -78,7 +78,7 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   }
   configureBackground();
   const catalog = new ConversationCatalog(session, histories, tasks);
-  const views = new ConversationViews(async () => ({ harness: session, tasks, sources, histories, inference, environment, catalog }), () => {});
+  const views = new ConversationViews(async () => ({ harness: session, tasks, sources, histories, inference, environment, catalog }), () => () => {});
   const close = async () => {
     views.close(); catalog.close();
     const detached = tasks.detachBackground();

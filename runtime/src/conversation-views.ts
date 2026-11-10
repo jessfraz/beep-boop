@@ -10,6 +10,7 @@ import { inspectMainWork, reconcileMainInput } from "./main_observation.js";
 import type { ConversationModels } from "./models.js";
 import { TaskError, type HostCall, type TaskStore } from "./tasks.js";
 import { activity } from "./transcript.js";
+import { Observation } from "./observation.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import type { SavedConversation } from "./generated/SavedConversation.js";
@@ -26,17 +27,22 @@ export interface ConversationServices {
   sources: SourceJournal;
 }
 type Emit = (event: RuntimeEventKind) => void;
-type View = { conversation_id: string; closed: boolean; finish(): void };
 
 /** Views observe Pi; inputs retain their owning task's execution mode. */
 export class ConversationViews {
-  private readonly views = new Map<number, View>();
+  private readonly views = new Map<number, Observation>();
   constructor(private readonly services: () => Promise<ConversationServices>,
-    private readonly attached: (request: number, conversation: Conversation) => void) {}
+    private readonly attached: (request: number, conversation: Conversation) => () => void) {}
 
   detach(id: number): void {
     const view = this.views.get(id);
-    if (view !== undefined) { view.closed = true; view.finish(); }
+    view?.close();
+  }
+  /** Route externally produced receipts through the same snapshot boundary. */
+  publish(id: number, event: RuntimeEventKind): boolean {
+    const view = this.views.get(id);
+    if (view === undefined) return false;
+    view.publish(event); return true;
   }
   close(): void { for (const id of this.views.keys()) this.detach(id); }
   private async summary(app: ConversationServices, id: string): Promise<SavedConversation> {
@@ -45,10 +51,8 @@ export class ConversationViews {
     return item;
   }
   async attach(id: number, conversation_id: string, emit: Emit, inputIds: readonly string[] = []): Promise<void> {
-    let finish = () => {};
-    const finished = new Promise<void>((resolve) => { finish = resolve; });
-    const view: View = { conversation_id, closed: false, finish }; this.views.set(id, view);
-    let stop: (() => Promise<void>) | undefined, stopSources: (() => Promise<void>) | undefined;
+    const view = new Observation(emit); this.views.set(id, view);
+    let stop: (() => Promise<void>) | undefined, stopSources: (() => Promise<void>) | undefined, release: (() => void) | undefined;
     try {
       const app = await this.services();
       if (view.closed) return;
@@ -58,31 +62,38 @@ export class ConversationViews {
       const model = await app.inference.peek(conversation, actor?.model ?? await app.environment.model(null));
       const native = await app.harness.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
       const imported = await app.histories.byConversation(conversation_id);
-      let ready = false; const buffered: RuntimeEventKind[] = [];
-      const publish = (event: RuntimeEventKind) => { if (!view.closed) { if (ready) emit(event); else buffered.push(event); } };
-      this.attached(id, conversation);
+      if (view.closed) return;
+      const publish = (event: RuntimeEventKind) => view.publish(event);
+      release = this.attached(id, conversation);
       let working = false;
       stop = await activity(app.harness, conversation, (activity) => publish({ type: "activity", activity }),
         (message) => publish({ type: "message", message }), undefined,
         { includeFinal: true, working(value) { working = value; publish({ type: "conversation_state", working }); } });
       if (view.closed) return;
-      emit({ type: "conversation_ready", conversation: summary, model,
+      view.snapshot({ type: "conversation_ready", conversation: summary, model,
         cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });
       const receiptWork = inputIds.length === 0 ? undefined : await inspectMainWork(app.harness, conversation);
       for (const input_id of inputIds) {
         if (view.closed) return;
-        for (const event of await reconcileMainInput(conversation, input_id, app.harness, receiptWork) ?? []) emit(event);
+        for (const event of await reconcileMainInput(conversation, input_id, app.harness, receiptWork) ?? []) view.snapshot(event);
       }
-      ready = true; for (const event of buffered) emit(event);
+      if (!view.open()) return;
       if (conversation.id === ROOT_CONVERSATION_ID) {
         stopSources = await app.sources.watchStates((sources) => publish({ type: "sources", sources }),
           () => publish({ type: "failure", code: "internal", message: "Integration status could not be read. Reconnect to check source coverage." }));
       }
-      await finished;
+      await view.finished;
     } finally {
-      if (this.views.get(id) === view) this.views.delete(id);
-      await stopSources?.();
-      await stop?.();
+      view.close();
+      // Release external receipt routing synchronously. Keep the closed gate
+      // until native subscriptions finish draining their pending publications.
+      try { release?.(); }
+      finally {
+        try {
+          try { await stopSources?.(); }
+          finally { await stop?.(); }
+        } finally { if (this.views.get(id) === view) this.views.delete(id); }
+      }
     }
   }
   private async host(app: ConversationServices, task: TaskRecord, threadId?: string, cwd = "/"): Promise<WorkerHost> {

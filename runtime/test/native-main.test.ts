@@ -12,6 +12,41 @@ import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 
+test("runtime EOF closes an attached native main observation", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-native-observation-eof-"));
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
+  const events: RuntimeEventKind[] = [];
+  let errors = "", ended = false, timer: NodeJS.Timeout | undefined, fail = (_error: Error) => {};
+  const deadline = new Promise<never>((_resolve, reject) => { fail = reject; });
+  const stop = () => { child.kill(); };
+  t.signal.addEventListener("abort", stop, { once: true });
+  child.stderr.setEncoding("utf8").on("data", (text: string) => { errors += text; });
+  const reader = (async () => {
+    for await (const line of protocolLines(child.stdout)) {
+      const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame)); events.push(frame.event);
+      if (frame.event.type !== "worker_idle" || ended) continue;
+      // End the owning transport with its real observer and source subscriptions
+      // still attached. No detach control or test-side kill completes the run.
+      ended = true; child.stdin.end();
+      timer = setTimeout(() => fail(new Error("EOF must close the attached observation and finish runtime shutdown")), 5_000);
+    }
+  })();
+  child.stdin.write(JSON.stringify({ version: 1, id: 1, command: { type: "observe_main", input_ids: [] } }) + "\n");
+  try {
+    const [code] = await Promise.race([Promise.all([closed, reader]), deadline]);
+    assert.equal(ended, true, "The native observation must reach its attached idle state before EOF");
+    assert.equal(code, 0, errors);
+    assert.equal(events.filter((event) => event.type === "done").length, 1, "EOF must finish the owned observation exactly once");
+    assert.equal(events.at(-1)?.type, "done");
+    assert.equal(events.some((event) => event.type === "failure" || event.type === "host_call"), false);
+  } finally {
+    clearTimeout(timer); t.signal.removeEventListener("abort", stop);
+    child.kill(); await closed; await reader.catch(() => {}); await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("native main observation survives idle, correlates notices, streams text and rejects stopped queued input on reconnect", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-main-")), queue = join(directory, "responses.json");
   await writeFile(queue, JSON.stringify({

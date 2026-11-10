@@ -17,6 +17,7 @@ import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
 import { ConversationCatalog } from "./catalog.js";
 import { ConversationViews } from "./conversation-views.js";
+import { Observation } from "./observation.js";
 import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
@@ -68,6 +69,14 @@ let activeLoginRequestId: number | undefined;
 // observer. Ready streams remain in `pending` for owned shutdown and controls.
 const admissions = new Set<number>();
 function emit(id: number, event: RuntimeEventKind): void {
+  if (event.type !== "done") {
+    const observer = mainObservers.get(id);
+    if (observer !== undefined) { observer.publish(event); return; }
+    if (conversationViews.publish(id, event)) return;
+  }
+  writeEvent(id, event);
+}
+function writeEvent(id: number, event: RuntimeEventKind): void {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
   if (event.type === "main_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
@@ -75,10 +84,10 @@ function emit(id: number, event: RuntimeEventKind): void {
   // closed event enum and must keep receiving their original canonical wire.
   if (event.type !== "text_delta" || mainObservers.has(id)) process.stdout.write(`${JSON.stringify(frame)}\n`);
   if (mainTurns.has(id)) {
-    for (const [observerId, observer] of mainObservers) {
+    for (const observer of mainObservers.values()) {
       const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
       if (["main_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
-        queueMainObserver(observerId, observer, update);
+        observer.publish(update);
       }
     }
   }
@@ -166,7 +175,7 @@ async function openApplication(): Promise<Application> {
     // A recovered generation can outlive its transport owner. Native main
     // observers still need its terminal receipts, exactly once per commit.
     if (conversationId === ROOT_CONVERSATION_ID.toString() && !mirroredToMain) {
-      for (const [id, observer] of mainObservers) queueMainObserver(id, observer, event);
+      for (const observer of mainObservers.values()) observer.publish(event);
     }
   });
   const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
@@ -235,7 +244,10 @@ function app(): ReturnType<typeof openApplication> { return application ??= open
 let mainQueue = Promise.resolve();
 const activeConversations = new Map<number, import("@earendil-works/pi-durable").Conversation>();
 const conversationViews = new ConversationViews(async () => ({ ...await app(), inference }),
-  (request, conversation) => activeConversations.set(request, conversation));
+  (request, conversation) => {
+    activeConversations.set(request, conversation);
+    return () => { if (activeConversations.get(request) === conversation) activeConversations.delete(request); };
+  });
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
@@ -265,17 +277,7 @@ async function retainMainInputs(harness: Harness, root: Conversation, turn: Main
 }
 const mainTurns = new Map<number, MainTurn>();
 const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
-type MainObserver = { buffer?: RuntimeEventKind[]; bytes: number; overflow: boolean; finish(): void };
-const mainObservers = new Map<number, MainObserver>();
-function queueMainObserver(id: number, observer: MainObserver, event: RuntimeEventKind): void {
-  if (observer.overflow) return;
-  if (observer.buffer === undefined) { emit(id, event); return; }
-  observer.bytes += Buffer.byteLength(JSON.stringify(event), "utf8");
-  if (observer.buffer.length >= 512 || observer.bytes > 4 * 1024 * 1024) {
-    observer.overflow = true; observer.finish(); return;
-  }
-  observer.buffer.push(event);
-}
+const mainObservers = new Map<number, Observation>();
 const inputControls = new Map<number, Set<Promise<void>>>();
 const ending = new Set<number>();
 
@@ -494,7 +496,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // A CLI can change settings while phones only observe the idle root.
           // The active main owner already mirrors to them; never publish twice.
           if (settings.conversation_id === ROOT_CONVERSATION_ID.toString() && !mainOwnerPublished) {
-            for (const [request, observer] of mainObservers) queueMainObserver(request, observer, update);
+            for (const observer of mainObservers.values()) observer.publish(update);
           }
         }
         emit(id, { type: "conversation_settings", settings }); break;
@@ -567,7 +569,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "conversations", ...await (await app()).catalog.list(command.query, command.cursor, command.limit) }); break;
       }
       case "attach_conversation": {
-        await conversationViews.attach(id, command.conversation_id, (event) => emit(id, event), command.input_ids ?? []); break;
+        await conversationViews.attach(id, command.conversation_id, (event) => writeEvent(id, event), command.input_ids ?? []); break;
       }
       case "conversation_input": {
         await conversationViews.input(command, (operation) => hostRequests.call(id, operation), (event) => emit(id, event)); break;
@@ -707,28 +709,29 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "feedback_ready", receipt, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) }); break;
       }
       case "observe_main": {
-        const application = await app();
-        const root = await application.harness.root(BACKGROUND_CONTEXT);
-        let finish = () => {};
-        const finished = new Promise<void>((resolve) => { finish = resolve; });
-        const observer: MainObserver = { buffer: [], bytes: 0, overflow: false, finish };
+        const observer = new Observation((event) => writeEvent(id, event));
         mainObservers.set(id, observer);
-        const stopNotices = await watchMainNotices(application.harness, root, (event) => queueMainObserver(id, observer, event));
+        let stopNotices: (() => void) | undefined;
         let stopSources: (() => Promise<void>) | undefined;
         try {
-          emit(id, { type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(),
+          const application = await app();
+          if (observer.closed) break;
+          const root = await application.harness.root(BACKGROUND_CONTEXT);
+          if (observer.closed) break;
+          stopNotices = await watchMainNotices(application.harness, root, (event) => observer.publish(event));
+          observer.snapshot({ type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
           // Page completion makes native clients ready, so receipts must precede it.
           const receiptWork = command.input_ids.length === 0 ? undefined : await inspectMainWork(application.harness, root);
           for (const input_id of command.input_ids) {
-            for (const event of await reconcileMainInput(root, input_id, application.harness, receiptWork) ?? []) emit(id, event);
+            if (observer.closed) break;
+            for (const event of await reconcileMainInput(root, input_id, application.harness, receiptWork) ?? []) observer.snapshot(event);
           }
-          for (const frame of await history(root, null, application.harness)) emit(id, frame);
-          if (observer.overflow) { failure(id, "internal", "Observation fell behind during history load. Reconnect to recover saved history."); break; }
-          for (const frame of observer.buffer ?? []) emit(id, frame);
-          delete observer.buffer;
-          stopSources = await application.sources.watchStates((sources) => emit(id, { type: "sources", sources }),
+          if (observer.closed) break;
+          for (const frame of await history(root, null, application.harness)) observer.snapshot(frame);
+          if (!observer.open()) break;
+          stopSources = await application.sources.watchStates((sources) => observer.publish({ type: "sources", sources }),
             () => failure(id, "internal", "Integration status could not be read. Reconnect to check source coverage."));
           // Native work outlives its transport owner. Publish a blocked run only
           // after history makes the observer ready, so it stays connected.
@@ -738,8 +741,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
             : work.recovery === "inspect_outcome" ? "Main conversation paused while owned work is parked. Inspect its prior outcome before retrying it."
               : "Main conversation paused. Worker/runtime update required before it can resume.");
           else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
-          await finished;
-        } finally { await stopSources?.(); stopNotices(); mainObservers.delete(id); }
+          await observer.finished;
+        } finally {
+          observer.close();
+          try { await stopSources?.(); }
+          finally { stopNotices?.(); mainObservers.delete(id); }
+        }
         break;
       }
       case "attach_main": {
@@ -917,7 +924,7 @@ try {
     }
     if (request.command.type === "detach_main") {
       mainViews.get(request.id)?.finish();
-      mainObservers.get(request.id)?.finish();
+      mainObservers.get(request.id)?.close();
       continue;
     }
     if (request.command.type === "detach_conversation") { conversationViews.detach(request.id); continue; }
@@ -966,6 +973,7 @@ try {
   if (backgroundOwner !== undefined) hostRequests.finish(backgroundOwner);
   stopBackground?.();
   conversationViews.close();
+  for (const observer of mainObservers.values()) observer.close();
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {

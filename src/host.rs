@@ -25,6 +25,8 @@ use crate::{
 
 pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
 
+pub mod effects;
+
 /// One service owns its history connection and warm embedding child.
 pub struct Executor {
     history: CodexHistory,

@@ -81,6 +81,14 @@ The supervisor reads Pi events while command writes are pending. One frame owns
 its write offset, and the bounded command queue provides backpressure. Shutdown
 has an independent signal so a saturated pipe cannot prevent cleanup.
 
+Rust derives request lifetime and supported controls once from the typed
+command. The CLI, service and runtime supervisor share that classification.
+Host effects have one owner for call identities, capacity, cancellation and
+completion. Process cancellation must finish cleanup; issued non-process
+effects retain ownership until their actual results arrive. Transport-specific
+disconnect behavior stays explicit instead of being inferred from separate
+flags in each connection loop.
+
 Workers connect to the coordinator and announce their actual Rex host ID, name,
 executable and local launch paths. Beep Boop reuses Rex's shared host inventory when
 available; each node can announce its own native Rex metadata even when that
@@ -136,6 +144,13 @@ bounded chunks over the existing authenticated connection, are verified by
 SHA-256, and are materialized on the selected execution host. Pi receives its
 native image content or a tool-readable file reference. History contains file
 metadata; the phone fetches preview bytes only when requested.
+
+Main and saved-conversation observations share a snapshot-to-live gate, bounded
+to 512 frames and 4 MiB while attaching. The gate owns buffering, delivery order,
+overflow and close; it releases buffered events after delivery or closure.
+Overflow ends that view with an explicit recovery error. Retained conversation
+history remains the recovery source, and transport errors do not become saved
+conversation messages.
 
 The MVP does not replicate the store or recover onto another host. If the
 coordinator is down, the client reports that it is unavailable. Copying a live

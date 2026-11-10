@@ -355,20 +355,32 @@ impl Broker {
         let generation = self.register(runtime, &node, calls, stop).await?;
         let mut pending: HashMap<String, oneshot::Sender<HostResult>> = HashMap::new();
         let mut cancellations = tokio::task::JoinSet::new();
+        let mut draining = false;
         let result: Result<()> = async {
             crate::service::write_frame(&mut writer, &RuntimeEventKind::WorkerReady { connection_id: generation.to_string() }).await?;
             loop {
+                if draining && pending.is_empty() && incoming.is_empty() { return Ok(()); }
                 tokio::select! {
                     changed = stopped.changed() => { let _ = changed; anyhow::bail!("A newer connection owns this node"); }
                     _ = runtime.stopped() => anyhow::bail!("Coordinator stopped"),
+                    _ = runtime.stopping(), if !draining => {
+                        // Existing effects still own their remote write receipts.
+                        incoming.close();
+                        draining = true;
+                    }
                     finished = cancellations.join_next(), if !cancellations.is_empty() => {
-                        if let Some(Ok((call_id, true))) = finished
-                            && pending.contains_key(&call_id) {
-                            crate::service::write_frame(&mut writer, &RuntimeEventKind::HostCancel { call_id }).await?;
+                        if let Some(Ok((call_id, cancelled))) = finished {
+                            if cancelled && pending.contains_key(&call_id) {
+                                crate::service::write_frame(&mut writer, &RuntimeEventKind::HostCancel { call_id }).await?;
+                            } else if pending.get(&call_id).is_some_and(oneshot::Sender::is_closed) {
+                                // A timed-out caller already received uncertainty.
+                                // Its abandoned reply cannot hold shutdown open.
+                                pending.remove(&call_id);
+                            }
                         }
                     }
-                    effect = incoming.recv() => {
-                        let Some(effect) = effect else { return Ok(()); };
+                    effect = incoming.recv(), if !draining || !incoming.is_empty() => {
+                        let Some(effect) = effect else { draining = true; continue; };
                         let call_id = Uuid::new_v4().to_string();
                         pending.insert(call_id.clone(), effect.reply);
                         let watched = call_id.clone();

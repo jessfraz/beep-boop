@@ -22,7 +22,9 @@ use tokio::{
 };
 
 mod diagnostics;
+pub mod lifecycle;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
+use crate::runtime::lifecycle::RequestLifecycle;
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -51,17 +53,20 @@ pub struct Runtime {
     actor: Option<JoinHandle<Result<()>>>,
     shutdown: watch::Sender<bool>,
     service_diagnostics: Mutex<Diagnostics>,
+    stopping: watch::Sender<bool>,
 }
 
 enum CommandMessage {
     Request {
         command: Box<RuntimeCommand>,
+        lifecycle: RequestLifecycle,
         admitted: oneshot::Sender<Result<RuntimeCall>>,
     },
     Reply {
         request_id: u32,
         call_id: String,
         result: HostResult,
+        delivered: oneshot::Sender<Result<()>>,
     },
     Detached(u32),
     OAuthCallback {
@@ -79,28 +84,11 @@ struct ActorControl {
     shutdown: watch::Receiver<bool>,
 }
 
-#[derive(Clone, Copy)]
-enum RuntimeView {
-    Main,
-    Conversation,
-}
-impl RuntimeView {
-    fn command(self) -> RuntimeCommand {
-        match self {
-            Self::Main => RuntimeCommand::DetachMain,
-            Self::Conversation => RuntimeCommand::DetachConversation,
-        }
-    }
-}
-
 struct Pending {
     events: Option<mpsc::Sender<RuntimeEventKind>>,
     host_calls: HashMap<String, HostTiming>,
     trace: Trace,
-    login: bool,
-    worker: bool,
-    view: Option<RuntimeView>,
-    interruptible: bool,
+    lifecycle: RequestLifecycle,
 }
 
 impl Runtime {
@@ -170,6 +158,7 @@ impl Runtime {
         let notifications = notices.clone();
         let diagnostics = Diagnostics::start(state);
         let service_diagnostics = Mutex::new(diagnostics.fork());
+        let (quiescing, _) = watch::channel(false);
         let actor = tokio::spawn(async move {
             let result = run_actor(
                 child,
@@ -194,29 +183,22 @@ impl Runtime {
             actor: Some(actor),
             shutdown,
             service_diagnostics,
+            stopping: quiescing,
         })
     }
 
     pub async fn request(&self, command: RuntimeCommand) -> Result<RuntimeCall> {
+        let lifecycle = RequestLifecycle::for_command(&command)
+            .context("Transport control commands do not create Pi requests")?;
         ensure!(
-            !matches!(
-                command,
-                RuntimeCommand::HostReply { .. }
-                    | RuntimeCommand::OAuthCallback { .. }
-                    | RuntimeCommand::Watch
-                    | RuntimeCommand::ConnectWorker { .. }
-                    | RuntimeCommand::WorkerInput { .. }
-                    | RuntimeCommand::SubmitInput { .. }
-                    | RuntimeCommand::DetachWorker
-                    | RuntimeCommand::DetachMain
-                    | RuntimeCommand::DetachConversation
-            ),
-            "Transport control commands do not create Pi requests"
+            !*self.stopping.borrow() || lifecycle.is_service_owned(),
+            "The coordinator is shutting down"
         );
         let (admitted, receiver) = oneshot::channel();
         self.commands
             .send(CommandMessage::Request {
                 command: Box::new(command),
+                lifecycle,
                 admitted,
             })
             .await
@@ -227,14 +209,19 @@ impl Runtime {
     }
 
     pub async fn reply(&self, request_id: u32, call_id: String, result: HostResult) -> Result<()> {
+        let (delivered, receiver) = oneshot::channel();
         self.commands
             .send(CommandMessage::Reply {
                 request_id,
                 call_id,
                 result,
+                delivered,
             })
             .await
-            .context("Pi runtime is closed")
+            .context("Pi runtime is closed")?;
+        receiver
+            .await
+            .context("Pi runtime closed before recording the host reply")?
     }
 
     pub async fn detach(&self, request_id: u32) {
@@ -279,6 +266,23 @@ impl Runtime {
             }
             if alive.changed().await.is_err() {
                 break;
+            }
+        }
+    }
+
+    /// Stop connection owners first, while Pi can still record effect receipts.
+    pub(crate) fn stop_requests(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    pub(crate) async fn stopping(&self) {
+        let mut stopping = self.stopping.subscribe();
+        loop {
+            if *stopping.borrow_and_update() {
+                return;
+            }
+            if stopping.changed().await.is_err() {
+                return;
             }
         }
     }
@@ -337,6 +341,9 @@ enum WriteCompletion {
     },
     Control,
     Effect,
+    HostReply {
+        delivered: oneshot::Sender<Result<()>>,
+    },
 }
 struct PendingWrite {
     id: u32,
@@ -390,11 +397,8 @@ fn disconnected_write(
     diagnostics: &mut Diagnostics,
 ) -> Result<Option<PendingWrite>> {
     for (id, call) in pending.iter_mut().filter(|(_, call)| call.events.is_none()) {
-        let command = if call.worker {
-            call.worker = false;
-            RuntimeCommand::DetachWorker
-        } else if let Some(view) = call.view.take() {
-            view.command()
+        let command = if let Some(command) = call.lifecycle.detach() {
+            command
         } else if let Some(call_id) = call.host_calls.keys().next().cloned() {
             let result = HostResult::Failed {
                 message: "The execution client disconnected; no command ran on a fallback host."
@@ -459,14 +463,19 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     frame.offset += count;
                     if frame.offset == frame.bytes.len() {
                         let frame = outgoing.take().context("Completed Pi command is unavailable")?;
-                        if !matches!(frame.completion, WriteCompletion::Effect)
+                        if !matches!(frame.completion, WriteCompletion::Effect | WriteCompletion::HostReply { .. })
                             && let Some(command) = frame.kind {
                             diagnostics.record(frame.id, &frame.trace, DiagnosticEvent::CommandSent { command });
                         }
-                        if let WriteCompletion::Admission { admitted, call } = frame.completion
-                            && admitted.send(Ok(call)).is_err()
-                            && let Some(call) = pending.get_mut(&frame.id) {
-                            reject_host_calls(frame.id, call, &mut diagnostics);
+                        match frame.completion {
+                            WriteCompletion::Admission { admitted, call } => {
+                                if admitted.send(Ok(call)).is_err()
+                                    && let Some(call) = pending.get_mut(&frame.id) {
+                                    reject_host_calls(frame.id, call, &mut diagnostics);
+                                }
+                            }
+                            WriteCompletion::HostReply { delivered } => { let _ = delivered.send(Ok(())); }
+                            _ => {}
                         }
                     }
                 },
@@ -484,16 +493,8 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                     }
                 },
                 message = commands.recv(), if outgoing.is_none() => match message {
-                    Some(CommandMessage::Request { command, admitted }) => {
+                    Some(CommandMessage::Request { command, lifecycle, admitted }) => {
                         let command = *command;
-                        let login = matches!(command, RuntimeCommand::Login);
-                        let worker = matches!(command, RuntimeCommand::RunTask { interactive: Some(true), .. });
-                        let view = match command {
-                            RuntimeCommand::AttachMain | RuntimeCommand::ObserveMain { .. } => Some(RuntimeView::Main),
-                            RuntimeCommand::AttachConversation { .. } => Some(RuntimeView::Conversation),
-                            _ => None,
-                        };
-                        let interruptible = worker || view.is_some() || matches!(command, RuntimeCommand::Chat { .. });
                         let id = next_id;
                         next_id = id.checked_add(1).context("Runtime request IDs exhausted")?;
                         let (sender, events) = mpsc::channel(64);
@@ -502,14 +503,16 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         if let Some(event) = trace.input(&command) { diagnostics.record(id, &trace, event); }
                         outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id, command }, trace.clone(),
                             WriteCompletion::Admission { admitted, call: RuntimeCall { request_id: id, events } })?);
-                        pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, login, worker, view, interruptible });
+                        pending.insert(id, Pending { events: Some(sender), host_calls: HashMap::new(), trace, lifecycle });
                     }
-                    Some(CommandMessage::Reply { request_id, call_id, result }) => {
+                    Some(CommandMessage::Reply { request_id, call_id, result, delivered }) => {
                         if let Some(call) = pending.get_mut(&request_id)
                             && let Some(timing) = call.host_calls.remove(&call_id) {
                             diagnostics.record(request_id, &call.trace, timing.reply(&call_id, &result));
                             outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
-                                command: RuntimeCommand::HostReply { call_id, result } }, call.trace.clone(), WriteCompletion::Effect)?);
+                                command: RuntimeCommand::HostReply { call_id, result } }, call.trace.clone(), WriteCompletion::HostReply { delivered })?);
+                        } else {
+                            let _ = delivered.send(Err(anyhow::anyhow!("The host reply no longer has an active request")));
                         }
                     }
                     Some(CommandMessage::Detached(id)) => {
@@ -518,7 +521,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         }
                     }
                     Some(CommandMessage::OAuthCallback { request_id, target }) => {
-                        if let Some(call) = pending.get(&request_id).filter(|request| request.login) {
+                        if let Some(call) = pending.get(&request_id).filter(|request| request.lifecycle == RequestLifecycle::Login) {
                             outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
                                 command: RuntimeCommand::OAuthCallback { target } }, call.trace.clone(), WriteCompletion::Effect)?);
                         }
@@ -528,8 +531,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
                         let unowned = Trace::unowned();
                         let trace = request.map_or(&unowned, |request| &request.trace);
                         if let Some(event) = trace.input(&command) { diagnostics.record(request_id, trace, event); }
-                        if request.is_some_and(|request| request.events.is_some() && (request.worker || (request.interruptible && matches!(*command,
-                                RuntimeCommand::Interrupt | RuntimeCommand::SubmitInput { .. })))) {
+                        if request.is_some_and(|request| request.events.is_some() && request.lifecycle.allows(&command)) {
                             outgoing = Some(PendingWrite::new(RuntimeRequest { version: PROTOCOL_VERSION, id: request_id,
                                 command: *command }, trace.clone(), WriteCompletion::Control)?);
                         } else { diagnostics.record(request_id, trace, DiagnosticEvent::ControlIgnored); }
@@ -934,6 +936,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         runtime
             .commands
             .send(CommandMessage::Request {
+                lifecycle: crate::runtime::lifecycle::RequestLifecycle::Chat,
                 command: Box::new(RuntimeCommand::Chat {
                     origin: None,
                     attachments: None,
@@ -970,6 +973,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
                 runtime
                     .commands
                     .try_send(CommandMessage::Request {
+                        lifecycle: crate::runtime::lifecycle::RequestLifecycle::Once,
                         command: Box::new(RuntimeCommand::Status),
                         admitted
                     })

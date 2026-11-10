@@ -1,17 +1,18 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     future::{Future, pending},
     io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use crate::{
     broker::Broker,
-    protocol::{CoordinatorBootstrap, HostCommand, RuntimeCommand, RuntimeEventKind},
+    host::effects::{Admission, Capacity, HostEffects},
+    protocol::{CoordinatorBootstrap, RuntimeCommand, RuntimeEventKind},
+    runtime::lifecycle::RequestLifecycle,
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -19,7 +20,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     task::JoinSet,
-    time::timeout,
 };
 
 use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
@@ -259,15 +259,10 @@ async fn serve_with_transport(
     };
     drop(listener);
     drop(tailnet);
-    // Allow terminal results to flush, then release idle client ownership.
-    let _ = timeout(Duration::from_secs(1), async {
-        while clients.join_next().await.is_some() {}
-    })
-    .await;
-    clients.abort_all();
+    // Stop admission while Pi remains alive to persist real effect receipts.
+    owner.stop_requests();
     while clients.join_next().await.is_some() {}
     if let Some(task) = background {
-        task.abort();
         let _ = task.await;
     }
     let runtime = Arc::try_unwrap(owner)
@@ -289,6 +284,17 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     Ok(())
 }
 
+async fn write_client_frame<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    runtime: &Runtime,
+) -> Result<()> {
+    tokio::select! {
+        result = write_frame(writer, value) => result,
+        _ = runtime.stopping() => anyhow::bail!("The coordinator is shutting down"),
+    }
+}
+
 async fn authenticated(
     stream: tokio::net::TcpStream,
     runtime: Arc<Runtime>,
@@ -296,7 +302,11 @@ async fn authenticated(
     peer: std::net::SocketAddr,
     authorization: impl Future<Output = Result<()>>,
 ) -> Result<()> {
-    if let Err(error) = authorization.await {
+    let authorization = tokio::select! {
+        result = authorization => result,
+        _ = runtime.stopping() => return Ok(()),
+    };
+    if let Err(error) = authorization {
         runtime.record_peer_rejected(peer, &error.to_string());
         return Err(error);
     }
@@ -311,10 +321,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = FrameReader::new(BufReader::new(reader));
-    let initial = reader
-        .next_frame()
-        .await?
-        .context("Client sent no command")?;
+    let initial = tokio::select! {
+        frame = reader.next_frame() => frame?.context("Client sent no command")?,
+        _ = runtime.stopping() => return Ok(()),
+    };
     let mut command: RuntimeCommand =
         serde_json::from_slice(&initial).context("Client sent an invalid command")?;
     let attachment = match &command {
@@ -336,10 +346,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 let done = matches!(event, RuntimeEventKind::Done);
                 if native {
                     if let Some(event) = crate::native::project(&event) {
-                        write_frame(&mut writer, &event).await?;
+                        write_client_frame(&mut writer, &event, &runtime).await?;
                     }
                 } else {
-                    write_frame(&mut writer, &event).await?;
+                    write_client_frame(&mut writer, &event, &runtime).await?;
                 }
                 if done {
                     completed = true;
@@ -347,10 +357,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             anyhow::ensure!(completed, "Attachment transfer ended without completion");
-            let Some(frame) =
-                tokio::time::timeout(std::time::Duration::from_secs(60), reader.next_frame())
-                    .await??
-            else {
+            let Some(frame) = (tokio::select! {
+                frame = tokio::time::timeout(std::time::Duration::from_secs(60), reader.next_frame()) => frame??,
+                _ = runtime.stopping() => return Ok(()),
+            }) else {
                 return Ok(());
             };
             request = match serde_json::from_slice::<RuntimeCommand>(&frame)? {
@@ -387,39 +397,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             }) {
                 crate::native::Operation::Runtime(command) => *command,
                 crate::native::Operation::Local(event) => {
-                    write_frame(&mut writer, &event).await?;
-                    write_frame(&mut writer, &crate::native::NativeEvent::Done).await?;
+                    write_client_frame(&mut writer, &event, &runtime).await?;
+                    write_client_frame(&mut writer, &crate::native::NativeEvent::Done, &runtime)
+                        .await?;
                     return Ok(());
                 }
             }
         }
         command => command,
     };
-    let login = matches!(command, RuntimeCommand::Login);
-    ensure!(
-        !matches!(
-            command,
-            RuntimeCommand::Interrupt
-                | RuntimeCommand::DetachMain
-                | RuntimeCommand::DetachConversation
-                | RuntimeCommand::SubmitInput { .. }
-                | RuntimeCommand::WorkerInput { .. }
-                | RuntimeCommand::DetachWorker
-                | RuntimeCommand::HostReply { .. }
-                | RuntimeCommand::OAuthCallback { .. }
-        ),
-        "Control commands require their active chat or login connection"
-    );
-    ensure!(
-        !matches!(
-            command,
-            RuntimeCommand::ConfigureCoordinator { .. }
-                | RuntimeCommand::RunBackground { .. }
-                | RuntimeCommand::RegisterNode { .. }
-                | RuntimeCommand::SetConnectedNodes { .. }
-        ),
-        "Coordinator metadata is owned by its local service"
-    );
     if let RuntimeCommand::ConnectWorker { node } = command {
         return broker.worker(reader, writer, &runtime, node).await;
     }
@@ -428,10 +414,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             tokio::select! {
                 notice = notices.recv() => match notice {
-                    Ok(notice) => write_frame(&mut writer, &notice.event).await?,
+                    Ok(notice) => write_client_frame(&mut writer, &notice.event, &runtime).await?,
                     Err(_) => anyhow::bail!("Live updates were interrupted; saved task updates remain available"),
                 },
                 _ = runtime.stopped() => anyhow::bail!("Coordinator stopped; saved updates remain available"),
+                _ = runtime.stopping() => return Ok(()),
                 input = reader.next_frame() => {
                     ensure!(input?.is_none(), "A live-update subscriber cannot submit another command");
                     return Ok(());
@@ -439,27 +426,19 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-    let attached = matches!(command, RuntimeCommand::RunTask { .. });
-    let main_view = matches!(
-        command,
-        RuntimeCommand::AttachMain
-            | RuntimeCommand::ObserveMain { .. }
-            | RuntimeCommand::AttachConversation { .. }
+    let lifecycle = RequestLifecycle::for_command(&command)
+        .context("Control commands require their active chat or login connection")?;
+    ensure!(
+        !lifecycle.is_service_owned(),
+        "Coordinator metadata is owned by its local service"
     );
-    let interruptible = attached || main_view || matches!(command, RuntimeCommand::Chat { .. });
-    let interactive = matches!(
-        command,
-        RuntimeCommand::RunTask {
-            interactive: Some(true),
-            ..
-        }
-    );
-    if native && main_view {
-        write_frame(
+    if native && lifecycle.is_view() {
+        write_client_frame(
             &mut writer,
             &crate::native::NativeEvent::Commands {
                 commands: crate::native::commands(),
             },
+            &runtime,
         )
         .await?;
     }
@@ -467,25 +446,26 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let mut input_closed = false;
     let mut output_closed = false;
     let mut host_calls = HashSet::new();
-    let mut effects = JoinSet::new();
-    let mut cancellations: HashMap<String, tokio::sync::watch::Sender<bool>> = HashMap::new();
+    let mut effects = HostEffects::new(Capacity::Unbounded);
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                completed = effects.join_next(), if !effects.is_empty() => {
-                    let (call_id, result) = completed.context("Owned effect queue closed")??;
-                    cancellations.remove(&call_id);
-                    runtime.reply(call.request_id, call_id, result).await?;
+                completed = effects.next(), if !effects.is_empty() => {
+                    let reply = completed?.context("Owned effect queue closed")?;
+                    runtime.reply(call.request_id, reply.call_id, reply.result).await?;
                 }
+                _ = runtime.stopping() => return Ok(()),
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
                         // The named node service owns browser connections and capability checks.
-                        if !attached || matches!(**command, HostCommand::Browser { .. } | HostCommand::OnNode { .. } | HostCommand::ReadContext { .. } | HostCommand::SearchContext { .. } | HostCommand::ReloadGuidance | HostCommand::Embed { .. }) {
-                            let (cancel, cancelled) = tokio::sync::watch::channel(false);
-                            cancellations.insert(call_id.clone(), cancel);
+                        if !lifecycle.delegates_host_call(command) {
                             let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
-                            effects.spawn(async move { (call_id, broker.execute_cancelled(command, cancelled).await) });
+                            if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
+                                broker.execute_cancelled(command, cancelled).await
+                            })? {
+                                runtime.reply(call.request_id, reply.call_id, reply.result).await?;
+                            }
                             continue;
                         }
                         if input_closed {
@@ -495,8 +475,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         host_calls.insert(call_id.clone());
                     }
                     if let RuntimeEventKind::HostCancel { call_id } = &event
-                        && let Some(cancel) = cancellations.get(call_id) {
-                        let _ = cancel.send(true);
+                        && effects.cancel(call_id) {
                         continue;
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
@@ -505,12 +484,12 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     let written = if native {
                         match crate::native::project(&event) {
-                            Some(event) if !output_closed => write_frame(&mut writer, &event).await,
+                            Some(event) if !output_closed => write_client_frame(&mut writer, &event, &runtime).await,
                             _ => Ok(()),
                         }
-                    } else if !output_closed { write_frame(&mut writer, &event).await } else { Ok(()) };
+                    } else if !output_closed { write_client_frame(&mut writer, &event, &runtime).await } else { Ok(()) };
                     if let Err(error) = written {
-                        if attached || main_view { return Err(error); }
+                        if lifecycle.is_worker() || lifecycle.is_view() { return Err(error); }
                         input_closed = true;
                         output_closed = true;
                     }
@@ -519,7 +498,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 frame = reader.next_frame(), if !input_closed => {
                     let bytes = match frame {
                         Ok(bytes) => bytes,
-                        Err(_) if !attached && !main_view => {
+                        Err(_) if !lifecycle.is_worker() && !lifecycle.is_view() => {
                             // A dropped CLI does not revoke work it already
                             // admitted. Keep the effect owner alive through its
                             // real result, as with EOF or a failed output write.
@@ -530,9 +509,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         Err(error) => return Err(error),
                     };
                     let Some(bytes) = bytes else {
-                        if main_view { return Ok(()); }
+                        if lifecycle.is_view() { return Ok(()); }
                         input_closed = true;
-                        if interactive { runtime.worker_control(call.request_id, RuntimeCommand::DetachWorker).await?; }
+                        if lifecycle.allows(&RuntimeCommand::DetachWorker) {
+                            runtime.worker_control(call.request_id, lifecycle.disconnect_command().context("Missing worker detach control")?).await?;
+                        }
                         for call_id in host_calls.drain() {
                             runtime.reply(call.request_id, call_id, disconnected()).await?;
                         }
@@ -545,17 +526,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                             ensure!(host_calls.remove(&call_id), "Client replied to an unknown host call");
                             runtime.reply(call.request_id, call_id, result).await?;
                         }
-                        RuntimeCommand::Interrupt if interruptible => {
-                            runtime.worker_control(call.request_id, RuntimeCommand::Interrupt).await?;
-                        }
-                        command @ RuntimeCommand::SubmitInput { .. } if interactive || (!attached && interruptible) => {
-                            runtime.worker_control(call.request_id, command).await?;
-                        }
-                        RuntimeCommand::OAuthCallback { target } if login => {
-                            runtime.callback(call.request_id, target).await?;
-                        }
-                        command @ (RuntimeCommand::WorkerInput { .. } | RuntimeCommand::DetachWorker) if interactive => {
-                            runtime.worker_control(call.request_id, command).await?;
+                        command if lifecycle.allows(&command) => {
+                            match command {
+                                RuntimeCommand::OAuthCallback { target } => runtime.callback(call.request_id, target).await?,
+                                command => runtime.worker_control(call.request_id, command).await?,
+                            }
                         }
                         _ => anyhow::bail!("An active client may only reply to its host calls"),
                     }
@@ -563,16 +538,21 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }.await;
-    for cancel in cancellations.values() {
-        let _ = cancel.send(true);
-    }
-    while let Some(completed) = effects.join_next().await {
-        if let Ok((call_id, response)) = completed {
-            let _ = runtime.reply(call.request_id, call_id, response).await;
-        }
+    let mut draining = effects.shutdown();
+    let mut drained = Ok(());
+    while let Some(reply) = draining.next().await {
+        let delivery = match reply {
+            Ok(reply) => {
+                runtime
+                    .reply(call.request_id, reply.call_id, reply.result)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        drained = drained.and(delivery);
     }
     runtime.detach(call.request_id).await;
-    result
+    result.and(drained)
 }
 
 fn disconnected() -> crate::protocol::HostResult {
@@ -632,6 +612,7 @@ mod reset_tests;
 
 #[cfg(test)]
 mod tests {
+    mod ownership;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
     use crate::service::{

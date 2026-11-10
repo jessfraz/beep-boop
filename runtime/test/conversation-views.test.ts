@@ -10,6 +10,7 @@ import { AgentDoc, createRegistry, Harness, ROOT_CONVERSATION_ID } from "@earend
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { createInputOrigins } from "../src/input_origin.js";
+import { watchInputDelivery } from "../src/input_delivery.js";
 import { ConversationCatalog } from "../src/catalog.js";
 import { ConversationViews } from "../src/conversation-views.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
@@ -48,7 +49,7 @@ async function open(directory: string) {
   const catalog = new ConversationCatalog(harness, histories, tasks);
   const sources = new SourceJournal(harness, tasks);
   const services = { harness, tasks, histories, inference, environment, catalog, sources };
-  const views = new ConversationViews(async () => services, () => {});
+  const views = new ConversationViews(async () => services, () => () => {});
   return { ...services, views, faux, registry, async imported() {
     return (await histories.import({ host_id: binding.host_id, thread: { id: "original-source", title: "Saved hardware work", cwd: "/example/project",
       created_at: 1, updated_at: 2, version: "one", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
@@ -118,6 +119,90 @@ function input(conversation_id: string, input_id: string, text: string): Extract
   return { type: "conversation_input", conversation_id, input_id, input: text, mode: "steer" };
 }
 function local(command: HostCommand): HostCommand { while (command.type === "on_node") command = command.command; return command; }
+
+test("saved conversation observation bounds live events during receipt reconciliation", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-view-overflow-")), app = await open(directory);
+  let running: Promise<void> | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Observe saved work", outcome: "Read retained history", model: fixtureModel });
+    const conversation = await app.tasks.conversation(task.conversation_id), frames: RuntimeEventKind[] = [];
+    let publish: Promise<void> | undefined, started = () => {};
+    const publishing = new Promise<void>((resolve) => { started = resolve; });
+    running = app.views.attach(1, task.conversation_id, (event) => {
+      frames.push(event);
+      if (event.type !== "conversation_ready") return;
+      // The real commit is queued before reconciliation reads. Its native
+      // transcript events must stay bounded until those receipts are ready.
+      publish = conversation.commit(async (tx) => {
+        for (let index = 0; index < 513; index += 1) await tx.appendEntry(conversation.id, {
+          kind: "fixture.observation", model: [{ role: "user", content: `Live update ${index}`, timestamp: index }],
+        });
+      }, BACKGROUND_CONTEXT);
+      started();
+    }, ["not-yet-saved"]);
+    await publishing; await publish;
+    assert.equal(frames.filter((event) => event.type === "failure").length, 1,
+      "A saved view must close with one recovery failure when its live snapshot queue overflows");
+    await running;
+    assert.equal(frames.some((event) => event.type === "message"), false,
+      "Overflow must discard the buffered transcript rather than replay a partial snapshot");
+    const stopped = frames.length;
+    await conversation.commit((tx) => tx.appendEntry(conversation.id, { kind: "fixture.observation",
+      model: [{ role: "user", content: "Published after the observation closed", timestamp: 514 }] }), BACKGROUND_CONTEXT);
+    assert.equal(frames.length, stopped, "A closed observation must release its native subscriptions");
+    assert.equal(app.faux.state.callCount, 0);
+  } finally {
+    app.views.close(); await running?.catch(() => {}); app.catalog.close();
+    await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("detached views release receipt routing before awaiting native subscription cleanup", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-view-cleanup-routing-")), app = await open(directory);
+  let registered = false, releases = 0, releaseRead = () => {}, stopDelivery = () => {};
+  const views = new ConversationViews(async () => app, () => {
+    registered = true;
+    return () => { registered = false; releases += 1; };
+  });
+  let running: Promise<void> | undefined, admitting: ReturnType<SourceJournal["admit"]> | undefined;
+  try {
+    const root = await app.harness.root(BACKGROUND_CONTEXT), frames: RuntimeEventKind[] = [];
+    let ready = () => {}, entered = () => {}, holdRead = false;
+    const observed = new Promise<void>((resolve) => { ready = resolve; });
+    const reading = new Promise<void>((resolve) => { entered = resolve; });
+    const held = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const states = app.sources.states.bind(app.sources);
+    // Hold a real source read so watchStates' native disposer must await its
+    // outstanding publication while a separate durable input commits.
+    app.sources.states = async () => {
+      const value = await states();
+      if (holdRead) { entered(); await held; }
+      return value;
+    };
+    running = views.attach(1, root.id.toString(), (event) => { frames.push(event); if (event.type === "sources") ready(); });
+    await observed; assert.equal(registered, true);
+    holdRead = true;
+    admitting = app.sources.admit({ source: { provider: "google", account: "google.fixture" }, events: [], checkpoint: null,
+      coverage: { status: "complete" } }, null);
+    await reading;
+    views.detach(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(registered, false, "Detach must release the bridge's receipt registration before async cleanup");
+    assert.equal(releases, 1);
+    const routes: boolean[] = [], stopped = frames.length;
+    stopDelivery = watchInputDelivery(app.harness, (_conversation, event) => { routes.push(views.publish(1, event)); });
+    await root.commit((tx) => tx.createSubmission({ type: "input", conversationId: root.id,
+      requestId: "during-cleanup", status: "unanswered", reason: "aborted" }), BACKGROUND_CONTEXT);
+    assert.deepEqual(routes, [true], "The closed gate must retain routing ownership throughout subscription cleanup");
+    assert.equal(frames.length, stopped, "A native submission during cleanup must not escape the closed gate");
+    releaseRead(); await admitting; await running;
+    assert.equal(releases, 1);
+    assert.equal(views.publish(1, { type: "worker_idle" }), false, "Completed cleanup must release the gate without tombstones");
+  } finally {
+    releaseRead(); views.close(); await admitting?.catch(() => {}); await running?.catch(() => {}); stopDelivery(); app.catalog.close();
+    await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("opening a known conversation never inventories unrelated saved history", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-direct-conversation-view-")); let app = await open(directory);
