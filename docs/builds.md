@@ -10,6 +10,10 @@ uses `make check-prepared` to run that same verification recipe. This target
 requires an already prepared runtime. Packaged Rust checks and the native Codex
 and embedding checks still run on Linux and macOS.
 
+Successful qualification saves compiler and dependency caches before package
+publication, so publishing failures preserve useful build work. Restore and
+save share one path definition and the resolved primary cache key.
+
 Each matrix runner publishes only after all its qualification and package smoke
 checks succeed. Publication is limited to pushes and manual runs on `main` in
 `jessfraz/beep-boop`. Pull requests only read the public cache. Other refs do not

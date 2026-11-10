@@ -47,7 +47,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Share Rust/Swift tool-merge traces across live, restored and sparse updates,
   preserving known names, terminal states and retained output.
 - [x] Prepare the runtime once in CI and gate signed-cache publication on
-  qualified package closures from trusted main runs.
+  qualified package closures from trusted main runs. Preserve qualified compiler
+  caches across publishing failures.
 - [x] Share bounded snapshot-to-live observation for main and saved chats,
   preserving event order and suppressing publications throughout view cleanup.
   Overflow reports recovery without retaining an unbounded history buffer.
