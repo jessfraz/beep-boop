@@ -52,12 +52,13 @@ seed its synthetic retained data in `runtime/test/fixtures/performance.ts`.
 The paired sampling and regression gate apply to every enum variant. Keep
 conversation text synthetic and test the real path the scenario is measuring.
 
-The same job measures native search and cached indexing against 16,384
+The same job measures native search and cached indexing against 65,536
 file-backed chunks with 1,024-dimensional synthetic vectors. Dense retrieval,
 full-text retrieval with hydration, and vector-cache reuse have separate paired
-measurements. Seeding and inference stay outside the clock; each sample checks
-ranking, hydrated text and provenance against the other revision. Query samples
-contain eight lookups; cached-index samples contain four updates. The same
+measurements. Seeding, candidate preparation and inference stay outside the
+clock; each sample checks the returned rankings, hydrated text and provenance
+against the other revision. Query samples contain eight lookups; cached-index
+samples contain four updates. The same
 paired-budget gate applies. Both reports use schema 2 and retain the raw
 medians alongside the paired budget score. Native results are in
 `performance/search.json` and JSONL.
@@ -84,9 +85,33 @@ under ongoing background work, not CI thresholds.
 
 Explicit keyword mode still runs dense retrieval for tie-breaking and fallback.
 Automatic chat context uses keyword-only retrieval on its separate reader, so
-it does not wait for that scan. Improving full-corpus semantic latency remains
-open; the small paired CI corpus does not establish acceptable absolute latency
-at this size.
+it does not wait for that scan.
+
+Large projections now scan compact binary vectors for 4,096 candidates and
+rerank their original float vectors. The compact table is derived in bounded
+publisher transactions from retained embeddings; absent or incomplete tables
+retain exact retrieval. Smaller projections keep the contiguous exact scan,
+which outperformed scattered candidate hydration in the paired fixture.
+Candidate preparation starts at 32,768 chunks; retrieval switches at 4 GiB of
+published float vectors.
+
+Private qualification compared the complete reader against the exact reader on
+20 retained retrieval cases and representative queries at 1.35 million chunks.
+All returned rankings, hydrated matches, provenance and coverage were identical,
+including both hardware routing queries. The 20-case run measured median
+reader time of 8.0 seconds for exact scans and 2.9 seconds with candidates.
+A later hardware pair under heavier I/O measured 9.1–14.7 seconds exact versus
+4.8–5.8 seconds with candidates. Native process counters in a separate hardware
+pair measured 6.4–6.9 GB read for exact retrieval versus 1.1–1.7 GB with
+candidates. Query inference is outside these reader timings.
+
+Binary retrieval remains approximate; these cases establish measured recall,
+not a guarantee for every future query.
+The paired CI corpus exercises candidate preparation and publication while
+retaining exact retrieval at its smaller size. A bounded native regression
+also runs the production binary ranking and float reranking function against
+retained SQLite vectors, comparing separated semantic matches with exact
+search and checking original text, provenance and deletion.
 
 ## Source journal
 

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { deleteCandidates, hasCandidates, publishCandidates } from "./search-candidates.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
 
 export type StagedChunk = { entry_id: string; ordinal: number; part: number; hash: string; text: string; source_refs: string[]; embedding: Uint8Array };
@@ -34,10 +35,12 @@ export function mutatePublished(database: DatabaseSync, mutation: SearchMutation
         if (written.changes !== 1) throw new Error("Search source repeated an entry part");
       }
     } else if (mutation.type === "reset") {
-      database.exec("DELETE FROM conversations; DROP TABLE IF EXISTS chunk_vectors; DELETE FROM metadata WHERE key='space'");
+      database.exec("DELETE FROM conversations; DROP TABLE IF EXISTS chunk_vectors; DROP TABLE IF EXISTS chunk_candidates; DELETE FROM metadata WHERE key IN ('space','binary_candidates_v1')");
     } else {
       const { conversation_id } = mutation;
+      const candidates = hasCandidates(database);
       if (mutation.type === "delete") {
+        if (candidates) deleteCandidates(database, database.prepare("SELECT id FROM chunks WHERE conversation_id=?").iterate(conversation_id));
         if (mutation.vectors) database.prepare("DELETE FROM chunk_vectors WHERE rowid IN (SELECT id FROM chunks WHERE conversation_id=?)").run(conversation_id);
         database.prepare("DELETE FROM conversations WHERE id=?").run(conversation_id);
       } else {
@@ -47,6 +50,7 @@ export function mutatePublished(database: DatabaseSync, mutation: SearchMutation
         const obsolete = `SELECT c.id FROM chunks c WHERE c.conversation_id=? AND NOT EXISTS (
           SELECT 1 FROM staging s WHERE s.conversation_id=c.conversation_id AND s.run=?
           AND s.entry_id=c.entry_id AND s.part=c.part AND s.hash=c.hash)`;
+        if (candidates) deleteCandidates(database, database.prepare(obsolete).iterate(conversation_id, mutation.run));
         if (mutation.vectors) database.prepare(`DELETE FROM chunk_vectors WHERE rowid IN (${obsolete})`).run(conversation_id, mutation.run);
         database.prepare(`DELETE FROM chunks WHERE id IN (${obsolete})`).run(conversation_id, mutation.run);
         database.prepare(`INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
@@ -57,6 +61,7 @@ export function mutatePublished(database: DatabaseSync, mutation: SearchMutation
         if (mutation.vectors) database.prepare(`INSERT INTO chunk_vectors(rowid,embedding)
           SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
           WHERE s.conversation_id=? AND s.run=? AND NOT EXISTS (SELECT 1 FROM chunk_vectors v WHERE v.rowid=c.id)`).run(conversation_id, mutation.run);
+        if (candidates) publishCandidates(database, conversation_id, mutation.run);
         database.prepare(`DELETE FROM source_refs WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN staging s
           ON s.conversation_id=c.conversation_id AND s.entry_id=c.entry_id AND s.part=c.part
           WHERE c.conversation_id=? AND s.run=? AND c.source_refs<>s.source_refs)`).run(conversation_id, mutation.run);

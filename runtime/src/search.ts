@@ -9,6 +9,7 @@ import type { EmbeddingPurpose } from "./generated/EmbeddingPurpose.js";
 import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import { mutatePublished, type SearchMutation, type StagedChunk } from "./search-mutations.js";
+import { candidateRanks, useCandidates } from "./search-candidates.js";
 
 export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[]; gaps?: string[] };
 export type SearchWatermark = { conversation_id: string; watermark: string };
@@ -186,7 +187,12 @@ export class SearchIndex {
     }
     // After bootstrap this connection only reads. Every file-backed write has
     // one asynchronous owner, including small writes that could wait on its lock.
-    if (this.source !== undefined) this.db.exec("PRAGMA query_only=ON");
+    if (this.source !== undefined) {
+      this.db.exec("PRAGMA query_only=ON");
+      // Existing projections prepare their derived candidates off the caller's
+      // event loop. Readers keep the exact path until preparation commits.
+      if (this.space !== undefined) this.publisher = new IndexWorker("./search-publisher.js", this.source, "History publication");
+    }
   }
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
@@ -336,8 +342,9 @@ export function readPublished(db: DatabaseSync, input: PublishedSearch): SearchR
         if (saved === undefined || JSON.stringify(space(JSON.parse(string(saved, "value")))) !== JSON.stringify(space(input.space))) {
           throw new Error("Embedding space changed; rebuild the search index");
         }
-        dense = db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
-          .all(input.vector, take).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
+        const candidates = useCandidates(db, input.vector) ? candidateRanks(db, input.vector, take) : undefined;
+        dense = (candidates ?? db.prepare("SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance")
+          .all(input.vector, take)).map((row) => ({ id: number(row, "id"), value: number(row, "value") }));
       }
     } catch (error) { gaps.push(error instanceof Error ? error.message : "Semantic retrieval is unavailable"); }
     // One snapshot owns ranks, coverage, and rowids through hydration, including

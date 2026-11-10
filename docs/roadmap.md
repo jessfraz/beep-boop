@@ -151,9 +151,11 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Representative SQL plans and paired CI benchmarks for history loading,
   dense/FTS retrieval, hydration and cached indexing. See
   [performance checks](performance.md).
-- [ ] Reduce full-corpus semantic search latency. Live qualification at 1.35
-  million chunks measured a 12.8-second exact dense scan versus 112 ms for
-  keyword-only retrieval. Preserve recall and measure concurrent lookups.
+- [x] Reduce full-corpus semantic search latency with binary candidates and
+  exact float reranking. At 1.35 million chunks, 20 real retrieval cases retained
+  identical full results while median reader time fell from 8.0 to 2.9 seconds.
+  Preparation reuses retained vectors; exact retrieval remains available until
+  preparation completes. See [qualification limits](performance.md).
 - [x] Private retrieval evals: paraphrases, exact references, similar threads,
   rich older context versus sparse recent context, and incomplete coverage.
   Track recall, wrong-thread selection and latency.

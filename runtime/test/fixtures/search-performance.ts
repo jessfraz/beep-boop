@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -11,7 +13,7 @@ import { isMainThread, parentPort, Worker, workerData } from "node:worker_thread
 import type { EmbeddingSpace } from "../../src/generated/EmbeddingSpace.js";
 import type { Embed, SearchIndex, SearchRecord, SearchResult } from "../../src/search.js";
 
-const conversations = 64, entries = 256, dimensions = 1024;
+const conversations = 64, entries = 1024, dimensions = 1024;
 export enum Scenario { Dense = "dense", Keyword = "keyword", CachedIndex = "cached_index" }
 const scenarios = Object.values(Scenario);
 const relativeAllowance = 0.25, absoluteAllowanceMs = 20;
@@ -70,6 +72,15 @@ async function serve(): Promise<void> {
     await index.upsert(`conversation-${conversation}`, "seed", records(conversation), embed);
   }
   assert.equal(documents, conversations * entries);
+  const publication = new DatabaseSync(join(location.directory, "search.sqlite"), { readOnly: true });
+  try {
+    const state = () => publication.prepare("SELECT value FROM metadata WHERE key='binary_candidates_v1'").get()?.value;
+    if (state() !== undefined) {
+      const deadline = performance.now() + 30_000;
+      while (state() !== "ready" && performance.now() < deadline) await delay(20);
+      assert.equal(state(), "ready", "Timed queries require a complete derived candidate index");
+    }
+  } finally { publication.close(); }
   const seeded = { type: "ready", seeded_ms: performance.now() - started, document_vectors: documents } satisfies Reply;
   const query = async (scenario: "dense" | "keyword") => index.search(scenario === "dense" ? "roadworthiness" : "inspection",
     scenario === "dense" ? embed : undefined, [], 8, scenario === "dense" ? "semantic" : "keyword");

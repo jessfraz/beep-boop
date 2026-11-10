@@ -301,9 +301,18 @@ transfer remains separate. Reconcile uncertain effects before retrying.
 
 The index uses independent exact-reference, FTS and dense retrieval. An embedding
 failure still permits lexical results and reports the semantic coverage gap.
-`sqlite-vec` uses exact scans. Live qualification found slow dense retrieval at
-1.35 million chunks; see the [measurements](performance.md). Compare latency and
-recall before adding an approximate index or tuning the chunker.
+Large projections use a derived binary `sqlite-vec` index to select 4,096
+candidates, then rerank their original float vectors by cosine distance. Smaller
+projections keep the contiguous exact scan; the threshold is 4 GiB of
+published float vectors. Exact references, FTS, hydration and source coverage
+retain the same publication snapshot.
+
+The existing publisher prepares binary candidates from retained vectors in
+256-row transactions, beginning at 32,768 chunks. Preparation yields between
+batches, resumes its durable cursor after interruption, and performs no
+inference or source import. Readers retain exact retrieval until the derived
+index is complete. Publication, deletion and reset update both indexes
+atomically. See the [latency and recall measurements](performance.md).
 
 Verify idempotent reruns, fork/version preservation, interrupted import/index
 catch-up, offline asset reads, inert old tools and fenced Rex replacement.
