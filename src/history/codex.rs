@@ -4,7 +4,7 @@
 mod projection;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -36,6 +36,7 @@ use crate::{
 const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
+const INVENTORY_RPC_DEADLINE: Duration = Duration::from_secs(60);
 // Reader-semantic changes revisit source checkpoints without changing item identity.
 const RETENTION_REVISION: u32 = 2;
 // Leave room for base64 expansion and metadata within PAGE_BYTES.
@@ -97,41 +98,49 @@ impl CodexHistory {
     }
 
     async fn list(&self, archived: bool, cursor: Option<String>) -> Result<HistoryResponse> {
+        let position = cursor
+            .map(|cursor| serde_json::from_str::<ListCursor>(&cursor))
+            .transpose()
+            .context("Invalid Codex inventory cursor")?;
+        ensure!(
+            position
+                .as_ref()
+                .is_none_or(|position| position.archived == archived && !position.cursor.is_empty()),
+            "Codex inventory cursor belongs to another collection or is empty"
+        );
+        let repairing = position
+            .as_ref()
+            .is_none_or(|position| matches!(position.phase, ListPhase::Repair));
         let mut params = ListParams {
             archived,
-            cursor: cursor.clone(),
-            use_state_db_only: cursor.is_some(),
-            limit: 50,
+            cursor: position.map(|position| position.cursor),
+            use_state_db_only: !repairing,
+            limit: if repairing { 100 } else { 50 },
             sort_key: "created_at",
             sort_direction: "asc",
             source_kinds: SOURCES,
             model_providers: &[],
         };
-        if cursor.is_none() {
-            // A repair response warms only one filesystem page. Finish that
-            // sweep before paging state, whose cursors preserve timestamp ties.
-            let mut seen = HashSet::new();
-            loop {
-                let repaired: NativeList = self.rpc("thread/list", &params).await?;
-                let Some(next) = repaired.next_cursor else {
-                    break;
-                };
-                ensure!(
-                    !next.is_empty() && seen.insert(next.clone()),
-                    "Codex returned an invalid or repeated thread-repair cursor"
-                );
-                params.cursor = Some(next);
+        if repairing {
+            // Native repair re-scans the filesystem on every page and caps its
+            // batch at 100. Yield its cursor between host calls so a large but
+            // healthy sweep cannot exceed the outer transport deadline. Only
+            // publish state pages, whose cursors preserve timestamp ties.
+            let repaired: NativeList = self.rpc("thread/list", &params).await?;
+            if let Some(next_cursor) =
+                ListCursor::next(archived, ListPhase::Repair, repaired.next_cursor, &params)?
+            {
+                return bounded(HistoryResponse::List {
+                    threads: vec![],
+                    next_cursor: Some(next_cursor),
+                });
             }
             params.cursor = None;
             params.use_state_db_only = true;
+            params.limit = 50;
         }
-        let page: NativeList = self.rpc("thread/list", params).await?;
-        ensure!(
-            page.next_cursor
-                .as_ref()
-                .is_none_or(|next| !next.is_empty() && Some(next) != cursor.as_ref()),
-            "Codex repeated a thread-list cursor"
-        );
+        let page: NativeList = self.rpc("thread/list", &params).await?;
+        let next_cursor = ListCursor::next(archived, ListPhase::State, page.next_cursor, &params)?;
         let threads = page
             .data
             .into_iter()
@@ -139,7 +148,7 @@ impl CodexHistory {
             .collect::<Result<Vec<_>>>()?;
         bounded(HistoryResponse::List {
             threads,
-            next_cursor: page.next_cursor,
+            next_cursor,
         })
     }
 
@@ -1556,6 +1565,41 @@ struct ListParams {
     source_kinds: &'static [&'static str],
     model_providers: &'static [&'static str],
 }
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ListPhase {
+    Repair,
+    State,
+}
+#[derive(Deserialize, Serialize)]
+struct ListCursor {
+    archived: bool,
+    phase: ListPhase,
+    cursor: String,
+}
+impl ListCursor {
+    fn next(
+        archived: bool,
+        phase: ListPhase,
+        cursor: Option<String>,
+        params: &ListParams,
+    ) -> Result<Option<String>> {
+        cursor
+            .map(|cursor| {
+                ensure!(
+                    !cursor.is_empty() && Some(&cursor) != params.cursor.as_ref(),
+                    "Codex returned an invalid or repeated thread-list cursor"
+                );
+                serde_json::to_string(&Self {
+                    archived,
+                    phase,
+                    cursor,
+                })
+                .context("Could not encode Codex inventory cursor")
+            })
+            .transpose()
+    }
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadParams<'a> {
@@ -1724,10 +1768,14 @@ impl Connection {
             .checked_add(1)
             .context("Codex request IDs exhausted")?;
         self.reusable = false;
-        // Inventory normally returns in under a second. A wedged listing must
-        // yield a coverage gap and let other hosts continue; full history pages
-        // retain their longer budget. The caller adds the owning host context.
-        let deadline = Duration::from_secs(if method == "thread/list" { 30 } else { 900 });
+        // Repair pages scan the legacy filesystem even for a small result.
+        // Allow that work while bounding a wedged listing separately from full
+        // history reads. The caller adds the owning host context.
+        let deadline = if method == "thread/list" {
+            INVENTORY_RPC_DEADLINE
+        } else {
+            Duration::from_secs(900)
+        };
         let started = Instant::now();
         timeout(deadline, async {
             self.write(&RpcRequest { id, method, params }).await?;
@@ -2103,6 +2151,134 @@ try{
             serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(!legacy.source_exhausted);
         assert!(!legacy.complete);
+    }
+
+    #[tokio::test]
+    async fn healthy_inventory_repair_may_take_longer_than_thirty_seconds() {
+        #[derive(Deserialize)]
+        struct Call {
+            pid: u32,
+            method: String,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = fixture(directory.path(), &provider_fixture(vec![]));
+        std::fs::write(directory.path().join("block"), b"block").unwrap();
+        let control = async {
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls"))
+                        && let Some(call) = calls
+                            .lines()
+                            .map(|line| serde_json::from_str::<Call>(line).unwrap())
+                            .find(|call| call.method == "thread/list")
+                    {
+                        break call.pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            std::fs::remove_file(directory.path().join("block")).unwrap();
+            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
+        };
+        let (result, ()) = tokio::join!(source.list(false, None), control);
+        let HistoryResponse::List { threads, .. } = result
+            .expect("A healthy repair must survive the observed thirty-second filesystem scan")
+        else {
+            panic!("Expected repaired inventory");
+        };
+        assert_eq!(threads.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inventory_repair_yields_before_the_whole_catalog_finishes() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Thread {
+            id: String,
+            preview: &'static str,
+            cwd: &'static str,
+            created_at: i64,
+            updated_at: i64,
+            history_mode: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Inventory {
+            threads: Vec<Thread>,
+            turns: Vec<Value>,
+            paginate_threads: bool,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let native = serde_json::to_value(Inventory {
+            threads: (0..101)
+                .map(|n| Thread {
+                    id: format!("source-{n}"),
+                    preview: "Invented inventory evidence",
+                    cwd: "/example/project",
+                    created_at: 1,
+                    updated_at: 2,
+                    history_mode: "legacy",
+                })
+                .collect(),
+            turns: vec![],
+            paginate_threads: true,
+        })
+        .unwrap();
+        let source = fixture(directory.path(), &native);
+        std::fs::write(directory.path().join("block"), b"block").unwrap();
+        let HistoryResponse::List {
+            threads,
+            next_cursor,
+        } = tokio::time::timeout(Duration::from_secs(3), source.list(false, None))
+            .await
+            .expect("Each host call must yield after one repair page, not await the entire sweep")
+            .unwrap()
+        else {
+            panic!("Expected repair progress");
+        };
+        assert!(
+            threads.is_empty(),
+            "Only native state cursors preserve timestamp ties"
+        );
+        let cursor = next_cursor.expect("The repair cursor must survive the host reply");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("thread/list"))
+                .count(),
+            1
+        );
+        std::fs::remove_file(directory.path().join("block")).unwrap();
+        drop(source);
+        let source = fixture(directory.path(), &native);
+        assert!(source.list(true, Some(cursor.clone())).await.is_err());
+        let mut cursor = Some(cursor);
+        let mut ids = std::collections::BTreeSet::new();
+        loop {
+            let HistoryResponse::List {
+                threads,
+                next_cursor,
+            } = source.list(false, cursor).await.unwrap()
+            else {
+                panic!("Expected inventory continuation");
+            };
+            for thread in threads {
+                assert!(
+                    ids.insert(thread.id),
+                    "Repair must not duplicate inventory entries"
+                );
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids.len(), 101);
     }
 
     #[tokio::test]
@@ -2769,7 +2945,7 @@ try{
 
     #[tokio::test]
     async fn stalled_inventory_expires_without_shortening_full_history_reads() {
-        use crate::history::codex::{NativeRead, ReadParams};
+        use crate::history::codex::{INVENTORY_RPC_DEADLINE, NativeRead, ReadParams};
 
         #[derive(serde::Serialize)]
         struct Message {
@@ -2823,15 +2999,17 @@ try{
             .id()
             .unwrap();
         assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGSTOP) }, 0);
+        let resume_after = INVENTORY_RPC_DEADLINE + Duration::from_secs(1);
+        let observation_deadline = resume_after + Duration::from_secs(4);
         let listing = tokio::time::timeout(
-            Duration::from_secs(35),
+            observation_deadline,
             blocked.request(HistoryRequest::List {
                 archived: false,
                 cursor: None,
             }),
         );
         let full_read = tokio::time::timeout(
-            Duration::from_secs(35),
+            observation_deadline,
             reader.rpc::<_, NativeRead>(
                 "thread/read",
                 ReadParams {
@@ -2861,7 +3039,7 @@ try{
             // Stop the real fixture after it received the request, before its
             // delayed reply. Both child pipes remain open throughout the wait.
             assert_eq!(unsafe { libc::kill(blocked_pid as i32, libc::SIGSTOP) }, 0);
-            tokio::time::sleep(Duration::from_secs(31)).await;
+            tokio::time::sleep(resume_after).await;
             assert_eq!(unsafe { libc::kill(blocked_pid as i32, libc::SIGCONT) }, 0);
             assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGCONT) }, 0);
             blocked_pid
@@ -2871,7 +3049,12 @@ try{
             .expect("A blocked inventory must settle before the long history deadline")
             .expect_err("A stopped native child cannot confirm its inventory");
         assert!(error.to_string().contains("thread/list"), "{error:#}");
-        assert!(error.to_string().contains("30s"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{}s", INVENTORY_RPC_DEADLINE.as_secs())),
+            "{error:#}"
+        );
         assert!(error.to_string().contains("ms elapsed"), "{error:#}");
         let read = read.unwrap().unwrap();
         let retained: Original =
@@ -4211,22 +4394,27 @@ try{
         }
         async fn page(
             source: &CodexHistory,
-            cursor: Option<String>,
+            mut cursor: Option<String>,
         ) -> (Vec<crate::history::HistoryThread>, Option<String>) {
-            let HistoryResponse::List {
-                threads,
-                next_cursor,
-            } = source
-                .request(HistoryRequest::List {
-                    archived: false,
-                    cursor,
-                })
-                .await
-                .unwrap()
-            else {
-                panic!("Expected native inventory")
-            };
-            (threads, next_cursor)
+            loop {
+                let HistoryResponse::List {
+                    threads,
+                    next_cursor,
+                } = source
+                    .request(HistoryRequest::List {
+                        archived: false,
+                        cursor,
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!("Expected native inventory")
+                };
+                if !threads.is_empty() || next_cursor.is_none() {
+                    return (threads, next_cursor);
+                }
+                cursor = next_cursor;
+            }
         }
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4235,7 +4423,7 @@ try{
         )
         .unwrap();
         let mut expected = std::collections::BTreeSet::new();
-        for _ in 0..52 {
+        for _ in 0..102 {
             let id = uuid::Uuid::new_v4().to_string();
             rollout(directory.path(), &id, "2026-01-02T12:00:00Z");
             expected.insert(id);
@@ -4249,11 +4437,14 @@ try{
         let later = uuid::Uuid::new_v4().to_string();
         rollout(directory.path(), &later, "2026-01-03T12:00:00Z");
         let (rest, cursor) = page(&source, cursor).await;
+        assert_eq!(rest.len(), 50);
+        let (tail, cursor) = page(&source, cursor).await;
         assert!(cursor.is_none());
-        assert_eq!(rest.len(), 2, "Continuation must not repeat rollout repair");
+        assert_eq!(tail.len(), 2, "Continuation must not repeat rollout repair");
         let imported: std::collections::BTreeSet<_> = first
             .into_iter()
             .chain(rest)
+            .chain(tail)
             .map(|thread| thread.id)
             .collect();
         assert_eq!(imported, expected);

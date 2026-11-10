@@ -96,8 +96,12 @@ Use the installed Codex app-server's read-only APIs. Page `thread/list` for
 active and archived threads with `modelProviders: []` and every native
 `sourceKinds` value explicitly selected. Omitted filters select the configured
 provider and interactive sources. Each inventory walk repairs legacy metadata
-once, then pages native state with `useStateDbOnly` and its tie-safe cursors.
-The initial repair can still be slow; later pages avoid repeated rollout scans.
+in bounded native pages, yielding a repair cursor between host requests. Once
+the sweep ends, it pages native state with `useStateDbOnly` and its tie-safe
+cursors. Repair pages carry progress rather than partially repaired inventory;
+the complete state pass preserves threads with equal timestamps. Native list
+calls have a 60-second deadline, separate from transcript reads. A large repair
+can still be slow without holding one host request for the entire sweep.
 CI exercises this path with the Codex package from the locked Nixpkgs input.
 Read metadata with `thread/read`, then use
 full turn/item pagination where supported, or the installed full-history read.

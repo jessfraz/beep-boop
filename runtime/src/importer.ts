@@ -87,7 +87,7 @@ export class CodexImporter {
     return result.response;
   }
   private async walk(nodes: AgentNode[], online: string[], call: HostCall, index: () => Promise<void>): Promise<ImportProgress> {
-    const progress = initial(); await this.publish(progress);
+    const progress = initial(); progress.host_id = nodes[0]?.host_id ?? null; await this.publish(progress);
     // Retained text can index while source pages commit. Only finish records a
     // postwalk checkpoint, and this request retains both operations until drained.
     let indexingGap: string | undefined;
@@ -104,9 +104,11 @@ export class CodexImporter {
       await publish();
     };
     try {
-      for (const node of nodes) {
+      for (const [position, node] of nodes.entries()) {
         progress.host_id = node.host_id;
         if (!online.includes(node.host_id)) { addGap(progress, `${node.name}: host is offline`); continue; }
+        // First-host publication precedes indexing; keep source admission parallel.
+        if (position > 0) await publish();
         for (const archived of [false, true]) {
           let cursor: string | null = null; const cursors = new Set<string>();
           try {

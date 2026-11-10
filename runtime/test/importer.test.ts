@@ -70,6 +70,41 @@ async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   return { conversation, entries: entries.items.filter(ImportedItemEntry.is), all: entries.items };
 }
 
+test("host progress advances before waiting for the next host's paged inventory", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-import-host-progress-")), app = await open(directory);
+  const first = thread("first-host"), second = thread("second-host"), updates: ImportProgress[] = [];
+  let release = () => {}, entered = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  let pending: Promise<ImportProgress> | undefined;
+  try {
+    pending = app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [], native(async (host, request) => {
+      if (request.type === "list") {
+        if (request.archived) return { type: "list", threads: [], next_cursor: null };
+        if (host === coordinator.host_id) return { type: "list", threads: [first], next_cursor: null };
+        if (request.cursor === null) {
+          entered(); await gate;
+          return { type: "list", threads: [], next_cursor: "native-repair-finished" };
+        }
+        assert.equal(request.cursor, "native-repair-finished");
+        return { type: "list", threads: [second], next_cursor: null };
+      }
+      if (request.type !== "read") throw new Error("No media in this fixture");
+      return page(host === coordinator.host_id ? first : second, [item(request.thread_id)]);
+    }), (progress) => updates.push(progress), async () => {});
+    await waiting;
+    assert.equal((await app.importer.status()).host_id, laptop.host_id);
+    assert.equal(updates.at(-1)?.host_id, laptop.host_id);
+    assert.equal(updates.at(-1)?.threads_imported, 1, "Earlier committed work stays visible while discovery waits");
+    release();
+    const result = await pending;
+    assert.equal(result.phase, "complete");
+    assert.equal(result.threads_imported, 2);
+    assert.equal((await originals(app, first.id)).entries.length, 1);
+    assert.equal((await originals(app, second.id)).entries.length, 1);
+  } finally { release(); await pending?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("large thread progress publishes committed page counters before that thread finishes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-import-live-progress-")), app = await open(directory);
   const source = thread("large-thread");
