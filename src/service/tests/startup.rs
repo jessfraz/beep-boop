@@ -41,13 +41,15 @@ impl Starting {
             &script,
             format!(
                 r#"
-import {{writeFileSync}} from 'node:fs';
+import {{writeFileSync, renameSync}} from 'node:fs';
 import {{join}} from 'node:path';
 import {{pathToFileURL}} from 'node:url';
 const keepAlive = setInterval(() => {{}}, 1000);
 await new Promise(resolve => {{
   process.once('SIGUSR2', resolve);
-  writeFileSync(join(process.argv[2], 'held.pid'), String(process.pid));
+  const pid = join(process.argv[2], 'held.pid');
+  writeFileSync(pid + '.pending', String(process.pid));
+  renameSync(pid + '.pending', pid);
 }});
 clearInterval(keepAlive);
 await import(pathToFileURL({}).href);
