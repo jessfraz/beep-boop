@@ -430,6 +430,22 @@ fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
         })
 }
 
+fn task_message_sender() -> Result<Option<String>> {
+    let value = match env::var(agent_cli::host::ACTOR_CONVERSATION_ENV) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error).context("Invalid actor conversation identity"),
+    };
+    let id = value
+        .parse::<u64>()
+        .context("Actor conversation identity must be a canonical positive native ID")?;
+    ensure!(
+        id > 0 && id <= 9_007_199_254_740_991 && id.to_string() == value,
+        "Actor conversation identity must be a canonical positive native ID"
+    );
+    Ok(Some(value))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
@@ -705,13 +721,19 @@ async fn main() -> Result<()> {
                 input,
                 mode,
                 input_id,
-            } => RuntimeCommand::TaskInput {
-                origin: Some(agent_cli::protocol::InputOrigin::Cli),
-                task_id,
-                input_id: input_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
-                input,
-                mode,
-            },
+            } => {
+                let sender_conversation_id = task_message_sender()?;
+                RuntimeCommand::TaskInput {
+                    origin: sender_conversation_id
+                        .is_none()
+                        .then_some(agent_cli::protocol::InputOrigin::Cli),
+                    sender_conversation_id,
+                    task_id,
+                    input_id: input_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
+                    input,
+                    mode,
+                }
+            }
             TasksAction::Recover {
                 task_id,
                 allocation_id,

@@ -574,7 +574,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const task = await application.tasks.get(command.task_id);
         await conversationViews.input({ type: "conversation_input", conversation_id: task.conversation_id,
           input_id: command.input_id, input: command.input, mode: command.mode, ...(command.origin === undefined ? {} : { origin: command.origin }) },
-        (operation) => hostRequests.call(id, operation), (event) => emit(id, event));
+        (operation) => hostRequests.call(id, operation), (event) => emit(id, event),
+        command.sender_conversation_id === undefined ? undefined : await application.executions.sender(application.tasks, command.sender_conversation_id));
         break;
       }
       case "annotate_transcript": {

@@ -3635,6 +3635,12 @@
                 }
               ]
             },
+            "sender_conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "task_id": {
               "$ref": "#/$defs/TaskId"
             },

@@ -233,7 +233,8 @@ test("Pi receives native images and delegation keeps immutable files on each act
     await tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "Use attached evidence", model: fixtureModel, cwd: host.cwd }, () => () => {}, [], call("worker"));
     assert.ok(writes.includes("coordinator:" + file.id)); assert.ok(writes.includes("worker:" + file.id));
     const workerMessages = (await history(await tasks.conversation(task.conversation_id), null, session)).flatMap((frame) => frame.messages);
-    assert.ok(workerMessages.some((message) => message.role === "user" && message.text === "" && message.attachments?.length === 2));
+    assert.ok(workerMessages.some((message) => message.role === "notice" && message.text === "" && message.attachments?.length === 2 &&
+      message.presentation?.type === "agent_coordination" && message.presentation.sender_thread_id === root.id.toString()));
     const stopped = await tasks.create({ title: "Cancel during transfer", outcome: "Keep queued evidence", model: fixtureModel });
     await tasks.enqueue(stopped.id, "Stop before inference", randomUUID(), undefined, undefined, [file]);
     await tasks.dispatch(stopped.id, host, async () => ({ type: "spawned", binding }));

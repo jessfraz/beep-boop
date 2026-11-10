@@ -66,6 +66,7 @@ export function commandPresentation(program: string, args: readonly string[]): E
 function coordination(call: Pick<ToolCall, "name" | "arguments">): AgentAction | null | undefined {
   switch (call.name) {
     case "spawn_agent": return "spawn";
+    case "message_task": return "send_message";
     case "continue_agent": return field(call.arguments, "mode") === "follow_up" ? "followup" : "send_input";
     case "read_agents": return "list";
     case "wait_agents": return "wait";
@@ -117,7 +118,7 @@ function savedPresentation(result: ToolResultMessage): MessageContent | undefine
 /** The same receipt metadata is persisted by real tools and read by live/reopened views. */
 export function agentPresentation(call: Pick<ToolCall, "name" | "arguments">, sender: string, output: unknown, targetAgentId?: string): Extract<MessagePresentation, { type: "agent_coordination" }> {
   let agents: AgentStatePresentation[];
-  if (call.name === "delegate_task") agents = agentStates([output], false);
+  if (call.name === "delegate_task" || call.name === "message_task") agents = agentStates([output], false);
   else if (call.name === "spawn_agent" || call.name === "continue_agent") {
     const id = targetAgentId ?? field(call.arguments, "agent_id"), title = field(call.arguments, "title");
     const targets = list(field(output, "agents")).filter((agent) =>

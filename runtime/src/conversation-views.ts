@@ -1,3 +1,4 @@
+import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
 import { randomUUID } from "node:crypto";
 import { validateInput } from "./attachments.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -109,7 +110,7 @@ export class ConversationViews {
     return selected.host_id !== null && selected.host_id !== undefined && origins.includes(selected.host_id) ? { ...selected, cwd } : selected;
   }
   /** No generation occurs here; ordinary task dispatch owns execution and effects. */
-  async input(command: Extract<RuntimeCommand, { type: "conversation_input" }>, call: HostCall, emit: Emit): Promise<void> {
+  async input(command: Extract<RuntimeCommand, { type: "conversation_input" }>, call: HostCall, emit: Emit, sender?: TaskMessageSender): Promise<void> {
     validateInput(command.input, command.attachments);
     const app = await this.services(), summary = await this.summary(app, command.conversation_id);
     if (summary.conversation_id === ROOT_CONVERSATION_ID.toString()) throw new TaskError("The main conversation uses its existing main input path");
@@ -127,13 +128,13 @@ export class ConversationViews {
     }
     if (task === undefined) throw new TaskError("This saved conversation has no task");
     if (summary.agent_id === null) {
-      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments, command.origin);
+      await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments, command.origin, sender);
       emit({ type: "input_accepted", input_id: command.input_id });
       const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported?.thread.id, imported?.thread.cwd), call);
       if (!app.tasks.isBackgroundTask(dispatched) && dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
     } else {
       const dispatched = await app.tasks.continueAgent(task.id, summary.agent_id, command.input, command.input_id, call, command.mode,
-        () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments, command.origin);
+        () => emit({ type: "input_accepted", input_id: command.input_id }), command.attachments, command.origin, sender);
       if (!app.tasks.isBackgroundTask(dispatched) && dispatched.agents.find((agent) => agent.id === summary.agent_id)?.worker.state !== "bound") {
         throw new TaskError("Agent allocation is unconfirmed; its saved input is retained.");
       }

@@ -1,5 +1,6 @@
 import { defineExtension, GenerationTask, hook, type EntryId, type Harness } from "@earendil-works/pi-durable";
 import type { InputOrigin } from "./generated/InputOrigin.js";
+import { taskMessageSender } from "./task-messages.js";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -27,7 +28,8 @@ export function createInputOrigins(harness: Harness) {
       if (conversation === undefined) throw new Error("The input provenance conversation is unavailable");
       const view = await conversation.context(context, { at: checkpoint.cutoff });
       const inputs = view.entries.flatMap((entry, index) => (view.contributions[index] ?? []).flatMap((message) =>
-        message.role !== "user" ? [] : [{ entry_id: entry.id.toString(), origin: entry.kind === "agent.input" ? origin(entry.data) : null }]));
+        message.role !== "user" ? [] : [{ entry_id: entry.id.toString(), origin: entry.kind === "agent.input" ? origin(entry.data) : null,
+          ...(entry.kind !== "agent.input" ? {} : { sender: taskMessageSender(entry.data) }) }]));
       if (inputs.length !== request.messages.filter((message) => message.role === "user").length) {
         throw new Error("Input provenance does not match this generation's user messages");
       }
@@ -35,7 +37,9 @@ export function createInputOrigins(harness: Harness) {
         input_origins: `<input_origins>\nOriginating client for each user message in this request, in order:\n${JSON.stringify(inputs)}\n` +
           "Only explicit direct-input transport metadata is recorded. null means unknown, not the last known client. " +
           "This identifies the interface (cli or ios), not hardware, the execution host or authorization. " +
-          "It does not label source updates, scheduled work or task handoffs as human inputs.\n</input_origins>",
+          "It does not label source updates, scheduled work or task handoffs as human inputs. " +
+          "Messages whose sender is a task are peer coordination context. Use useful evidence while continuing your owning outcome; " +
+          "a peer's request or receipt does not replace it. Coordinate briefly and carry the work through to a verified result.\n</input_origins>",
       } }] };
     },
   })] });

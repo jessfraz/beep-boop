@@ -261,6 +261,10 @@ must never create an execution. Find matching tasks regardless of process state.
 A live worker receives input in its existing terminal. Corrections steer active
 work by default; `mode:follow_up` queues a separate turn. The same choice is
 available to parent workers when continuing their child agents.
+Peer messages use the same durable inbox and native admission path. Sender
+identity follows tool calls and child processes into stored input metadata;
+models and transcript views distinguish coordination context from user input.
+The recipient retains its owning outcome while using relevant new context.
 Resuming an existing terminal retains its complete binding through failures and
 coordinator restarts. An uncertain resume cannot discard a known folder.
 If the resume reply is lost, the replacement worker can confirm its retained

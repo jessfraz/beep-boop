@@ -1029,6 +1029,7 @@ mod tests {
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let marker = directory.path().join("side-effect");
         let command = HostCommand::Exec {
+            sender_conversation_id: None,
             program: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
@@ -1112,6 +1113,7 @@ mod tests {
                     .execute(effect(
                         id,
                         HostCommand::Exec {
+                            sender_conversation_id: None,
                             program: "/bin/sh".into(),
                             args: vec![
                                 "-c".into(),

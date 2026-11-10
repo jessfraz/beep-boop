@@ -297,6 +297,20 @@ pub enum InputOrigin {
     Ios,
 }
 
+/// The native conversation that supplied cross-task coordination context.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskMessageSender {
+    Coordinator {
+        conversation_id: String,
+    },
+    Task {
+        task_id: TaskId,
+        conversation_id: String,
+        title: String,
+    },
+}
+
 /// Used only when an idle chief starts a new turn; active work keeps its context.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct MainInputContext {
@@ -520,6 +534,9 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         origin: Option<InputOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sender_conversation_id: Option<String>,
         task_id: TaskId,
         input_id: String,
         input: String,
@@ -800,6 +817,9 @@ pub struct TaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub origin: Option<InputOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sender: Option<TaskMessageSender>,
     pub id: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -941,6 +961,9 @@ pub enum HostCommand {
         args: Vec<String>,
         cwd: String,
         timeout_seconds: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sender_conversation_id: Option<String>,
     },
     ReadFile {
         path: String,

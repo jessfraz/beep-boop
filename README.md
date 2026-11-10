@@ -53,6 +53,10 @@ Results return to the main chat, so visiting task sessions is optional. Worker
 connections share metadata, not duplicate executions. Offline workers retain
 their tasks; automatic transfer to another machine comes later.
 
+Tasks can share context through `message_task`, steering active work or queuing
+a follow-up. Messages retain their sender across restarts, and the receiving
+task keeps working toward its owning outcome.
+
 Rex task tabs open directly into chat and accept replies after a turn finishes.
 The TUI reopens the saved main conversation with `beep-boop` and reconnects to
 ongoing work. `/exit` or Ctrl+C detaches main chat while that work continues;

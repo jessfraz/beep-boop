@@ -251,6 +251,7 @@ impl Process {
         config: &BrowserConfig,
         session_id: Uuid,
         claims: Arc<Mutex<HashMap<String, Uuid>>>,
+        owner_id: &str,
     ) -> Result<Self> {
         let helper = runtime.with_file_name("browser-host.js");
         ensure!(
@@ -269,6 +270,7 @@ impl Process {
             Command::new("node")
         };
         let mut child = command
+            .env(crate::host::ACTOR_CONVERSATION_ENV, owner_id)
             .arg(helper)
             .arg(serde_json::to_string(config)?)
             .stdin(Stdio::piped())
@@ -537,7 +539,7 @@ impl BrowserHost {
                 .runtime
                 .as_deref()
                 .context("Browser runtime is unavailable")?;
-            let process = match Process::start(runtime, config, request.session_id, self.tab_claims.clone()) {
+            let process = match Process::start(runtime, config, request.session_id, self.tab_claims.clone(), &request.owner_id) {
                 Ok(process) => process,
                 Err(_) => return Ok(BrowserResponse::Failed {
                     session_id: request.session_id,
@@ -669,6 +671,7 @@ import { createInterface } from 'node:readline';
 const {user_data_dir: directory} = JSON.parse(process.argv[2]);
 writeFileSync(join(directory, 'pid'), String(process.pid));
 writeFileSync(join(directory, 'wrapper'), process.env.AGENT_BROWSER_FIXTURE_WRAPPER ?? '');
+writeFileSync(join(directory, 'actor'), process.env.BEEP_BOOP_ACTOR_CONVERSATION ?? '');
 const input = createInterface({input:process.stdin});
 input.on('line', async line => {
   const request = JSON.parse(line);
@@ -891,6 +894,12 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
                 .await
                 .unwrap(),
             "wrapped"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("actor"))
+                .await
+                .unwrap(),
+            owner.to_string()
         );
         assert!(matches!(
             host.execute(

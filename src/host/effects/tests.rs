@@ -132,6 +132,7 @@ async fn cancel_reaps_a_running_process_and_releases_its_call_identity() {
             executor
                 .execute_cancelled(
                     HostCommand::Exec {
+                        sender_conversation_id: None,
                         program: "node".into(),
                         args: vec!["--eval".into(), program],
                         cwd,

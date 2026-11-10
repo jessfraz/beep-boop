@@ -21,6 +21,7 @@ async fn process_start_failure_reports_not_started_and_keeps_its_actual_cause() 
     let cwd = directory.path().to_string_lossy().into_owned();
     let result = Executor::new(directory.path())
         .execute(HostCommand::Exec {
+            sender_conversation_id: None,
             program: program.clone(),
             args: vec!["invented-sensitive-argument".into()],
             cwd: cwd.clone(),

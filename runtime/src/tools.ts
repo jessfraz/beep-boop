@@ -18,6 +18,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { DelegationDecision } from "./generated/DelegationDecision.js";
 import type { InputMode } from "./generated/InputMode.js";
+import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 import { importedSummary } from "./history.js";
 import type { BackgroundScheduler } from "./background.js";
@@ -62,6 +63,10 @@ export class Executions {
     const execution = this.attached.get(id);
     if (execution === undefined) throw new TaskError("The execution client is disconnected; attach the task to continue");
     return execution;
+  }
+  async sender(tasks: TaskStore, id: string): Promise<TaskMessageSender> {
+    // Source triage is coordinator-owned, but has its own native conversation.
+    return this.get(id).role === "triage" ? { type: "coordinator", conversation_id: id } : tasks.messageSender(id);
   }
   async hosts(id: string): Promise<WorkerHost[]> {
     const execution = this.get(id);
@@ -219,6 +224,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         const chosen = args.host === undefined ? undefined : hosts.find((host) => host.host_id === args.host || host.name === args.host);
         if (args.host !== undefined && chosen === undefined) throw new TaskError("Choose a connected worker host.");
         const command: HostCommand = { type: "exec", program: args.program, args: args.args,
+          sender_conversation_id: api.conversationId.toString(),
           cwd: args.cwd ?? chosen?.cwd ?? execution.default_host?.cwd ?? execution.cwd, timeout_seconds: args.timeout_seconds ?? 900 };
         const result = await execution.call(chosen?.host_id === null || chosen?.host_id === undefined ? command
           : { type: "on_node", host_id: chosen.host_id, command });
@@ -400,11 +406,27 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         await record(action === "create" ? { kind: "create", task_id: task.id, conversation_id: task.conversation_id, reason }
           : { kind: action, task_id: task.id, conversation_id: task.conversation_id });
         const inputId = await api.memo("input_id", randomUUID(), context);
-        await tasks.enqueue(task.id, args.input, inputId, undefined, mode, await tasks.attachmentRefs(args.attachments));
+        await tasks.enqueue(task.id, args.input, inputId, undefined, mode, await tasks.attachmentRefs(args.attachments), undefined, await executions.sender(tasks, api.conversationId.toString()));
         return agentOutput("delegate_task", args, api.conversationId.toString(), await tasks.dispatch(task.id, host, execution.call));
       } }),
     record,
   ] });
+  const messageTask = defineTool({ name: "message_task", description: "Send relevant context to an existing task. Steer when needed now; follow_up queues it. The recipient retains its owning outcome.",
+    parameters: Type.Object({ task_id: Type.String({ minLength: 1 }), input: Type.String({ maxLength: 16000 }),
+      attachments: attachmentIds, mode: Type.Optional(Type.Enum(inputModes)) }),
+    async execute(args, api, context) {
+      const execution = executions.get(api.conversationId.toString());
+      const sender = await executions.sender(tasks, api.conversationId.toString());
+      const task = await tasks.get(args.task_id);
+      if (sender.type === "task" && sender.task_id === task.id) throw new TaskError("Use this task's existing child-agent tools");
+      const inputId = await api.memo("input_id", randomUUID(), context);
+      await tasks.enqueue(task.id, args.input, inputId, undefined, args.mode ?? "steer",
+        await tasks.attachmentRefs(args.attachments), undefined, sender);
+      await tasks.dispatch(task.id, await tasks.workerHost(task.id), execution.call);
+      return { ...output({ task_id: task.id, conversation_id: task.conversation_id, input_id: inputId }), details: {
+        role: "tool", text: "", presentation: agentPresentation({ name: "message_task", arguments: args }, sender.conversation_id, task),
+      } satisfies MessageContent };
+    } });
   const continueAgent = defineTool({ name: "continue_agent", description: "Steer an existing agent with corrections or current context. Use mode:follow_up for an independent later turn. Reuses its conversation and owning execution.",
       parameters: Type.Object({ agent_id: Type.String({ minLength: 1 }), input: Type.String({ maxLength: 16000 }), attachments: attachmentIds,
         mode: Type.Optional(Type.Enum(inputModes)) }),
@@ -449,9 +471,9 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         return agentOutput("report_result", args, api.conversationId.toString(), await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
           { conversation_id: api.conversationId.toString(), call_id: api.callId }));
       } });
-  const worker = defineExtension({ name: "task-parent", tools: [record, searchTask, readTask, continueAgent, spawnAgent, readAgents, waitAgents] });
-  const agent = defineExtension({ name: "task-agent", tools: [searchTask, readTask, readAgents, reportResult] });
+  const worker = defineExtension({ name: "task-parent", tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents] });
+  const agent = defineExtension({ name: "task-agent", tools: [searchTask, readTask, messageTask, readAgents, reportResult] });
   // Pending actors may recover before their next configuration refresh.
-  const legacy = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });
+  const legacy = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });
   return { host, main, worker, agent, legacy };
 }

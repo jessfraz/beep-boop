@@ -854,7 +854,7 @@ test("worker host tools execute through the attached client while the main conve
     const running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id,
       binding, instructions: "Use verified source.", model: fixtureModel, cwd: host.cwd },
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async (command) => {
-      assert.deepEqual(command, { type: "exec", program: "inspect", args: ["literal value"], cwd: host.cwd, timeout_seconds: 900 });
+      assert.deepEqual(command, { type: "exec", sender_conversation_id: conversation.id.toString(), program: "inspect", args: ["literal value"], cwd: host.cwd, timeout_seconds: 900 });
       started(); return hostResult;
     } }), [app.tools.host, app.tools.worker]);
     await hostStarted;

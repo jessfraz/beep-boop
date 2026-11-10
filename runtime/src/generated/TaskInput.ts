@@ -3,9 +3,10 @@ import type { AttachmentRef } from "./AttachmentRef.js";
 import type { InputMode } from "./InputMode.js";
 import type { InputOrigin } from "./InputOrigin.js";
 import type { ScheduledOccurrence } from "./ScheduledOccurrence.js";
+import type { TaskMessageSender } from "./TaskMessageSender.js";
 
 export type TaskInput = {
 /**
  * Direct transport metadata retained in the durable task outbox.
  */
-origin?: InputOrigin, id: string, content: string, mode?: InputMode, attachments?: Array<AttachmentRef>, scheduled?: ScheduledOccurrence, };
+origin?: InputOrigin, sender?: TaskMessageSender, id: string, content: string, mode?: InputMode, attachments?: Array<AttachmentRef>, scheduled?: ScheduledOccurrence, };

@@ -144,9 +144,8 @@ recovery; [history](history.md) describes import and retrieval.
   and automatic enrollment are implemented; signed-build enrollment and
   real-phone delivery remain to verify.
   See [notification setup](notifications.md).
-- [ ] Direct coordination between task sessions: durable messages with delivery
-  receipts, steering or queueing, and references to shared work. Reuse existing
-  task inboxes and workers.
+- [x] Direct coordination between task sessions through their durable inboxes:
+  sender identity, admission receipts, steering or queueing, and shared history.
 - [ ] Voice input through a transcription provider interface.
 - [x] File/photo attachments on iOS and dragged files in the terminal, retained
   with the conversation and delivered to Pi on the selected execution host.

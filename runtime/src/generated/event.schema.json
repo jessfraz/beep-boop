@@ -2333,6 +2333,12 @@
             "program": {
               "type": "string"
             },
+            "sender_conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "timeout_seconds": {
               "type": "integer",
               "format": "uint16",
@@ -5682,11 +5688,66 @@
               "type": "null"
             }
           ]
+        },
+        "sender": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskMessageSender"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "id",
         "content"
+      ]
+    },
+    "TaskMessageSender": {
+      "description": "The native conversation that supplied cross-task coordination context.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "coordinator"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "conversation_id",
+            "title"
+          ]
+        }
       ]
     },
     "TaskRecord": {

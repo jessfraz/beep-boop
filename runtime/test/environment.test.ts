@@ -345,9 +345,9 @@ test("native model tools route main execution explicitly and expose coordinator 
       ]);
       assert.equal((await (await root.submit({ type: "input", content: "Inspect the shared context and this project." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
       assert.deepEqual(commands, [
-        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 900 } },
-        { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: "/home/laptop/project", timeout_seconds: 900 } },
-        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 65535 } },
+        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", sender_conversation_id: root.id.toString(), program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 900 } },
+        { type: "on_node", host_id: laptop.host_id, command: { type: "exec", sender_conversation_id: root.id.toString(), program: "pwd", args: [], cwd: "/home/laptop/project", timeout_seconds: 900 } },
+        { type: "on_node", host_id: coordinator.host_id, command: { type: "exec", sender_conversation_id: root.id.toString(), program: "pwd", args: [], cwd: coordinator.home_directory, timeout_seconds: 65535 } },
         { type: "read_context", repository_id: "operations", path: "playbooks/mail.md", offset: 0, limit: 64000 },
         { type: "search_context", repository_id: "operations", query: "brief", path: "context", limit: 5 },
       ]);
@@ -375,8 +375,8 @@ test("native model tools route main execution explicitly and expose coordinator 
         connectedHosts: () => app.environment.hosts(host.cwd, host.host_id ?? null, [host]), call,
       }), [app.tools.host, app.tools.worker]);
     assert.deepEqual(commands, [
-      { type: "on_node", host_id: laptop.host_id, command: { type: "exec", program: "pwd", args: [], cwd: laptop.home_directory, timeout_seconds: 900 } },
-      { type: "exec", program: "pwd", args: [], cwd: host.cwd, timeout_seconds: 900 },
+      { type: "on_node", host_id: laptop.host_id, command: { type: "exec", sender_conversation_id: task.conversation_id, program: "pwd", args: [], cwd: laptop.home_directory, timeout_seconds: 900 } },
+      { type: "exec", sender_conversation_id: task.conversation_id, program: "pwd", args: [], cwd: host.cwd, timeout_seconds: 900 },
       { type: "read_context", repository_id: "operations", path: "context/preferences.md", offset: 0, limit: 64000 },
     ]);
     assert.match(await app.tasks.history(task.id), /Choose a connected worker host/);

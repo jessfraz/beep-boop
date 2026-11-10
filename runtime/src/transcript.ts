@@ -1,3 +1,4 @@
+import { taskMessageSender } from "./task-messages.js";
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord";
@@ -120,6 +121,12 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
     }
   };
   if (entry.kind === "agent.notice_context") return messages;
+  const sender = entry.kind === "agent.input" ? taskMessageSender(entry.data) : undefined;
+  if (sender !== undefined && object(entry.data) && typeof entry.data.text === "string") return messageRows(entry, {
+    role: "notice", text: entry.data.text,
+    presentation: { type: "agent_coordination", action: "send_message", sender_thread_id: sender.conversation_id,
+      receiver_thread_ids: [entry.conversationId.toString()], agents: [] },
+  }).map((message, index) => index !== 0 || attachments === undefined ? message : { ...message, attachments });
   if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") {
     add("notice", entry.data.text);
     const origin = readNoticeOrigin(entry.data.notice_origin);

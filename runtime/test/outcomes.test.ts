@@ -252,7 +252,7 @@ test("a due coordinator handoff collects remote evidence and continues the same 
         calls.push(operation);
         if (operation.type === "on_node") {
           assert.equal(operation.host_id, remote.host_id);
-          assert.deepEqual(operation.command, { type: "exec", program: "journalctl",
+          assert.deepEqual(operation.command, { type: "exec", sender_conversation_id: conversation.id.toString(), program: "journalctl",
             args: ["--user", "--unit=fixture-agent.service", "--since=1 day ago", "--no-pager"], cwd: remote.cwd, timeout_seconds: 30 });
           return { type: "process", exit_code: 0, stdout: evidence, stderr: "", truncated: false };
         }

@@ -22,6 +22,8 @@ import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
 import { NoticeLineage, readNoticeOrigin } from "./notice_origin.js";
 import type { InputOrigin } from "./generated/InputOrigin.js";
+import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
+import { peerContext, sameSender } from "./task-messages.js";
 import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
@@ -326,7 +328,7 @@ export class TaskStore {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
     return this.attachments.input("", await this.attachmentRefs([id]), call);
   }
-  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     let prepared: Awaited<ReturnType<AttachmentStore["input"]>>;
     if (refs === undefined || refs.length === 0) prepared = { content: text,
       ...(inputOrigin === undefined ? {} : { entry: { kind: "agent.input", data: { text, origin: inputOrigin } } }) };
@@ -335,10 +337,14 @@ export class TaskStore {
       prepared = await this.attachments.input(text, refs, call, inputOrigin);
     }
     const origin = (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
-    if (origin === undefined || origin === null) return prepared;
+    if (sender === undefined && (origin === undefined || origin === null)) return prepared;
     const metadata = prepared.entry?.data;
-    return { ...prepared, entry: { ...prepared.entry, kind: "agent.input", data: {
-      ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : { text }), notice_origin: origin,
+    const context = sender?.type === "task" ? peerContext(text, sender) : undefined;
+    return { ...prepared, ...(context === undefined ? {} : { content: typeof prepared.content === "string" ? context
+      : [{ type: "text", text: context }, ...prepared.content.slice(1)] }),
+      entry: { ...prepared.entry, kind: "agent.input", data: {
+      ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : { text }),
+      ...(sender === undefined ? {} : { sender }), ...(origin === undefined || origin === null ? {} : { notice_origin: origin }),
     } } };
   }
   private async admit<T>(refs: readonly AttachmentRef[] | undefined, commit: () => Promise<T>): Promise<T> {
@@ -493,6 +499,11 @@ export class TaskStore {
     const owner = await this.findOwner(conversationId);
     if (owner !== undefined) return owner;
     throw new TaskError("No task owns this conversation");
+  }
+  async messageSender(conversationId: string): Promise<TaskMessageSender> {
+    if (conversationId === ROOT_CONVERSATION_ID.toString()) return { type: "coordinator", conversation_id: conversationId };
+    const { task, agent } = await this.owner(conversationId);
+    return { type: "task", task_id: task.id, conversation_id: conversationId, title: agent?.title ?? task.title };
   }
   async findOwner(conversationId: string): Promise<{ task: TaskRecord; agent?: TaskAgentRecord } | undefined> {
     await this.prepare();
@@ -814,8 +825,8 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
     return this.get(id);
   }
-  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin): Promise<TaskRecord> {
-    return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments, undefined, origin);
+  async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments, undefined, origin, sender);
   }
   async enqueueScheduled(id: string, content: string, occurrence: ScheduledOccurrence): Promise<TaskRecord> {
     return this.enqueueActor(id, content, occurrence.id, undefined, undefined, undefined, undefined, occurrence);
@@ -825,16 +836,16 @@ export class TaskStore {
     if (active?.attached !== true || active.input !== input) throw new TaskError("This worker is no longer attached");
     return this.enqueueActor(input.task_id, content, inputId, input.agent_id, undefined, mode, attachments, undefined, origin);
   }
-  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[], origin?: InputOrigin): Promise<TaskRecord> {
+  async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[], origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(id, agentId));
     const attached = active?.attached === true && active.observer?.signal.aborted !== true;
     if (!attached && call === undefined) throw new TaskError("This agent is no longer attached; its conversation is retained");
-    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments, undefined, origin);
+    const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments, undefined, origin, sender);
     admitted?.();
     const current = this.running.get(this.actorKey(id, agentId));
     return (current?.attached === true && current.observer?.signal.aborted !== true) || call === undefined ? task : this.dispatchAgent(id, agentId, call);
   }
-  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin): Promise<TaskRecord> {
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     validateInput(content, attachments);
     const store = this.attachments;
     if (attachments !== undefined && attachments.length > 0) {
@@ -845,7 +856,8 @@ export class TaskStore {
       const previous = actor.pending.find(input => input.id === inputId);
       if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
           JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []) ||
-          JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin)) {
+          JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin ||
+          !sameSender(previous.sender, sender))) {
         throw new TaskError("A task input ID cannot be reused with different content or mode");
       }
       return previous;
@@ -862,7 +874,8 @@ export class TaskStore {
         const previous = validate(actor);
         if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }),
           ...(attachments === undefined ? {} : { attachments }),
-          ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }) });
+          ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
+          ...(sender === undefined ? {} : { sender }) });
         actor.state = { state: "open" };
         task.state = { state: "open" };
       });
@@ -889,7 +902,7 @@ export class TaskStore {
         // configuration. Explicit steering belongs to the active turn.
         if (input.scheduled !== undefined) { scheduled = true; continue; }
         if (scheduled && input.mode !== "steer") continue;
-        const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin);
+        const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin, input.sender);
         if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted) break;
         await conversation.submit({ type: "input", ...prepared, requestId: input.id,
           whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
@@ -1494,7 +1507,7 @@ export class TaskStore {
           unbind?.(); unbind = bind(conversation, executionHost, selected);
           await observer?.configured?.(conversation, task.title);
         }
-        const prepared = await this.prepareInput(conversation, next.content, next.attachments, call, next.origin);
+        const prepared = await this.prepareInput(conversation, next.content, next.attachments, call, next.origin, next.sender);
         if (active.fenced || observer?.signal.aborted) break;
         const submission = await conversation.submit({ type: "input", ...prepared, requestId: next.id,
           whenBusy: next.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);

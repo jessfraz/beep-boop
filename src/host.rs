@@ -24,6 +24,7 @@ use crate::{
 };
 
 pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
+pub const ACTOR_CONVERSATION_ENV: &str = "BEEP_BOOP_ACTOR_CONVERSATION";
 
 pub mod effects;
 
@@ -54,6 +55,7 @@ pub(crate) struct ProcessRequest<'a> {
     cwd: &'a Path,
     deadline: Duration,
     output_limit: usize,
+    sender_conversation_id: Option<&'a str>,
 }
 
 impl<'a> ProcessRequest<'a> {
@@ -75,7 +77,13 @@ impl<'a> ProcessRequest<'a> {
             cwd,
             deadline,
             output_limit,
+            sender_conversation_id: None,
         })
+    }
+
+    pub fn with_sender_conversation(mut self, sender_conversation_id: Option<&'a str>) -> Self {
+        self.sender_conversation_id = sender_conversation_id;
+        self
     }
 }
 
@@ -253,6 +261,7 @@ impl Executor {
             args,
             cwd,
             timeout_seconds,
+            sender_conversation_id,
         } = &command
             && !crate::sources::messages_read::is_read(program, args)
         {
@@ -271,7 +280,8 @@ impl Executor {
                     Path::new(cwd),
                     Duration::from_secs(u64::from(*timeout_seconds)),
                     256 * 1024,
-                )?;
+                )?
+                .with_sender_conversation(sender_conversation_id.as_deref());
                 Ok::<_, anyhow::Error>(
                     run_process_until(request, async move {
                         loop {
@@ -381,6 +391,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             args,
             cwd,
             timeout_seconds,
+            sender_conversation_id,
         } => {
             let request = ProcessRequest::new(
                 &program,
@@ -388,7 +399,8 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 Path::new(&cwd),
                 Duration::from_secs(timeout_seconds.into()),
                 256 * 1024,
-            )?;
+            )?
+            .with_sender_conversation(sender_conversation_id.as_deref());
             if crate::sources::messages_read::is_read(&program, &args) {
                 return crate::rex::source::execute(program, args, cwd, timeout_seconds).await;
             }
@@ -878,8 +890,17 @@ pub(crate) async fn run_process_until(
         cwd,
         deadline,
         output_limit,
+        sender_conversation_id,
     } = request;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    // Actor identity belongs to this effect, never to the long-lived host's
+    // inherited environment or an earlier task.
+    if let Some(sender) = sender_conversation_id {
+        command.env(ACTOR_CONVERSATION_ENV, sender);
+    } else {
+        command.env_remove(ACTOR_CONVERSATION_ENV);
+    }
+    let mut child = command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -1162,6 +1183,7 @@ setInterval(() => {}, 1000);
     #[tokio::test]
     async fn runs_literal_arguments_and_retains_real_exit_status() {
         let result = execute(HostCommand::Exec {
+            sender_conversation_id: None,
             program: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
@@ -1199,6 +1221,7 @@ setInterval(() => {}, 1000);
         let cwd = directory.path().to_string_lossy().into_owned();
         let argument = "invented-sensitive-argument";
         let result = execute(HostCommand::Exec {
+            sender_conversation_id: None,
             program: program.clone(),
             args: vec![argument.into()],
             cwd: cwd.clone(),
@@ -1231,6 +1254,7 @@ setInterval(() => {}, 1000);
         let result = executor
             .execute_cancelled(
                 HostCommand::Exec {
+                    sender_conversation_id: None,
                     program: "node".into(),
                     args: vec![argument.into()],
                     cwd: cwd.clone(),
@@ -1255,6 +1279,7 @@ setInterval(() => {}, 1000);
     async fn ordinary_commands_accept_fifteen_minutes_and_the_positive_wire_domain() {
         for timeout_seconds in [900, u16::MAX] {
             let result = execute(HostCommand::Exec {
+                sender_conversation_id: None,
                 program: "node".into(),
                 args: vec!["--eval".into(), "process.stdout.write('ready\\n')".into()],
                 cwd: "/".into(),
@@ -1268,6 +1293,7 @@ setInterval(() => {}, 1000);
         }
         assert!(matches!(
             execute(HostCommand::Exec {
+                sender_conversation_id: None,
                 program: "node".into(),
                 args: vec![],
                 cwd: "/".into(),
@@ -1324,6 +1350,7 @@ setInterval(() => {}, 1000);
     #[tokio::test]
     async fn command_timeout_is_an_explicit_result() {
         let result = execute(HostCommand::Exec {
+            sender_conversation_id: None,
             program: "/bin/sh".into(),
             args: vec!["-c".into(), "sleep 30".into()],
             cwd: "/".into(),

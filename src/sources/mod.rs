@@ -572,6 +572,7 @@ mod tests {
         assert!(!source.truncated);
         assert_eq!(source.stdout.len(), 512 * 1024);
         let interactive = host::execute(HostCommand::Exec {
+            sender_conversation_id: None,
             program: command[0].clone(),
             args: command[1..].to_vec(),
             cwd: "/".into(),
