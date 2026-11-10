@@ -191,6 +191,9 @@ recovery; [history](history.md) describes import and retrieval.
   existing task → resumed worker → action → verified outcome. Cover unrelated
   noise, exchanges already handled by the user, malicious source instructions,
   duplicate events and source failures.
+  [Live source-routing evaluation](architecture.md#validation) covers standing
+  workflows, protected mail and ambiguous outreach; external effects remain
+  outside that evaluation.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
 - [ ] Benchmarks for input admission, first visible activity, steering/stop,

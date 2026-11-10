@@ -504,6 +504,7 @@ export class SourceJournal {
       if (signal?.aborted) { abort(); requireActive(); }
       await this.tasks.inference.configure(conversation, selected, { cwd: command.cwd,
         instructions: (await this.tasks.instructions(command.instructions)) + "\n\nAct on new signals using current workspace guidance and the owning workflow's authorization. " +
+          "Before dismissing a signal, check relevant configured standing workflows with list_jobs/read_job when needed; absence of a direct user request does not make authorized work inapplicable. " +
           "Reuse or steer the owning worker now when evidence enables a next step; linking evidence or saving notes is not execution. Do not defer useful work to the next scheduled pass. " +
           "Dispatch without waiting for workers; their durable outcomes return as source events. Link or dismiss every event and keep unfinished work in its owning task, not aggregate bookkeeping tasks. " +
           "Current instructions and preferences govern existing tasks too; stale task notes do not revoke authorization or establish relevance. " +

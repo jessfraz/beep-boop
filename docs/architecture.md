@@ -609,3 +609,19 @@ proof. Exercise surviving children, repeated inputs and source versions,
 interrupted imports and guarded resource cleanup through their real owners.
 Use representative model evaluations separately for judgment and follow-through;
 tests that match prompt wording do not establish those behaviors.
+
+Source triage considers relevant configured workflows before discarding a
+signal. Standing authorization can apply without a new direct request. Domain
+permissions stay in workspace job specs, and triage reuses their existing task.
+
+After building the runtime, the opt-in source-workflow evaluation runs against
+an existing ChatGPT plan session with invented mail and isolated Pi storage:
+
+```sh
+AGENT_SOURCE_WORKFLOWS_EVAL=1 AGENT_EVAL_AUTH_DIR=/existing/agent/state \
+  nix develop .#ci --command node --test runtime/dist/test/source-workflows.test.js
+```
+
+It checks clear pitches, ambiguous outreach, protected supplier mail and task
+reuse through native tools. It does not perform mailbox actions or refresh
+authentication, and is separate from the deterministic CI suite.
