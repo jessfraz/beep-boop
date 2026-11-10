@@ -301,8 +301,9 @@ transfer remains separate. Reconcile uncertain effects before retrying.
 
 The index uses independent exact-reference, FTS and dense retrieval. An embedding
 failure still permits lexical results and reports the semantic coverage gap.
-`sqlite-vec` uses exact scans. Larger-corpus latency and recall need measurement
-before adding an approximate index or tuning the chunker.
+`sqlite-vec` uses exact scans. Live qualification found slow dense retrieval at
+1.35 million chunks; see the [measurements](performance.md). Compare latency and
+recall before adding an approximate index or tuning the chunker.
 
 Verify idempotent reruns, fork/version preservation, interrupted import/index
 catch-up, offline asset reads, inert old tools and fenced Rex replacement.

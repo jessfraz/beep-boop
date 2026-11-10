@@ -76,6 +76,18 @@ setup outside timing and verify the actual result as well as its latency.
 These synthetic measurements complement live corpus latency and retrieval
 recall checks.
 
+Live qualification against 1.35 million published chunks measured 112 ms for
+keyword-only retrieval and 12.8 seconds for an exact dense scan. Two concurrent
+CLI searches took 11–18 seconds end to end; their query embeddings took
+617–653 ms. A retained-history page loaded in 0.8 seconds. These are observations
+under ongoing background work, not CI thresholds.
+
+Explicit keyword mode still runs dense retrieval for tie-breaking and fallback.
+Automatic chat context uses keyword-only retrieval on its separate reader, so
+it does not wait for that scan. Improving full-corpus semantic latency remains
+open; the small paired CI corpus does not establish acceptable absolute latency
+at this size.
+
 ## Source journal
 
 Source decisions use Pi's native deltas. Rewriting a full retained journal on
