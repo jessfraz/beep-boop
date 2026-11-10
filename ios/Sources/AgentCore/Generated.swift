@@ -308,6 +308,16 @@ public struct ConversationSettings: Codable, Sendable, Equatable {
     }
 }
 
+public enum ErrorCode: String, Codable, Sendable, Equatable {
+    case `invalidRequest` = "invalid_request"
+    case `authenticationRequired` = "authentication_required"
+    case `authenticationFailed` = "authentication_failed"
+    case `providerUnavailable` = "provider_unavailable"
+    case `coordinatorUnavailable` = "coordinator_unavailable"
+    case `storageUnavailable` = "storage_unavailable"
+    case `internal` = "internal"
+}
+
 public enum FastMode: String, Codable, Sendable, Equatable {
     case `toggle` = "toggle"
     case `on` = "on"
@@ -1272,11 +1282,14 @@ public struct NativeEventNotice: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventFailure: Codable, Sendable, Equatable {
+    public var `code`: ErrorCode?
     public var `message`: String
-    public init(`message`: String) {
+    public init(`code`: ErrorCode? = nil, `message`: String) {
+        self.`code` = `code`
         self.`message` = `message`
     }
     enum CodingKeys: String, CodingKey {
+        case `code` = "code"
         case `message` = "message"
     }
 }

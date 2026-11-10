@@ -97,6 +97,7 @@ fn result(command: &HostCommand) -> HostResult {
             snapshot: empty_guidance(),
         },
         _ => HostResult::Failed {
+            delivery: None,
             message: "Synthetic retrieval is unavailable".into(),
         },
     }

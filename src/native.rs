@@ -227,6 +227,9 @@ pub enum NativeEvent {
     },
     Failure {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        code: Option<crate::protocol::ErrorCode>,
     },
     Idle,
     Disconnect,
@@ -529,8 +532,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             input_id: input_id.clone(),
             message: message.clone(),
         },
-        RuntimeEventKind::Failure { message, .. } => NativeEvent::Failure {
+        RuntimeEventKind::Failure { code, message } => NativeEvent::Failure {
             message: message.clone(),
+            code: Some(code.clone()),
         },
         RuntimeEventKind::Notice { text, .. } => NativeEvent::Notice {
             settings: None,
@@ -1334,3 +1338,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod error_tests;

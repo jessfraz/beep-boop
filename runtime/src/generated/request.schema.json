@@ -1266,6 +1266,13 @@
         "archived"
       ]
     },
+    "HostDelivery": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "outcome_uncertain"
+      ]
+    },
     "HostResult": {
       "oneOf": [
         {
@@ -1591,6 +1598,17 @@
         {
           "type": "object",
           "properties": {
+            "delivery": {
+              "description": "Missing on older workers; absence makes no claim about execution.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HostDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "message": {
               "type": "string"
             },

@@ -27,6 +27,23 @@ recovery; [history](history.md) describes import and retrieval.
   share host-effect ownership and the CLI's client context across transports.
   Shutdown drains issued writes before releasing the runtime. Regression tests
   cover worker interruption, read-only observers, effect capacity and receipts.
+- [x] Retain attachments before Pi admission without filesystem work on the
+  shared commit queue; retention failures admit no input.
+- [x] Carry native invocation cancellation through background host effects,
+  preserving issued receipts and isolating unrelated execution lanes.
+- [x] Preserve typed storage, provider and native failures, plus host-delivery
+  certainty. Reconnect reconciles uncertain inputs without resending them.
+- [x] Coalesce source-status reads and make retrieval close terminal for queued
+  indexing, lazy opens and late embedding replies.
+- [x] Partition retained task and source bodies in native Pi documents, with
+  resumable migration, bounded read/write regressions and real SQL-plan and
+  growth benchmarks. Legacy records remain intact.
+- [x] Use narrow process results and validate native execution bindings before
+  host effects while retaining process limits and cleanup ownership.
+- [x] Share Rust/Swift tool-merge traces across live, restored and sparse updates,
+  preserving known names, terminal states and retained output.
+- [x] Prepare the runtime once in CI and gate signed-cache publication on
+  qualified package closures from trusted main runs.
 - [x] Share bounded snapshot-to-live observation for main and saved chats,
   preserving event order and suppressing publications throughout view cleanup.
   Overflow reports recovery without retaining an unbounded history buffer.

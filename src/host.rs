@@ -18,7 +18,7 @@ use tokio::{
 use crate::{
     embeddings::{EmbeddingProvider, llama::LlamaProvider},
     history::{HistorySource, codex::CodexHistory},
-    protocol::{HostCommand, HostResult, TaskId, WorkerHost, WorkerRef},
+    protocol::{HostCommand, HostDelivery, HostResult, TaskId, WorkerHost, WorkerRef},
     resources::{ResourceBackend, git::GitBackend},
     rex::{BlockId, HostId, RexClient, RexError, SessionId, WindowId, WorkerBinding, WorkerResume},
 };
@@ -26,6 +26,104 @@ use crate::{
 pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
 
 pub mod effects;
+
+/// Local process execution has one result shape; the wire enum is constructed
+/// only when serving a host request or returning a capture to another process.
+#[derive(Debug)]
+pub(crate) struct ProcessOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+}
+
+impl From<ProcessOutput> for HostResult {
+    fn from(output: ProcessOutput) -> Self {
+        Self::Process {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            truncated: output.truncated,
+        }
+    }
+}
+
+pub(crate) struct ProcessRequest<'a> {
+    program: &'a str,
+    args: &'a [String],
+    cwd: &'a Path,
+    deadline: Duration,
+    output_limit: usize,
+}
+
+impl<'a> ProcessRequest<'a> {
+    pub fn new(
+        program: &'a str,
+        args: &'a [String],
+        cwd: &'a Path,
+        deadline: Duration,
+        output_limit: usize,
+    ) -> std::result::Result<Self, ProcessFailure> {
+        if program.is_empty() || !cwd.is_absolute() || deadline.is_zero() || output_limit == 0 {
+            return Err(ProcessFailure::NotStarted(anyhow::anyhow!(
+                "Command needs a program, absolute directory, positive timeout and output limit"
+            )));
+        }
+        Ok(Self {
+            program,
+            args,
+            cwd,
+            deadline,
+            output_limit,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessFailure {
+    NotStarted(anyhow::Error),
+    OutcomeUncertain(anyhow::Error),
+}
+
+impl ProcessFailure {
+    fn delivery(&self) -> HostDelivery {
+        match self {
+            Self::NotStarted(_) => HostDelivery::NotStarted,
+            Self::OutcomeUncertain(_) => HostDelivery::OutcomeUncertain,
+        }
+    }
+    fn cause(&self) -> &anyhow::Error {
+        match self {
+            Self::NotStarted(error) | Self::OutcomeUncertain(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.cause())
+    }
+}
+
+impl std::error::Error for ProcessFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause().as_ref())
+    }
+}
+
+fn failure(error: anyhow::Error) -> HostResult {
+    let delivery = error
+        .downcast_ref::<ProcessFailure>()
+        .map(ProcessFailure::delivery)
+        .or_else(|| {
+            matches!(error.downcast_ref::<RexError>(), Some(RexError::InvalidId))
+                .then_some(HostDelivery::NotStarted)
+        });
+    HostResult::Failed {
+        message: error.to_string(),
+        delivery,
+    }
+}
 
 /// One service owns its history connection and warm embedding child.
 pub struct Executor {
@@ -115,9 +213,7 @@ impl Executor {
             }
             command => execute_inner(command).await,
         };
-        result.unwrap_or_else(|error| HostResult::Failed {
-            message: error.to_string(),
-        })
+        result.unwrap_or_else(failure)
     }
 
     pub async fn execute_cancelled(
@@ -131,6 +227,7 @@ impl Executor {
                     response: self.browser.execute(request.clone(), cancelled).await,
                 },
                 Err(error) => HostResult::Failed {
+                    delivery: Some(HostDelivery::NotStarted),
                     message: error.to_string(),
                 },
             };
@@ -147,7 +244,7 @@ impl Executor {
                             std::future::pending::<()>().await;
                         }
                     }
-                } => HostResult::Failed { message: "History embedding was interrupted".into() },
+                } => HostResult::Failed { delivery: None, message: "History embedding was interrupted".into() },
                 result = self.execute(command) => result,
             };
         }
@@ -168,17 +265,15 @@ impl Executor {
                 };
             }
             let result = async {
-                ensure!(
-                    *timeout_seconds > 0 && !program.is_empty() && Path::new(cwd).is_absolute(),
-                    "Command needs a program, absolute directory and positive timeout"
-                );
-                run_process_until(
+                let request = ProcessRequest::new(
                     program,
                     args,
                     Path::new(cwd),
                     Duration::from_secs(u64::from(*timeout_seconds)),
                     256 * 1024,
-                    async move {
+                )?;
+                Ok::<_, anyhow::Error>(
+                    run_process_until(request, async move {
                         loop {
                             if *cancelled.borrow_and_update() {
                                 break;
@@ -187,14 +282,13 @@ impl Executor {
                                 std::future::pending::<()>().await;
                             }
                         }
-                    },
+                    })
+                    .await?
+                    .into(),
                 )
-                .await
             }
             .await;
-            return result.unwrap_or_else(|error| HostResult::Failed {
-                message: error.to_string(),
-            });
+            return result.unwrap_or_else(failure);
         }
         // Non-process effects may have already committed an external write.
         // Keep ownership until their real result arrives instead of guessing.
@@ -202,12 +296,11 @@ impl Executor {
     }
 }
 
-pub async fn execute(command: HostCommand) -> HostResult {
+#[cfg(test)]
+pub(crate) async fn execute(command: HostCommand) -> HostResult {
     match execute_inner(command).await {
         Ok(result) => result,
-        Err(error) => HostResult::Failed {
-            message: error.to_string(),
-        },
+        Err(error) => failure(error),
     }
 }
 
@@ -234,15 +327,16 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             })
         }
         HostCommand::InspectWorker { binding } => {
+            let binding = ExecutionBinding::try_from(&binding)?;
             let client = RexClient::new(None);
             let identity = client.whoami().await?;
             ensure!(
-                identity.host_id == HostId::parse(&binding.host_id)?,
+                identity.host_id == binding.host_id,
                 "Worker belongs to another host"
             );
             Ok(HostResult::WorkerPresence {
                 presence: client
-                    .worker_presence(&native_binding(&binding)?, &identity.host_id)
+                    .worker_presence(&binding.native, &identity.host_id)
                     .await?,
             })
         }
@@ -288,22 +382,17 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             cwd,
             timeout_seconds,
         } => {
-            ensure!(timeout_seconds > 0, "Command timeout must be positive");
-            ensure!(
-                !program.is_empty() && Path::new(&cwd).is_absolute(),
-                "Command needs a program and absolute working directory"
-            );
-            if crate::sources::messages_read::is_read(&program, &args) {
-                return crate::rex::source::execute(program, args, cwd, timeout_seconds).await;
-            }
-            run_process(
+            let request = ProcessRequest::new(
                 &program,
                 &args,
                 Path::new(&cwd),
                 Duration::from_secs(timeout_seconds.into()),
                 256 * 1024,
-            )
-            .await
+            )?;
+            if crate::sources::messages_read::is_read(&program, &args) {
+                return crate::rex::source::execute(program, args, cwd, timeout_seconds).await;
+            }
+            Ok(run_process(request).await?.into())
         }
         HostCommand::ReadFile {
             path,
@@ -355,7 +444,13 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             allocation_id,
             title,
             parent,
-        } => spawn_worker(&host, &task_id, &allocation_id, &title, parent.as_ref()).await,
+        } => {
+            let parent = parent
+                .as_ref()
+                .map(ExecutionBinding::try_from)
+                .transpose()?;
+            spawn_worker(&host, &task_id, &allocation_id, &title, parent.as_ref()).await
+        }
         HostCommand::SpawnSubagent {
             host,
             parent,
@@ -364,17 +459,18 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             allocation_id,
             title,
         } => {
+            let parent = ExecutionBinding::try_from(&parent)?;
             let client = RexClient::new(None);
             let identity = client.whoami().await?;
             ensure!(
-                identity.host_id == HostId::parse(&parent.host_id)?,
+                identity.host_id == parent.host_id,
                 "Subagent must use its task's host"
             );
-            let native = native_binding(&parent)?;
+            let native = &parent.native;
             client
                 .inspect_session(&native.session_id)
                 .await?
-                .verify_binding(&native, &identity.host_id)?;
+                .verify_binding(native, &identity.host_id)?;
             let args = worker_args(&host, &task_id, &allocation_id, Some(&agent_id));
             match client
                 .create_worker_window(
@@ -394,12 +490,11 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                     }
                     promote(&client, &binding.session_id).await;
                     Ok(HostResult::Spawned {
-                        binding: WorkerRef {
-                            host_id: identity.host_id.to_string(),
-                            session_id: binding.session_id.to_string(),
-                            window_id: binding.window_id.to_string(),
-                            block_id: binding.block_id.to_string(),
-                        },
+                        binding: ExecutionBinding {
+                            host_id: identity.host_id,
+                            native: binding,
+                        }
+                        .into(),
                     })
                 }
                 Err(RexError::CreationUncertain { session_id }) => {
@@ -415,14 +510,32 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             binding,
             task_id,
             allocation_id,
-        } => resume_bound_worker(host, binding, task_id, allocation_id, None).await,
+        } => {
+            resume_bound_worker(
+                host,
+                ExecutionBinding::try_from(&binding)?,
+                task_id,
+                allocation_id,
+                None,
+            )
+            .await
+        }
         HostCommand::ResumeAgentWorker {
             host,
             binding,
             task_id,
             agent_id,
             allocation_id,
-        } => resume_bound_worker(host, binding, task_id, allocation_id, Some(agent_id)).await,
+        } => {
+            resume_bound_worker(
+                host,
+                ExecutionBinding::try_from(&binding)?,
+                task_id,
+                allocation_id,
+                Some(agent_id),
+            )
+            .await
+        }
     }
 }
 
@@ -430,19 +543,19 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
 // effects instead of silently starting a parent with a child's allocation.
 async fn resume_bound_worker(
     host: WorkerHost,
-    binding: WorkerRef,
+    binding: ExecutionBinding,
     task_id: TaskId,
     allocation_id: String,
     agent_id: Option<String>,
 ) -> Result<HostResult> {
     let client = RexClient::new(None);
-    let native = native_binding(&binding)?;
+    let native = &binding.native;
     let identity = client.whoami().await?;
     ensure!(
-        identity.host_id == HostId::parse(&binding.host_id)?,
+        identity.host_id == binding.host_id,
         "Worker host identity changed"
     );
-    let presence = client.worker_presence(&native, &identity.host_id).await?;
+    let presence = client.worker_presence(native, &identity.host_id).await?;
     if matches!(presence, crate::protocol::WorkerPresence::MissingSession) {
         anyhow::bail!("The task session was closed; reconcile its allocation before reopening");
     }
@@ -460,16 +573,15 @@ async fn resume_bound_worker(
             Ok(restored) if confirmed_binding(&client, &restored, &identity.host_id).await => {
                 promote(&client, &restored.session_id).await;
                 Ok(HostResult::Spawned {
-                    binding: WorkerRef {
+                    binding: ExecutionBinding {
                         host_id: binding.host_id,
-                        session_id: restored.session_id.to_string(),
-                        window_id: restored.window_id.to_string(),
-                        block_id: restored.block_id.to_string(),
-                    },
+                        native: restored,
+                    }
+                    .into(),
                 })
             }
             Ok(_) => Ok(HostResult::CreationUncertain {
-                session_id: Some(binding.session_id),
+                session_id: Some(binding.native.session_id.to_string()),
             }),
             Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
                 session_id: session_id.map(|id| id.to_string()),
@@ -491,21 +603,45 @@ async fn resume_bound_worker(
 }
 
 async fn require_local_host(expected: &str) -> Result<()> {
+    let expected = HostId::parse(expected)?;
     let identity = RexClient::new(None).whoami().await?;
     ensure!(
-        identity.host_id == HostId::parse(expected)?,
+        identity.host_id == expected,
         "Resource belongs to another host"
     );
     Ok(())
 }
 
-fn native_binding(binding: &WorkerRef) -> Result<WorkerBinding> {
-    Ok(WorkerBinding {
-        session_id: SessionId::parse(&binding.session_id)?,
-        window_id: WindowId::parse(&binding.window_id)?,
-        block_id: BlockId::parse(&binding.block_id)?,
-        revision: 0,
-    })
+struct ExecutionBinding {
+    host_id: HostId,
+    native: WorkerBinding,
+}
+
+impl TryFrom<&WorkerRef> for ExecutionBinding {
+    type Error = RexError;
+    fn try_from(binding: &WorkerRef) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            host_id: HostId::parse(&binding.host_id)?,
+            native: WorkerBinding {
+                session_id: SessionId::parse(&binding.session_id)?,
+                window_id: WindowId::parse(&binding.window_id)?,
+                block_id: BlockId::parse(&binding.block_id)?,
+                // The protocol records identity, not a live Rex revision.
+                revision: 0,
+            },
+        })
+    }
+}
+
+impl From<ExecutionBinding> for WorkerRef {
+    fn from(binding: ExecutionBinding) -> Self {
+        Self {
+            host_id: binding.host_id.to_string(),
+            session_id: binding.native.session_id.to_string(),
+            window_id: binding.native.window_id.to_string(),
+            block_id: binding.native.block_id.to_string(),
+        }
+    }
 }
 
 fn worker_args(
@@ -554,26 +690,25 @@ async fn spawn_worker(
     task_id: &TaskId,
     allocation_id: &str,
     title: &str,
-    parent: Option<&WorkerRef>,
+    parent: Option<&ExecutionBinding>,
 ) -> Result<HostResult> {
     let client = RexClient::new(None);
+    let expected = host.host_id.as_deref().map(HostId::parse).transpose()?;
     let identity = client.whoami().await?;
     ensure!(
-        host.host_id
-            .as_ref()
-            .is_none_or(|id| id == &identity.host_id.to_string()),
+        expected.is_none_or(|id| id == identity.host_id),
         "Worker host differs from this node's native Rex identity"
     );
     let result = if let Some(parent) = parent {
         ensure!(
-            identity.host_id == HostId::parse(&parent.host_id)?,
+            identity.host_id == parent.host_id,
             "The feedback terminal must use its originating host"
         );
-        let native = native_binding(parent)?;
+        let native = &parent.native;
         client
             .inspect_session(&native.session_id)
             .await?
-            .verify_binding(&native, &identity.host_id)?;
+            .verify_binding(native, &identity.host_id)?;
         client
             .create_worker_window(
                 &native.session_id,
@@ -602,12 +737,11 @@ async fn spawn_worker(
             }
             promote(&client, &binding.session_id).await;
             Ok(HostResult::Spawned {
-                binding: WorkerRef {
-                    host_id: identity.host_id.to_string(),
-                    session_id: binding.session_id.to_string(),
-                    window_id: binding.window_id.to_string(),
-                    block_id: binding.block_id.to_string(),
-                },
+                binding: ExecutionBinding {
+                    host_id: identity.host_id,
+                    native: binding,
+                }
+                .into(),
             })
         }
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
@@ -635,13 +769,13 @@ async fn resume_worker(
     host: &WorkerHost,
     task_id: &TaskId,
     allocation_id: &str,
-    binding: &WorkerRef,
+    binding: &ExecutionBinding,
     agent_id: Option<&str>,
 ) -> Result<HostResult> {
-    promote(client, &SessionId::parse(&binding.session_id)?).await;
+    promote(client, &binding.native.session_id).await;
     match client
         .resume_worker(
-            &native_binding(binding)?,
+            &binding.native,
             &host.agent_program,
             &worker_args(host, task_id, allocation_id, agent_id),
             Path::new(&host.cwd),
@@ -653,12 +787,11 @@ async fn resume_worker(
             presence: crate::protocol::WorkerPresence::Pending,
         }),
         Ok(WorkerResume::Started(replacement)) => Ok(HostResult::Spawned {
-            binding: WorkerRef {
+            binding: ExecutionBinding {
                 host_id: binding.host_id.clone(),
-                session_id: replacement.session_id.to_string(),
-                window_id: replacement.window_id.to_string(),
-                block_id: replacement.block_id.to_string(),
-            },
+                native: replacement,
+            }
+            .into(),
         }),
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
             session_id: session_id.map(|id| id.to_string()),
@@ -728,33 +861,24 @@ async fn exited_unreaped(pid: libc::pid_t) -> Result<()> {
 }
 
 pub(crate) async fn run_process(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    deadline: Duration,
-    output_limit: usize,
-) -> Result<HostResult> {
-    run_process_until(
-        program,
-        args,
-        cwd,
-        deadline,
-        output_limit,
-        std::future::pending(),
-    )
-    .await
+    request: ProcessRequest<'_>,
+) -> std::result::Result<ProcessOutput, ProcessFailure> {
+    run_process_until(request, std::future::pending()).await
 }
 
 /// Cancellation retains the same group ownership, reaping and pipe draining as
 /// timeout. Dropping the future also kills the group through its owned guard.
 pub(crate) async fn run_process_until(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    deadline: Duration,
-    output_limit: usize,
+    request: ProcessRequest<'_>,
     cancelled: impl Future<Output = ()>,
-) -> Result<HostResult> {
+) -> std::result::Result<ProcessOutput, ProcessFailure> {
+    let ProcessRequest {
+        program,
+        args,
+        cwd,
+        deadline,
+        output_limit,
+    } = request;
     let mut child = Command::new(program)
         .args(args)
         .current_dir(cwd)
@@ -765,65 +889,72 @@ pub(crate) async fn run_process_until(
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| {
-            anyhow::anyhow!("Could not start command {program:?} in {cwd:?}: {error}")
+            ProcessFailure::NotStarted(
+                anyhow::Error::new(error)
+                    .context(format!("Could not start command {program:?} in {cwd:?}")),
+            )
         })?;
-    let mut group = ProcessGroup(
-        child
-            .id()
-            .context("Command has no process identity")?
-            .try_into()?,
-    );
-    let stdout = child
-        .stdout
-        .take()
-        .context("Command output pipe is unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("Command error pipe is unavailable")?;
-    let mut output = tokio::spawn(captured(stdout, output_limit));
-    let mut errors = tokio::spawn(captured(stderr, output_limit));
-    let finished = tokio::select! {
-        result = timeout(deadline, exited_unreaped(group.0)) => Some(result),
-        _ = cancelled => None,
-    };
-    group.terminate();
-    let status = timeout(Duration::from_secs(3), child.wait())
-        .await
-        .context("Command exit could not be confirmed")??;
-    let capture = timeout(Duration::from_secs(3), async {
-        Ok::<_, anyhow::Error>(((&mut output).await??, (&mut errors).await??))
-    })
+    let result = async {
+        let mut group = ProcessGroup(
+            child
+                .id()
+                .context("Command has no process identity")?
+                .try_into()?,
+        );
+        let stdout = child
+            .stdout
+            .take()
+            .context("Command output pipe is unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Command error pipe is unavailable")?;
+        let mut output = tokio::spawn(captured(stdout, output_limit));
+        let mut errors = tokio::spawn(captured(stderr, output_limit));
+        let finished = tokio::select! {
+            result = timeout(deadline, exited_unreaped(group.0)) => Some(result),
+            _ = cancelled => None,
+        };
+        group.terminate();
+        let status = timeout(Duration::from_secs(3), child.wait())
+            .await
+            .context("Command exit could not be confirmed")??;
+        let capture = timeout(Duration::from_secs(3), async {
+            Ok::<_, anyhow::Error>(((&mut output).await??, (&mut errors).await??))
+        })
+        .await;
+        let ((stdout, out_cut), (stderr, err_cut)) = match capture {
+            Ok(result) => result?,
+            Err(_) => {
+                output.abort();
+                errors.abort();
+                anyhow::bail!("Command output did not close after exit");
+            }
+        };
+        let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+        let exit_code = match finished {
+            Some(Ok(result)) => {
+                result?;
+                status.code().unwrap_or(128)
+            }
+            Some(Err(_)) => {
+                stderr.push_str("\nCommand timed out and its process group was stopped.");
+                124
+            }
+            None => {
+                stderr.push_str("\nCommand cancelled and its process group was stopped.");
+                143
+            }
+        };
+        Ok(ProcessOutput {
+            exit_code,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+            truncated: out_cut || err_cut,
+        })
+    }
     .await;
-    let ((stdout, out_cut), (stderr, err_cut)) = match capture {
-        Ok(result) => result?,
-        Err(_) => {
-            output.abort();
-            errors.abort();
-            anyhow::bail!("Command output did not close after exit");
-        }
-    };
-    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-    let exit_code = match finished {
-        Some(Ok(result)) => {
-            result?;
-            status.code().unwrap_or(128)
-        }
-        Some(Err(_)) => {
-            stderr.push_str("\nCommand timed out and its process group was stopped.");
-            124
-        }
-        None => {
-            stderr.push_str("\nCommand cancelled and its process group was stopped.");
-            143
-        }
-    };
-    Ok(HostResult::Process {
-        exit_code,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr,
-        truncated: out_cut || err_cut,
-    })
+    result.map_err(ProcessFailure::OutcomeUncertain)
 }
 
 #[cfg(test)]
@@ -834,9 +965,37 @@ mod tests {
     use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 
     use crate::{
-        host::{execute, run_process, run_process_until},
+        host::{ProcessOutput, ProcessRequest, execute, run_process, run_process_until},
         protocol::{HostCommand, HostResult},
     };
+
+    #[test]
+    fn execution_bindings_validate_each_native_identity_once_before_execution() {
+        use crate::{host::ExecutionBinding, protocol::WorkerRef};
+        let valid = WorkerRef {
+            host_id: "11111111-1111-4111-8111-111111111111".into(),
+            session_id: "session:22222222-2222-4222-8222-222222222222".into(),
+            window_id: "window:33333333-3333-4333-8333-333333333333".into(),
+            block_id: "block:44444444-4444-4444-8444-444444444444".into(),
+        };
+        let binding = ExecutionBinding::try_from(&valid).unwrap();
+        assert_eq!(binding.host_id.as_str(), valid.host_id);
+        assert_eq!(binding.native.session_id.as_str(), valid.session_id);
+        assert_eq!(binding.native.window_id.as_str(), valid.window_id);
+        assert_eq!(binding.native.block_id.as_str(), valid.block_id);
+        let mut wrong_kind = valid.clone();
+        wrong_kind.session_id = valid.block_id.clone();
+        assert!(matches!(
+            ExecutionBinding::try_from(&wrong_kind),
+            Err(crate::rex::RexError::InvalidId)
+        ));
+        let mut nil_host = valid;
+        nil_host.host_id = "00000000-0000-0000-0000-000000000000".into();
+        assert!(matches!(
+            ExecutionBinding::try_from(&nil_host),
+            Err(crate::rex::RexError::InvalidId)
+        ));
+    }
 
     #[tokio::test]
     async fn interrupt_releases_embedding_waiting_behind_the_owned_provider() {
@@ -862,7 +1021,7 @@ mod tests {
             .expect("Cancellation must not wait for the held embedding provider")
             .unwrap();
         assert!(
-            matches!(result, HostResult::Failed { message } if message == "History embedding was interrupted")
+            matches!(result, HostResult::Failed { message, .. } if message == "History embedding was interrupted")
         );
         assert!(
             held.is_none(),
@@ -873,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn source_capture_preserves_literal_arguments_and_nonzero_status() {
         let literal = "$(literal);*.chat";
-        let result = run_process(
+        let result = run_process(ProcessRequest::new(
             "node",
             &[
                 "--eval".into(),
@@ -882,19 +1041,16 @@ mod tests {
             ],
             std::path::Path::new("/"),
             Duration::from_secs(5),
-            1024,
+            1024).unwrap(),
         )
         .await
         .unwrap();
-        let HostResult::Process {
+        let ProcessOutput {
             exit_code,
             stdout,
             stderr,
             truncated,
-        } = result
-        else {
-            panic!("Expected captured native process");
-        };
+        } = result;
         assert_eq!(exit_code, 7);
         assert_eq!(stdout, literal);
         assert_eq!(stderr, "diagnostic");
@@ -933,11 +1089,14 @@ setInterval(() => {}, 1000);
         ];
         let running = tokio::spawn(async move {
             run_process_until(
-                "node",
-                &args,
-                &cwd,
-                Duration::from_secs(900),
-                2 * 1024 * 1024,
+                ProcessRequest::new(
+                    "node",
+                    &args,
+                    &cwd,
+                    Duration::from_secs(900),
+                    2 * 1024 * 1024,
+                )
+                .unwrap(),
                 async move {
                     let _ = cancelled.await;
                 },
@@ -967,15 +1126,12 @@ setInterval(() => {}, 1000);
             .expect("Cancellation must complete cleanup")
             .unwrap()
             .unwrap();
-        let HostResult::Process {
+        let ProcessOutput {
             exit_code,
             stdout,
             stderr,
             truncated,
-        } = result
-        else {
-            panic!("Expected cancelled native process");
-        };
+        } = result;
         assert_eq!(exit_code, 143);
         assert_eq!(stdout, "ready");
         assert!(stderr.contains("cancelled"));
@@ -1049,7 +1205,7 @@ setInterval(() => {}, 1000);
             timeout_seconds: 2,
         })
         .await;
-        let HostResult::Failed { message } = result else {
+        let HostResult::Failed { message, .. } = result else {
             panic!("Expected a command start failure");
         };
         assert!(message.contains(&program), "{message}");
@@ -1083,7 +1239,7 @@ setInterval(() => {}, 1000);
                 cancelled,
             )
             .await;
-        let HostResult::Failed { message } = result else {
+        let HostResult::Failed { message, .. } = result else {
             panic!("Expected a command start failure");
         };
         assert!(message.contains("node"), "{message}");
@@ -1184,3 +1340,6 @@ setInterval(() => {}, 1000);
         assert!(stderr.contains("timed out"));
     }
 }
+
+#[cfg(test)]
+mod error_tests;

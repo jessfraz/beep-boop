@@ -1093,6 +1093,7 @@ mod tests {
                 timing.reply(
                     "embedding-call",
                     &HostResult::Failed {
+                        delivery: None,
                         message: "PRIVATE_EMBEDDING_ERROR_SENTINEL".into(),
                     },
                 ),

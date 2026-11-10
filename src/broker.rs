@@ -15,7 +15,8 @@ use crate::{
     discovery::validate_node,
     host,
     protocol::{
-        AgentNode, CoordinatorBootstrap, HostCommand, HostResult, RuntimeCommand, RuntimeEventKind,
+        AgentNode, CoordinatorBootstrap, HostCommand, HostDelivery, HostResult, RuntimeCommand,
+        RuntimeEventKind,
     },
     runtime::{FrameReader, Runtime},
 };
@@ -196,7 +197,7 @@ impl Broker {
             )
         });
         let Some((sender, resume_agent, browser, browser_user_tabs)) = sender else {
-            return unavailable();
+            return not_started();
         };
         if let HostCommand::Browser { request, .. } = &command {
             let user_tabs = matches!(
@@ -219,6 +220,7 @@ impl Broker {
         }
         if matches!(command, HostCommand::ResumeAgentWorker { .. }) && !resume_agent {
             return HostResult::Failed {
+                delivery: Some(HostDelivery::NotStarted),
                 message: "Update agent on this host before resuming a saved child agent".into(),
             };
         }
@@ -239,7 +241,7 @@ impl Broker {
             .await
             .is_err()
         {
-            return unavailable();
+            return not_started();
         }
         match timeout(deadline, received).await {
             Ok(Ok(result)) => result,
@@ -318,6 +320,7 @@ impl Broker {
                             | HostCommand::ReadUsage { .. }
                     ) {
                         return HostResult::Failed {
+                            delivery: Some(HostDelivery::NotStarted),
                             message:
                                 "Nested node routing and remote context access are unsupported"
                                     .into(),
@@ -325,6 +328,7 @@ impl Broker {
                     }
                     if target(&command).is_some_and(|target| target != host_id) {
                         return HostResult::Failed {
+                            delivery: Some(HostDelivery::NotStarted),
                             message: "The explicit node differs from the resource's native owner"
                                 .into(),
                         };
@@ -339,6 +343,7 @@ impl Broker {
                 }
             };
         result.unwrap_or_else(|error| HostResult::Failed {
+            delivery: None,
             message: error.to_string(),
         })
     }
@@ -453,12 +458,20 @@ pub async fn control(runtime: &Runtime, command: RuntimeCommand) -> Result<()> {
     result?
 }
 
+fn not_started() -> HostResult {
+    HostResult::Failed {
+        delivery: Some(HostDelivery::NotStarted),
+        message: "The owning node was unavailable before accepting this effect; no command was started or replayed and no fallback host was used.".into(),
+    }
+}
+
 fn unavailable() -> HostResult {
-    HostResult::Failed { message: "The owning node disconnected or its reply was lost; no fallback host was used and the effect was not replayed.".into() }
+    HostResult::Failed { delivery: Some(HostDelivery::OutcomeUncertain), message: "The owning node disconnected or its reply was lost; no fallback host was used and the effect was not replayed.".into() }
 }
 
 #[cfg(test)]
 mod tests {
+    mod delivery;
     use crate::{
         broker::Broker,
         models::ModelSelection,
@@ -662,7 +675,9 @@ mod tests {
                 allocation_id: "child-allocation".into(),
             })
             .await;
-        assert!(matches!(child,HostResult::Failed{message} if message.contains("Update agent")));
+        assert!(
+            matches!(child,HostResult::Failed { message, .. } if message.contains("Update agent"))
+        );
         assert!(
             timeout(Duration::from_millis(25), worker.reader.next_frame())
                 .await
@@ -930,7 +945,7 @@ mod tests {
         ));
         let mut new = Worker::connect(broker.clone(), runtime.clone(), id).await;
         assert!(
-            matches!(timeout(Duration::from_secs(2),first).await.unwrap().unwrap(),HostResult::Failed{message} if message.contains("not replayed"))
+            matches!(timeout(Duration::from_secs(2),first).await.unwrap().unwrap(),HostResult::Failed { message, .. } if message.contains("not replayed"))
         );
         old.close().await;
         let next = {
@@ -1004,7 +1019,7 @@ mod tests {
         ));
         worker.close().await;
         assert!(
-            matches!(pending.await.unwrap(),HostResult::Failed{message} if message.contains("reply was lost"))
+            matches!(pending.await.unwrap(),HostResult::Failed { message, .. } if message.contains("reply was lost"))
         );
         assert!(matches!(
             broker.execute(effect(id, command)).await,
@@ -1077,7 +1092,9 @@ mod tests {
             panic!("Expected Exec effect")
         };
         let result=timeout(Duration::from_secs(13),pending).await.expect("The requested one-second deadline plus transport grace must replace the old fixed305-second wait").unwrap();
-        assert!(matches!(result,HostResult::Failed {message} if message.contains("not replayed")));
+        assert!(
+            matches!(result,HostResult::Failed { message, .. } if message.contains("not replayed"))
+        );
         assert!(
             !marker.exists(),
             "The coordinator must not run the timed-out effect"

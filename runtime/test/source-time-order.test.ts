@@ -32,7 +32,7 @@ async function claim(app: Awaited<ReturnType<typeof open>>) {
   await assert.rejects(app.sources.triage({ type: "triage_sources", instructions: "", cwd: "/", hosts: [],
     model: { provider: "openai", model_id: "no-inference-for-source-order", reasoning: null, fast: false } },
   () => { assert.fail("An empty model registry must stop before execution binding"); }, []), /Unknown model/);
-  const record = await app.storage.findDocument({ kind: "agent.sources", scope: { kind: "session" } }, "current", BACKGROUND_CONTEXT);
+  const record = await app.storage.findDocument({ kind: "agent.source.control", scope: { kind: "session" } }, "current", BACKGROUND_CONTEXT);
   assert.ok(record);
   const document = await app.storage.document(record.id, "current", BACKGROUND_CONTEXT);
   const active = document?.value.active;

@@ -92,7 +92,9 @@ export class ConversationCatalog {
     return this.loading;
   }
   private async includeTasks(items: Map<string, SavedConversation>, only?: string): Promise<void> {
-    for (const task of await this.tasks.list()) {
+    const owner = only === undefined ? undefined : await this.tasks.findOwner(only);
+    const tasks = only === undefined ? await this.tasks.list() : owner === undefined ? [] : [owner.task];
+    for (const task of tasks) {
       for (const actor of [task, ...task.agents]) {
         if (only !== undefined && actor.conversation_id !== only) continue;
         const saved = items.get(actor.conversation_id);

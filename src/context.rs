@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -14,7 +15,7 @@ use tokio::{
 
 use crate::{
     host,
-    protocol::{ContextMatch, ContextRepository, HostCommand, HostResult},
+    protocol::{ContextMatch, ContextRepository, HostResult},
 };
 
 #[derive(Clone, Default)]
@@ -140,21 +141,23 @@ impl ContextStore {
             Some(path) => self.path(id, path).await?,
             None => PathBuf::from(&repository.root),
         };
-        let inventory = host::execute(HostCommand::Exec {
-            program: "git".into(),
-            args: vec![
-                "ls-files".into(),
-                "--cached".into(),
-                "--others".into(),
-                "--exclude-standard".into(),
-                "--deduplicate".into(),
-                "-z".into(),
-            ],
-            cwd: repository.root.clone(),
-            timeout_seconds: 15,
-        })
-        .await;
-        let HostResult::Process {
+        let args = [
+            "ls-files".into(),
+            "--cached".into(),
+            "--others".into(),
+            "--exclude-standard".into(),
+            "--deduplicate".into(),
+            "-z".into(),
+        ];
+        let inventory = host::run_process(host::ProcessRequest::new(
+            "git",
+            &args,
+            Path::new(&repository.root),
+            Duration::from_secs(15),
+            256 * 1024,
+        )?)
+        .await?;
+        let host::ProcessOutput {
             exit_code: 0,
             stdout,
             mut truncated,

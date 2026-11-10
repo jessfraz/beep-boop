@@ -1,8 +1,45 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { invalidHostReply, protocolLines, validEvent, validRequest } from "../src/protocol.js";
+import { errorEvent, invalidHostReply, protocolLines, validEvent, validRequest } from "../src/protocol.js";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
 import type { MachineSnapshot } from "../src/generated/MachineSnapshot.js";
 import type { RuntimeRequest } from "../src/generated/RuntimeRequest.js";
+
+test("real SQLite failures retain storage classification through native cause wrapping", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-storage-failure-")), path = join(directory, "conversation.sqlite");
+  let database = new DatabaseSync(path);
+  try {
+    database.exec("CREATE TABLE retained (id INTEGER PRIMARY KEY)"); database.close();
+    database = new DatabaseSync(path, { readOnly: true });
+    let failure: unknown;
+    try { database.exec("INSERT INTO retained VALUES (1)"); }
+    catch (error) { failure = error; }
+    assert.ok(failure instanceof Error);
+    const event = errorEvent(new Error("private-path-and-content", { cause: failure }));
+    assert.deepEqual(event, { type: "failure", code: "storage_unavailable", message: "Storage is read-only. Saved state is retained." });
+    assert.equal(validEvent({ version: 1, id: 1, event }), true);
+    assert.equal(JSON.stringify(event).includes("private-path-and-content"), false);
+  } finally { database.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("owned provider failures and unknown programming failures have distinct sanitized codes", () => {
+  const secret = "provider-token-and-private-payload";
+  const providerCodes: ModelsError["code"][] = ["provider", "stream", "model_source"];
+  for (const code of providerCodes) {
+    const event = errorEvent(new ModelsError(code, secret));
+    assert.equal(event.code, "provider_unavailable"); assert.equal(event.message.includes(secret), false);
+  }
+  assert.equal(errorEvent(new ModelsError("auth", secret)).code, "authentication_failed");
+  assert.equal(errorEvent(new ModelsError("model_validation", secret)).code, "invalid_request");
+  const unknown = errorEvent(new TypeError(secret));
+  assert.equal(unknown.code, "internal"); assert.equal(unknown.message.includes(secret), false);
+  const hostile = { get cause() { throw new Error(secret); } };
+  assert.equal(errorEvent(hostile).code, "internal");
+});
 
 test("LF frames preserve Unicode and UTF-8 across every byte boundary, CRLF and EOF", async () => {
   const first = JSON.stringify({ text: "Line\u2028paragraph\u2029🐙日本語 café" });

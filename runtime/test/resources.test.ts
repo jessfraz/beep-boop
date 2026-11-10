@@ -66,6 +66,32 @@ test("resource allocation intent and consumers precede the host effect and survi
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("retiring a collector retains its last native receipt without starting the next effect", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-cancel-"));
+  let app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Review", outcome: "Verify the change" });
+    const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
+    await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Verified" }; });
+    const controller = new AbortController();
+    const collect: (host: string, call: (command: HostCommand) => Promise<HostResult>, signal: AbortSignal) => Promise<ResourceRecord[]> = app.resources.collect.bind(app.resources);
+    const calls: string[] = [];
+    await assert.rejects(collect(hostId, async (command) => {
+      calls.push(command.type);
+      assert.equal(command.type, "resource_inspect", "Retired collection must not start a cleanup plan");
+      if (command.type !== "resource_inspect") throw new Error("Unexpected host effect");
+      controller.abort(new Error("Collector invocation retired"));
+      return { type: "resource", report: { type: "observed", record: { ...command.record, state: { state: "ready", identity } } } };
+    }, controller.signal), /Collector invocation retired/);
+    assert.deepEqual(calls, ["resource_inspect"]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const saved = (await app.resources.list())[0];
+    assert.deepEqual(saved?.state, { state: "ready", identity }, "A completed receipt survives cancellation and reopen");
+    assert.deepEqual(saved?.consumers, []);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("waiting tasks, unsettled child consumers and other hosts hold resources; retiring blocks reuse before native removal", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); let app = await open(directory);
   try {

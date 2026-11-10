@@ -393,6 +393,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             match crate::native::prepare(request).unwrap_or_else(|error| {
                 crate::native::Operation::Local(crate::native::NativeEvent::Failure {
                     message: error.to_string(),
+                    code: Some(crate::protocol::ErrorCode::InvalidRequest),
                 })
             }) {
                 crate::native::Operation::Runtime(command) => *command,
@@ -557,6 +558,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
 
 fn disconnected() -> crate::protocol::HostResult {
     crate::protocol::HostResult::Failed {
+        delivery: Some(crate::protocol::HostDelivery::OutcomeUncertain),
         message: "The execution client disconnected; no command ran on a fallback host.".into(),
     }
 }
@@ -1486,7 +1488,7 @@ mod tests {
             matches!(&replies[2], HostResult::Browser { response: BrowserResponse::Disconnected { session_id, .. } } if *session_id == original_session)
         );
         assert!(
-            matches!(&replies[3], HostResult::Failed { message } if message.contains("no fallback host"))
+            matches!(&replies[3], HostResult::Failed { message, .. } if message.contains("no fallback host"))
         );
         assert!(
             matches!(&replies[4], HostResult::File { content, .. } if content == "from attached client")
@@ -1805,7 +1807,7 @@ mod tests {
         let path = service.wait_for("reply.json").await;
         let reply: HostResult = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(
-            matches!(reply, HostResult::Failed { message } if message.contains("disconnected"))
+            matches!(reply, HostResult::Failed { message, .. } if message.contains("disconnected"))
         );
         status(service.client().await).await;
         service.stop().await;

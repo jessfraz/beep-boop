@@ -62,6 +62,7 @@ impl HostEffects {
             return Ok(Admission::Rejected(Reply {
                 call_id,
                 result: HostResult::Failed {
+                    delivery: Some(crate::protocol::HostDelivery::NotStarted),
                     message: "The worker is busy; no command was started".into(),
                 },
             }));

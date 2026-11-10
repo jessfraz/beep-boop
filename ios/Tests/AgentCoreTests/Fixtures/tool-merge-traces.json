@@ -1,0 +1,660 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "terminal_body_survives_unknown_and_generic_activity",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_started",
+              "call_id": "call",
+              "name": "exec"
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Retained output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "command",
+                "command": "printf fixture",
+                "exit_code": 0,
+                "duration_ms": 12
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "late-unknown",
+              "role": "tool",
+              "text": "Stale unknown body",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "unknown"
+              },
+              "presentation": {
+                "type": "command",
+                "command": null,
+                "exit_code": null,
+                "duration_ms": null
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_started",
+              "call_id": "call",
+              "name": "exec"
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_finished",
+              "call_id": "call",
+              "name": "exec"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Retained output",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "command",
+          "command": "printf fixture",
+          "exit_code": 0,
+          "duration_ms": 12
+        }
+      }
+    },
+    {
+      "name": "older_call_enriches_failed_result_without_replacing_body",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Retained failure",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "failed"
+              },
+              "presentation": {
+                "type": "command",
+                "command": null,
+                "exit_code": 7,
+                "duration_ms": 12
+              }
+            }
+          }
+        },
+        {
+          "older_page": true,
+          "event": {
+            "type": "history",
+            "conversation_id": "fixture",
+            "messages": [
+              {
+                "entry_id": "call-entry",
+                "role": "tool",
+                "text": "Older arguments",
+                "continuation": false,
+                "final_chunk": true,
+                "tool": {
+                  "call_id": "call",
+                  "name": "exec",
+                  "status": "running"
+                },
+                "presentation": {
+                  "type": "command",
+                  "command": "printf fixture",
+                  "exit_code": null,
+                  "duration_ms": null
+                }
+              }
+            ],
+            "next_cursor": null,
+            "page_complete": true
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_finished",
+              "call_id": "call",
+              "name": "exec"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Retained failure",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "failed"
+        },
+        "presentation": {
+          "type": "command",
+          "command": "printf fixture",
+          "exit_code": 7,
+          "duration_ms": 12
+        }
+      }
+    },
+    {
+      "name": "presentation_free_output_chunks_are_retained",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "FIRST output\n",
+              "continuation": false,
+              "final_chunk": false,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "finished"
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "LAST output",
+              "continuation": true,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "finished"
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "call-entry",
+              "role": "tool",
+              "text": "Older arguments",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "running"
+              }
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "FIRST output\nLAST output",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "finished"
+        },
+        "presentation": null
+      }
+    },
+    {
+      "name": "sparse_command_metadata_and_name_do_not_erase_known_facts",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Retained output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "command",
+                "command": "printf fixture",
+                "exit_code": 0,
+                "duration_ms": 12
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Retained output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "command",
+                "command": null,
+                "exit_code": null,
+                "duration_ms": null
+              }
+            }
+          }
+        },
+        {
+          "older_page": true,
+          "event": {
+            "type": "history",
+            "conversation_id": "fixture",
+            "messages": [
+              {
+                "entry_id": "older-call",
+                "role": "tool",
+                "text": "Older arguments",
+                "continuation": false,
+                "final_chunk": true,
+                "tool": {
+                  "call_id": "call",
+                  "name": "",
+                  "status": "running"
+                },
+                "presentation": {
+                  "type": "command",
+                  "command": null,
+                  "exit_code": null,
+                  "duration_ms": null
+                }
+              }
+            ],
+            "next_cursor": null,
+            "page_complete": true
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_started",
+              "call_id": "call",
+              "name": ""
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_finished",
+              "call_id": "call",
+              "name": ""
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Retained output",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "command",
+          "command": "printf fixture",
+          "exit_code": 0,
+          "duration_ms": 12
+        }
+      }
+    },
+    {
+      "name": "sparse_file_metadata_retains_recorded_changes",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "+new\n-old",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "apply_patch",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "file_changes",
+                "changes": [
+                  {
+                    "path": "example.rs",
+                    "operation": "update"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "+new\n-old",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "apply_patch",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "file_changes",
+                "changes": []
+              }
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "+new\n-old",
+        "tool": {
+          "call_id": "call",
+          "name": "apply_patch",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "file_changes",
+          "changes": [
+            {
+              "path": "example.rs",
+              "operation": "update"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "sparse_agent_metadata_retains_names_action_and_targets",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Queued input",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "send_input",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "agent_coordination",
+                "action": "followup",
+                "sender_thread_id": "root-thread",
+                "receiver_thread_ids": [
+                  "child-thread"
+                ],
+                "agents": [
+                  {
+                    "thread_id": "child-thread",
+                    "name": "Drawing review",
+                    "state": "completed"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Queued input",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "send_input",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "agent_coordination",
+                "action": null,
+                "sender_thread_id": null,
+                "receiver_thread_ids": [],
+                "agents": []
+              }
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Queued input",
+        "tool": {
+          "call_id": "call",
+          "name": "send_input",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "agent_coordination",
+          "action": "followup",
+          "sender_thread_id": "root-thread",
+          "receiver_thread_ids": [
+            "child-thread"
+          ],
+          "agents": [
+            {
+              "thread_id": "child-thread",
+              "name": "Drawing review",
+              "state": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "known_result_upgrades_unknown_without_losing_call_metadata",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "call-entry",
+              "role": "tool",
+              "text": "Unconfirmed output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "unknown"
+              },
+              "presentation": {
+                "type": "command",
+                "command": "printf fixture",
+                "exit_code": null,
+                "duration_ms": null
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Confirmed output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "exec",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "command",
+                "command": null,
+                "exit_code": 0,
+                "duration_ms": 12
+              }
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Confirmed output",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "command",
+          "command": "printf fixture",
+          "exit_code": 0,
+          "duration_ms": 12
+        }
+      }
+    },
+    {
+      "name": "generic_activity_enriches_a_sparse_terminal_name",
+      "steps": [
+        {
+          "older_page": false,
+          "event": {
+            "type": "message",
+            "message": {
+              "entry_id": "result",
+              "role": "tool",
+              "text": "Retained output",
+              "continuation": false,
+              "final_chunk": true,
+              "tool": {
+                "call_id": "call",
+                "name": "",
+                "status": "finished"
+              },
+              "presentation": {
+                "type": "command",
+                "command": "printf fixture",
+                "exit_code": 0,
+                "duration_ms": 12
+              }
+            }
+          }
+        },
+        {
+          "older_page": false,
+          "event": {
+            "type": "activity",
+            "activity": {
+              "type": "tool_finished",
+              "call_id": "call",
+              "name": "exec"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "entry_id": "result",
+        "text": "Retained output",
+        "tool": {
+          "call_id": "call",
+          "name": "exec",
+          "status": "finished"
+        },
+        "presentation": {
+          "type": "command",
+          "command": "printf fixture",
+          "exit_code": 0,
+          "duration_ms": 12
+        }
+      }
+    }
+  ]
+}

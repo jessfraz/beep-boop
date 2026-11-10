@@ -55,7 +55,7 @@ test("public delegation after SQLite reopen retains unknown sessions and resumes
         commands.push(command);
         if (command.type === "resume_worker") {
           resumes += 1; assert.equal(command.binding.session_id, binding.session_id);
-          return available ? { type: "spawned", binding: replacement } : { type: "failed", message: "Session inspection unavailable" };
+          return available ? { type: "spawned", binding: replacement } : { type: "failed", delivery: "not_started", message: "Session inspection unavailable" };
         }
         assert.ok(command.type === "on_node" && command.command.type === "inspect_worker");
         return { type: "failed", message: "Native session-specific inspection could not complete" };
@@ -98,7 +98,7 @@ test("failed resumption preserves the known binding and cannot revoke it into a 
     let failed = false;
     try {
       await app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
-        if (command.type === "resume_worker") { resumes += 1; return { type: "failed", message: "Synthetic Rex read failed before mutation" }; }
+        if (command.type === "resume_worker") { resumes += 1; return { type: "failed", delivery: "not_started", message: "Synthetic Rex read failed before mutation" }; }
         assert.equal(command.type, "on_node"); return { type: "failed", message: "Synthetic inspection unavailable" };
       });
     } catch { failed = true; }

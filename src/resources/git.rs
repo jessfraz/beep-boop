@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    host,
-    protocol::{HostCommand, HostResult, TaskId},
+    host::{self, ProcessOutput, ProcessRequest},
+    protocol::TaskId,
     resources::{
         CleanupPlan, CleanupReceipt, NativeWorktreeIdentity, ResourceBackend, ResourceRecord,
         ResourceReport, ResourceState, WorktreeAllocation,
@@ -102,40 +102,20 @@ pub struct GuardedPlan {
     pub build_bytes: u64,
 }
 
-struct Output {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-async fn run(program: &str, args: Vec<String>, cwd: &Path) -> Result<Output> {
-    match host::execute(HostCommand::Exec {
-        program: program.into(),
-        args,
-        cwd: path_text(cwd)?,
-        timeout_seconds: 30,
-    })
-    .await
-    {
-        HostResult::Process {
-            exit_code,
-            stdout,
-            stderr,
-            truncated,
-        } => {
-            ensure!(
-                !truncated,
-                "Command output was incomplete; resource coverage is unknown"
-            );
-            Ok(Output {
-                code: exit_code,
-                stdout,
-                stderr,
-            })
-        }
-        HostResult::Failed { message } => anyhow::bail!("{message}"),
-        _ => anyhow::bail!("Unsupported resource command result"),
-    }
+async fn run(program: &str, args: Vec<String>, cwd: &Path) -> Result<ProcessOutput> {
+    let output = host::run_process(ProcessRequest::new(
+        program,
+        &args,
+        cwd,
+        std::time::Duration::from_secs(30),
+        256 * 1024,
+    )?)
+    .await?;
+    ensure!(
+        !output.truncated,
+        "Command output was incomplete; resource coverage is unknown"
+    );
+    Ok(output)
 }
 
 fn path_text(path: &Path) -> Result<String> {
@@ -144,14 +124,14 @@ fn path_text(path: &Path) -> Result<String> {
         .context("Resource path is not valid UTF-8")
 }
 
-async fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
+async fn git(cwd: &Path, args: &[&str]) -> Result<ProcessOutput> {
     run("git", args.iter().map(|arg| (*arg).into()).collect(), cwd).await
 }
 
 async fn value(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = git(cwd, args).await?;
     ensure!(
-        output.code == 0,
+        output.exit_code == 0,
         "Git resource inspection failed: {}",
         brief(&output.stderr)
     );
@@ -245,7 +225,7 @@ async fn planned_path(record: &ResourceRecord) -> Result<(PathBuf, PathBuf)> {
     )
     .await?;
     ensure!(
-        check.code == 0 && !record.branch.starts_with('-'),
+        check.exit_code == 0 && !record.branch.starts_with('-'),
         "Invalid worktree branch name"
     );
     let name = root
@@ -347,7 +327,7 @@ async fn unused(record: &ResourceRecord, identity: &NativeWorktreeIdentity) -> R
     unused_processes(&output, identity)
 }
 
-fn unused_processes(output: &Output, identity: &NativeWorktreeIdentity) -> Result<()> {
+fn unused_processes(output: &ProcessOutput, identity: &NativeWorktreeIdentity) -> Result<()> {
     // A confirmed consumer holds the tree even when another path was unreadable.
     let mut process = "unknown";
     for line in output.stdout.lines() {
@@ -362,7 +342,7 @@ fn unused_processes(output: &Output, identity: &NativeWorktreeIdentity) -> Resul
         }
     }
     ensure!(
-        (output.code == 0 || output.code == 1) && output.stderr.is_empty(),
+        (output.exit_code == 0 || output.exit_code == 1) && output.stderr.is_empty(),
         "Could not inspect active resource processes; preserving worktree"
     );
     Ok(())
@@ -380,7 +360,7 @@ impl GitBackend {
         Ok(Self { cleanup })
     }
 
-    async fn helper(&self, cwd: &Path, arguments: &[&str]) -> Result<Output> {
+    async fn helper(&self, cwd: &Path, arguments: &[&str]) -> Result<ProcessOutput> {
         let (program, prefix) = self
             .cleanup
             .split_first()
@@ -409,7 +389,7 @@ impl GitBackend {
                 ]
             )
             .await?
-            .code
+            .exit_code
                 == 1,
             "Allocation branch already exists; preserving it"
         );
@@ -494,7 +474,7 @@ impl GitBackend {
         unused(record, &identity).await?;
         let result = self.helper(Path::new(&identity.top), &["--plan"]).await?;
         ensure!(
-            result.code == 0,
+            result.exit_code == 0,
             "Guarded cleanup plan refused: {}",
             brief(&result.stderr)
         );
@@ -636,7 +616,7 @@ impl GitBackend {
                 .as_ref()
                 .and_then(|receipt| receipt.retained_submodules.as_deref())
                 .is_some_and(|path| Path::new(path).join("modules").is_dir());
-        if execution.as_ref().is_ok_and(|output| output.code == 0)
+        if execution.as_ref().is_ok_and(|output| output.exit_code == 0)
             && verified_receipt
             && archive_verified
             && absent == (true, true, true)
@@ -710,10 +690,10 @@ async fn absence(identity: &NativeWorktreeIdentity) -> Result<(bool, bool, bool)
     )
     .await?;
     ensure!(
-        branch.code == 0 || branch.code == 1,
+        branch.exit_code == 0 || branch.exit_code == 1,
         "Could not verify branch absence"
     );
-    Ok((path_absent, !registered, branch.code == 1))
+    Ok((path_absent, !registered, branch.exit_code == 1))
 }
 
 #[async_trait::async_trait]
@@ -1073,8 +1053,9 @@ mod tests {
             branch: "task/fixture".into(),
             head: "fixture-head".into(),
         };
-        let mut output = Output {
-            code: 1,
+        let mut output = ProcessOutput {
+            exit_code: 1,
+            truncated: false,
             stdout: format!("p123\nn{}\n", identity.top),
             stderr: "lsof: WARNING: inaccessible file system; output may be incomplete".into(),
         };

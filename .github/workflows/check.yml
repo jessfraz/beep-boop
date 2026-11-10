@@ -49,7 +49,7 @@ jobs:
       - name: Prepare verified browser extension fixture
         run: nix develop .#ci --command node runtime/dist/test/fixtures/prepare-browser.js "$RUNNER_TEMP"
       - name: Check Rust and runtime
-        run: nix develop .#ci --command make check
+        run: nix develop .#ci --command make check-prepared
       - name: Check native Codex history
         run: nix develop .#ci --command cargo test --locked --lib history::codex::tests::installed_codex_ -- --ignored
       - name: Check generated bindings
@@ -57,9 +57,30 @@ jobs:
       - name: Evaluate flake
         run: nix flake check --no-build --all-systems
       - name: Build packaged CLI
-        run: nix build
+        id: package
+        run: |
+          package=$(nix build .#beep-boop --print-out-paths)
+          printf 'path=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Check native embeddings
         run: nix develop --command cargo test --locked --lib embeddings::llama::tests::native_runner_is_private_warm_and_returns_retrieval_vectors -- --ignored --exact
       - name: Smoke test package
         run: |
           ./result/bin/beep-boop --version
+      - name: Publish qualified package closure
+        if: >-
+          github.repository == 'jessfraz/beep-boop' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+        run: |
+          if [ -z "${CACHIX_AUTH_TOKEN:-}" ]; then
+            echo '::error::CACHIX_AUTH_TOKEN is required to publish the qualified package. Configure a write token scoped to jessfraz-global-nix.'
+            exit 1
+          fi
+          if [[ "${PACKAGE_PATH:-}" != /nix/store/* || ! -d "${PACKAGE_PATH:-}" ]]; then
+            echo '::error::The qualified package output is missing.'
+            exit 1
+          fi
+          cachix push jessfraz-global-nix "$PACKAGE_PATH"

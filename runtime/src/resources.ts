@@ -100,8 +100,10 @@ export class ResourceStore {
       if (report.type === "collected") item.receipt = report.receipt;
     }, BACKGROUND_CONTEXT);
   }
-  async collect(hostId: string, call: HostCall): Promise<ResourceRecord[]> {
+  async collect(hostId: string, call: HostCall, signal?: AbortSignal): Promise<ResourceRecord[]> {
+    signal?.throwIfAborted();
     for (const initial of await this.list()) {
+      signal?.throwIfAborted();
       if (initial.host_id !== hostId || this.collecting.has(initial.id) || initial.state.state === "removed" || initial.state.state === "partial") continue;
       this.collecting.add(initial.id);
       try {
@@ -115,21 +117,23 @@ export class ResourceStore {
         if (current.record.consumers.length > 0) continue;
         // A persisted retiring plan is replayable only through the backend's exact identity checks.
         if (current.record.state.state === "retiring" && current.plan !== null) {
-          await this.adopt(await this.report({ type: "resource_collect", record: current.record, plan: current.plan }, call));
+          await this.adopt(await this.report({ type: "resource_collect", record: current.record, plan: current.plan }, call, signal));
           continue;
         }
-        const inspected = await this.report({ type: "resource_inspect", record: current.record }, call);
+        const inspected = await this.report({ type: "resource_inspect", record: current.record }, call, signal);
         await this.adopt(inspected);
         if (inspected.record.state.state !== "ready") continue;
-        const planned = await this.report({ type: "resource_plan_cleanup", record: inspected.record }, call);
+        const planned = await this.report({ type: "resource_plan_cleanup", record: inspected.record }, call, signal);
         await this.adopt(planned);
         if (planned.type !== "planned") continue;
-        await this.adopt(await this.report({ type: "resource_collect", record: planned.record, plan: planned.plan }, call));
+        await this.adopt(await this.report({ type: "resource_collect", record: planned.record, plan: planned.plan }, call, signal));
       } finally { this.collecting.delete(initial.id); }
     }
+    signal?.throwIfAborted();
     return this.list();
   }
-  private async report(command: HostCommand, call: HostCall): Promise<ResourceReport> {
+  private async report(command: HostCommand, call: HostCall, signal?: AbortSignal): Promise<ResourceReport> {
+    signal?.throwIfAborted();
     const result = await call(command);
     if (result.type !== "resource") throw new TaskError(`${command.type} was not confirmed: ${result.type === "failed" ? result.message : `unexpected ${result.type} result`}. Resource state is retained.`);
     return result.report;

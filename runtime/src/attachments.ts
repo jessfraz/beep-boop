@@ -168,16 +168,19 @@ export class AttachmentStore {
   private async keep(refs: readonly AttachmentRef[]): Promise<void> {
     for (const ref of refs) { const saved = await this.metadata(ref.id); saved.retained = true; await this.save(saved); }
   }
-  /** The callback checks its live owner synchronously before starting Pi submission.
-   * Serialize ownership start and retention with collection. Await Pi's SQLite
-   * receipt after releasing the store queue; retain bytes on uncertain failure. */
+  /** Retain bytes before Pi can own their references. The callback checks its
+   * live owner after filesystem work; undefined releases provisional retention.
+   * Await Pi's receipt outside this queue, retaining bytes on uncertain failure. */
   async admit<T>(refs: readonly AttachmentRef[] | undefined, submit: () => Promise<T> | undefined): Promise<T | undefined> {
     const operation = this.serial.catch(() => {}).then(async () => {
       const canonical = await this.resolve(refs);
+      const previous = await Promise.all(canonical.map(ref => this.metadata(ref.id)));
+      const restore = async () => { for (const saved of previous) if (!saved.retained) await this.save(saved); };
+      try { await this.keep(canonical); }
+      catch (error) { await restore(); throw error; }
       const pending = submit();
-      if (pending === undefined) return undefined;
+      if (pending === undefined) { await restore(); return undefined; }
       void pending.catch(() => {});
-      await this.keep(canonical);
       // Release the store queue before Pi's SQLite receipt: another SQLite
       // transaction may already be waiting to retain its own attachment refs.
       return { pending };

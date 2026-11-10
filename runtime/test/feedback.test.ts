@@ -99,7 +99,7 @@ test("feedback retains native allocation recovery decisions and the known bindin
       window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
     const task = await app.tasks.create({ title: "Recover existing work", outcome: "Keep its folder", model: fixtureModel });
     await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
-    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "failed", message: "Synthetic failure api_key=fixture-secret-value" })));
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "failed", delivery: "not_started", message: "Synthetic failure api_key=fixture-secret-value" })));
     const bundle = await app.feedback.capture("Resume failed", { ...context(), task_id: task.id });
     const decisions = bundle.entries.flatMap((entry) => entry.evidence).filter((evidence) => evidence.type === "allocation");
     const failed = decisions.find((evidence) => evidence.decision.operation === "resume" && evidence.decision.result.type === "failed");

@@ -113,25 +113,48 @@ also runs the production binary ranking and float reranking function against
 retained SQLite vectors, comparing separated semantic matches with exact
 search and checking original text, provenance and deletion.
 
-## Source journal
+## Durable task and source state
 
-Source decisions use Pi's native deltas. Rewriting a full retained journal on
-each decision blocks unrelated settings reads on the shared commit queue.
-The runtime regression verifies bounded persisted decision bytes, concurrent
-settings reads, atomic decisions, original versions and replay after reopening.
-It covers the former 64-delta checkpoint boundary. CI uses a 4 MiB synthetic
-journal; the same test accepts a larger qualification corpus:
+Tasks and source events use keyed Pi documents. Small control records retain
+source cursors and triage ownership; indexed references locate task owners and
+related event versions without decoding unrelated retained bodies. Pi still
+owns the SQLite schema and atomic commit boundary.
+
+Startup migrates legacy documents in batches of at most 32 records or 4 MiB,
+retaining the exact old records. Each batch is independently durable and resumes
+after interruption. A record larger than the budget owns its own batch.
+Migrated startup checks only the completion markers. The runtime regressions
+close Pi during both migrations, reopen the file, and verify ownership,
+versions, decisions and relinking. Cold point reads and hot admission also have
+byte budgets against actual native SQLite reads and writes in CI.
+
+The reusable growth fixture measures first migration, warm reopen, cold point
+reads and repeated task/source admission at increasing retained sizes:
 
 ```sh
-nix develop .#ci --command env AGENT_SOURCE_JOURNAL_BYTES=366639229 \
-  node --test runtime/dist/test/source-journal-performance.test.js
+nix develop .#ci --command node runtime/dist/test/fixtures/state-growth.js
 ```
 
-Local qualification with 366.7 MB of synthetic evidence reduced a settings read
-beside a decision from 1,603 ms to 5.6 ms. At 65 decisions, the read took 5.3 ms
-and cold replay took 224 ms. These timings are observations, not CI thresholds;
-CI rejects a decision that rewrites the corpus instead of a bounded delta.
+Set `AGENT_STATE_COUNTS`, `AGENT_STATE_SOURCE_BYTES`, `AGENT_STATE_TASK_BYTES`,
+`AGENT_STATE_RUNS` and `AGENT_STATE_REPORT` to qualify a larger synthetic corpus
+and retain JSON. Setup stays outside admission timing. The fixture records the
+actual SQL emitted by Pi and runs `EXPLAIN QUERY PLAN` with its real parameters.
+Point lookups use `documents_by_address`; document materialization and writes
+use the existing document-revision indexes and primary keys. No SQLite schema
+changes or extra indexes are required.
 
-The delta tail grows until a future compaction mechanism is provided. Replay
-cost beyond the qualified tail remains unmeasured; initial creation still
-writes a complete base. No schema or data migration is required.
+Local qualification with 4,096 tasks, 366 MiB of source text and 8 MiB of task
+summaries measured:
+
+| Operation | Legacy documents | Keyed documents |
+| --- | ---: | ---: |
+| Cold task and source-status read | 385 ms | 0.47 ms |
+| Task admission, median | 86.7 ms | 5.0 ms |
+| Task admission, p95 | 124.8 ms | 9.3 ms |
+| Source admission, median | 12.4 ms | 7.0 ms |
+| First readiness, including migration | 394 ms | 6,342 ms |
+
+The one-time migration trades startup work for bounded normal reads and writes.
+Subsequent Harness reopen took 0.85 ms, followed by the 0.47 ms point read.
+These local observations are not CI latency thresholds. The CI regressions
+verify bounded materialization and persistence, not machine-specific timings.

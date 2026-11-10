@@ -400,8 +400,8 @@ fn disconnected_write(
         let command = if let Some(command) = call.lifecycle.detach() {
             command
         } else if let Some(call_id) = call.host_calls.keys().next().cloned() {
-            let result = HostResult::Failed {
-                message: "The execution client disconnected; no command ran on a fallback host."
+            let result = HostResult::Failed { delivery: Some(crate::protocol::HostDelivery::OutcomeUncertain),
+                message: "The execution client disconnected; its operation outcome is unconfirmed. No fallback host was used."
                     .into(),
             };
             if let Some(timing) = call.host_calls.remove(&call_id) {

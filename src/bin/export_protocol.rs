@@ -1,19 +1,27 @@
 #[path = "export_protocol/swift.rs"]
 mod swift;
-use std::{fs, path::PathBuf};
+#[path = "../../tests/fixtures/tool_merge.rs"]
+mod tool_merge;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
+use agent_cli::protocol;
 use agent_cli::protocol::{
     AllocationDecision, DelegationDecision, HistoryImportBatch, HistoryImportReceipt, RuntimeEvent,
     RuntimeRequest, TaskOutcome,
 };
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use schemars::schema_for;
 use ts_rs::{Config, TS};
 
 fn main() -> Result<()> {
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/src/generated");
     fs::create_dir_all(&output)?;
-    let config = Config::from_env().with_out_dir(&output);
+    let config = Config::from_env()
+        .with_out_dir(&output)
+        .with_import_extension(Some("js"));
     RuntimeRequest::export_all(&config)?;
     RuntimeEvent::export_all(&config)?;
     agent_cli::native::NativeCommand::export_all(&config)?;
@@ -83,6 +91,7 @@ fn main() -> Result<()> {
     let fixtures =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ios/Tests/AgentCoreTests/Fixtures");
     fs::create_dir_all(&fixtures)?;
+    validate_tool_merge_traces(&fixtures)?;
     let schema = serde_json::to_value(schema_for!(agent_cli::native::NativeEvent))?;
     let events = swift::samples(&schema, &schema)?
         .into_iter()
@@ -117,6 +126,47 @@ fn main() -> Result<()> {
                 fs::write(path, formatted)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_tool_merge_traces(fixtures: &Path) -> Result<()> {
+    let traces: tool_merge::Traces =
+        serde_json::from_slice(&fs::read(fixtures.join("tool-merge-traces.json"))?)?;
+    ensure!(
+        traces.version == 1 && !traces.cases.is_empty(),
+        "Unsupported tool merge trace contract"
+    );
+    for case in traces.cases {
+        ensure!(!case.name.is_empty(), "A tool merge trace needs a name");
+        for step in case.steps {
+            ensure!(
+                !step.older_page
+                    || matches!(step.event, protocol::RuntimeEventKind::History { .. }),
+                "Only a history frame can be an older page"
+            );
+            let native = agent_cli::native::project(&step.event)
+                .context("A tool trace event must have a native projection")?;
+            let _: agent_cli::native::NativeEvent =
+                serde_json::from_slice(&serde_json::to_vec(&native)?)?;
+        }
+        let expected = protocol::RuntimeEventKind::Message {
+            message: protocol::HistoryMessage {
+                entry_id: case.expected.entry_id,
+                text: case.expected.text,
+                tool: Some(case.expected.tool),
+                presentation: case.expected.presentation,
+                role: protocol::HistoryRole::Tool,
+                continuation: false,
+                final_chunk: true,
+                notice_origin: None,
+                attachments: None,
+            },
+        };
+        let native = agent_cli::native::project(&expected)
+            .context("A tool trace result must have a native projection")?;
+        let _: agent_cli::native::NativeEvent =
+            serde_json::from_slice(&serde_json::to_vec(&native)?)?;
     }
     Ok(())
 }

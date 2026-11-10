@@ -12,8 +12,13 @@ public enum ConnectionState: Sendable, Equatable {
   }
 }
 
-private struct CoordinatorRejection: LocalizedError {
+struct CoordinatorRejection: LocalizedError {
   let message: String
+  let code: ErrorCode?
+  init(message: String, code: ErrorCode? = nil) {
+    self.message = message
+    self.code = code
+  }
   var errorDescription: String? { message }
 }
 
@@ -479,7 +484,7 @@ public actor CoordinatorSession {
           // Before readiness this rejects observation admission. Afterwards the
           // same event can be a mirrored model-turn failure; keep observing.
           if case .failure(let value) = event, !ready {
-            throw CoordinatorRejection(message: value.message)
+            throw CoordinatorRejection(message: value.message, code: value.code)
           }
           if case .disconnect = event {
             await disconnect()
@@ -785,7 +790,8 @@ public actor CoordinatorSession {
             guard let result else { throw ConnectionError.incompleteFrame }
             await actionConnections.removeValue(forKey: id)?.close()
             return result
-          case .failure(let failure): throw CoordinatorRejection(message: failure.message)
+          case .failure(let failure):
+            throw CoordinatorRejection(message: failure.message, code: failure.code)
           default: throw ConnectionError.incompleteFrame
           }
         }
@@ -843,7 +849,8 @@ public actor CoordinatorSession {
             publish()
             await actionConnections.removeValue(forKey: id)?.close()
             return result
-          case .failure(let value): throw CoordinatorRejection(message: value.message)
+          case .failure(let value):
+            throw CoordinatorRejection(message: value.message, code: value.code)
           default: throw ConnectionError.incompleteFrame
           }
         }
@@ -885,7 +892,8 @@ public actor CoordinatorSession {
           guard let status else { throw ConnectionError.incompleteFrame }
           await actionConnections.removeValue(forKey: id)?.close()
           return status
-        case .failure(let value): throw CoordinatorRejection(message: value.message)
+        case .failure(let value):
+          throw CoordinatorRejection(message: value.message, code: value.code)
         default: throw ConnectionError.incompleteFrame
         }
       }
@@ -935,7 +943,8 @@ public actor CoordinatorSession {
           guard let details else { throw ConnectionError.incompleteFrame }
           await actionConnections.removeValue(forKey: id)?.close()
           return details
-        case .failure(let value): throw CoordinatorRejection(message: value.message)
+        case .failure(let value):
+          throw CoordinatorRejection(message: value.message, code: value.code)
         default: throw ConnectionError.incompleteFrame
         }
       }

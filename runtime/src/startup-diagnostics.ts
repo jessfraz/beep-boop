@@ -1,7 +1,7 @@
 import { chmod, mkdir, open } from "node:fs/promises";
 import { join } from "node:path";
 
-type Stage = "storage_open" | "harness_recovery" | "application_recovery" | "environment_configure" | "node_registration";
+type Stage = "storage_open" | "harness_recovery" | "application_recovery" | "task_migration" | "source_migration" | "environment_configure" | "node_registration";
 type Cause = { kind: "sqlite" | "os"; code: number } | { kind: "error" | "unknown" };
 type Record = { version: 1; time_ms: number; stage: Stage } & (
   { kind: "begin" } | { kind: "ready"; duration_ms: number } |

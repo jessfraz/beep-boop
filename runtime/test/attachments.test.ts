@@ -111,6 +111,58 @@ const host: WorkerHost = { host_id: "11111111-1111-4111-8111-111111111111", name
 const binding = { host_id: host.host_id ?? "", session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
 
+for (const child of [false, true]) test(`${child ? "child" : "task"} attachment admission leaves unrelated Pi commits available during retention I/O`, { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-commit-")), models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const tasks = new TaskStore(session, new ConversationModels(models)), store = new AttachmentStore(directory); tasks.useAttachments(store);
+  let release = () => {}, admission: Promise<unknown> | undefined, unrelated: Promise<unknown> | undefined, timer: NodeJS.Timeout | undefined;
+  try {
+    const task = await tasks.create({ title: "Retain exact evidence", outcome: "Keep the input", model: fixtureModel });
+    const root = await session.root(BACKGROUND_CONTEXT), file = await upload(store, Buffer.from("Real immutable attachment bytes"));
+    let entered = () => {}, reads = 0;
+    const started = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+    const resolve = store.resolve.bind(store);
+    store.resolve = async refs => {
+      const canonical = await resolve(refs);
+      if (++reads === 2) { entered(); await held; }
+      return canonical;
+    };
+    admission = child ? tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Read the file", input: "Review", inputId: "file", attachments: [file] })
+      : tasks.enqueue(task.id, "Review", "file", undefined, undefined, [file]);
+    await started;
+    unrelated = root.submit({ type: "write", requestId: "unrelated", entry: { kind: "fixture.admission", data: { text: "Independent canonical work" } } }, BACKGROUND_CONTEXT);
+    await Promise.race([unrelated, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Attachment retention I/O must not own Pi's shared transaction")), 2_000);
+    })]);
+    release(); await admission;
+    await assert.rejects(store.request({ type: "discard", id: file.id }), /retained/);
+    const saved = await tasks.get(task.id);
+    assert.deepEqual((child ? saved.agents[0]?.pending : saved.pending)?.[0]?.attachments, [file]);
+  } finally {
+    clearTimeout(timer); release(); await Promise.allSettled([admission, unrelated]);
+    await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retention failure cannot leave a Pi input referring to an unretained attachment", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-retention-failure-")), models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const store = new AttachmentStore(directory);
+  try {
+    const file = await upload(store, Buffer.from("An original that must not disappear after admission")), root = await session.root(BACKGROUND_CONTEXT);
+    const temporary = join(directory, "attachments", file.id, "metadata.json.tmp"); await mkdir(temporary);
+    await assert.rejects(store.admit([file], () => root.submit({ type: "write", requestId: "must-not-admit",
+      entry: { kind: "fixture.attachment-admission", data: { attachment_id: file.id } } }, BACKGROUND_CONTEXT)));
+    await session.commit(async () => {}, BACKGROUND_CONTEXT);
+    assert.equal((await root.entries({}, 20, undefined, BACKGROUND_CONTEXT)).items.some(entry => entry.kind === "fixture.attachment-admission"), false,
+      "Pi must never durably reference a file whose retention failed");
+    await rm(temporary, { recursive: true });
+    assert.deepEqual(await store.request({ type: "discard", id: file.id }), { type: "discarded" });
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("Pi receives native images and delegation keeps immutable files on each actor's execution host", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-attachment-model-"));
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);

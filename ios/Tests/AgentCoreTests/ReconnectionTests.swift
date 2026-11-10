@@ -21,6 +21,8 @@ private actor ReconnectCoordinator {
   private var released = false
   private var stopped = false
   private var failures: [String] = []
+  private var nextObservationFailure: NativeEventFailure?
+  private var loseSubmissionReceipt = false
 
   init(_ behavior: ReconnectBehavior) { self.behavior = behavior }
   func observedIDs() -> [[String]] { observations }
@@ -41,6 +43,10 @@ private actor ReconnectCoordinator {
     sockets.values.map { String(describing: $0.state) }.sorted()
   }
   func errors() -> [String] { failures }
+  func failNextObservation(_ failure: NativeEventFailure) {
+    nextObservationFailure = failure
+  }
+  func loseNextSubmissionReceipt() { loseSubmissionReceipt = true }
   func observerEvent(_ event: NativeEvent) async throws {
     for id in observers {
       if let socket = sockets[id] { try await emit(event, to: socket) }
@@ -88,6 +94,13 @@ private actor ReconnectCoordinator {
         observers.insert(id)
         observations.append(request.inputIds)
         sourceStatusRequests.append(request.sourceStatus)
+        if let failure = nextObservationFailure {
+          nextObservationFailure = nil
+          try await emit(.failure(failure), to: socket)
+          try await emit(.done, to: socket)
+          _ = try await receive(socket)
+          return
+        }
         if behavior == .reject {
           try await emit(.failure(.init(message: "This client is not authorized.")), to: socket)
           try await emit(.done, to: socket)
@@ -141,6 +154,10 @@ private actor ReconnectCoordinator {
         _ = try await receive(socket)
       case .submit(let input):
         submissions.append(input)
+        if loseSubmissionReceipt {
+          loseSubmissionReceipt = false
+          return
+        }
         try await emit(.accepted(.init(inputId: input.inputId, work: acceptedWork)), to: socket)
         if behavior == .turnFailure {
           try await emit(
@@ -491,6 +508,72 @@ func terminalCoordinatorRejectionStopsRetryingAndStaysOutOfHistory(_ behavior: R
   while !(await predicate()) {
     guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
     try await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [ErrorCode.coordinatorUnavailable, .internal])
+func transientAdmissionFailureRecoversTheOriginalUncertainInputWithoutResending(_ code: ErrorCode)
+  async throws
+{
+  try await withReconnectCoordinator(.recover) { model, fixture, outbox in
+    try await waitForReconnectState { model.connection == .connected }
+    await fixture.releaseSnapshot()
+    await fixture.failNextObservation(
+      .init(code: code, message: "The observation is temporarily unavailable."))
+    await fixture.loseNextSubmissionReceipt()
+    model.draft = "Keep the original uncertain input"
+    await model.send()
+    model.draft = "Preserve new typing while reconnecting"
+    try await waitForReconnectFixture { await fixture.observedIDs().count >= 2 }
+    try await waitForReconnectState {
+      model.rows.contains { $0.row.entryID != nil }
+        || (model.connection == .disconnected && model.error != nil)
+    }
+    try #require(model.connection == .connected, "A typed transient rejection must reconnect")
+    let submitted = try #require(await fixture.submitted().first)
+    #expect(await fixture.submitted() == [submitted], "An uncertain write is never replayed")
+    #expect(await fixture.observedIDs() == [[], [submitted.inputId], [submitted.inputId]])
+    #expect(model.rows.filter { $0.row.role == .user }.count == 1)
+    #expect(model.rows.first?.row.entryID == "saved-\(submitted.inputId)")
+    #expect(model.rows.first?.row.delivery == .saved)
+    #expect(try savedInputs(at: outbox).isEmpty)
+    #expect(model.draft == "Preserve new typing while reconnecting")
+    #expect(model.error == nil)
+  }
+}
+
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    ErrorCode.invalidRequest, .authenticationRequired, .authenticationFailed,
+    .providerUnavailable, .storageUnavailable,
+  ])
+func permanentAdmissionFailurePreservesUncertainInputAndRequiresCorrection(_ code: ErrorCode)
+  async throws
+{
+  try await withReconnectCoordinator(.recover) { model, fixture, outbox in
+    try await waitForReconnectState { model.connection == .connected }
+    await fixture.releaseSnapshot()
+    await fixture.failNextObservation(
+      .init(code: code, message: "The observation is temporarily unavailable."))
+    await fixture.loseNextSubmissionReceipt()
+    model.draft = "Retain the unconfirmed input"
+    await model.send()
+    model.draft = "Unrelated new draft"
+    try await waitForReconnectState { model.connection == .disconnected && model.error != nil }
+    let submitted = try #require(await fixture.submitted().first)
+    #expect(try savedInputs(at: outbox) == [submitted])
+    #expect(model.rows.first?.row.delivery == .uncertain)
+    #expect(model.draft == "Unrelated new draft")
+    #expect(model.error == "The observation is temporarily unavailable.")
+    try await waitForReconnectFixture { await fixture.activeSockets() == 0 }
+    try await Task.sleep(for: .milliseconds(2300))
+    #expect(await fixture.observedIDs() == [[], [submitted.inputId]])
+    #expect(await fixture.submitted() == [submitted])
   }
 }
 

@@ -1071,14 +1071,18 @@ impl State {
     fn tool(&mut self, call_id: String, name: String, status: ToolStatus) {
         if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id: id, .. } if id == &call_id)) {
             let message = &mut self.messages[index];
-            if matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Failed | ToolStatus::Declined | ToolStatus::Interrupted, .. })
-                || (matches!(status, ToolStatus::Unknown) && !matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Unknown, .. }))
-                || (matches!(&message.kind, MessageKind::Tool { status: ToolStatus::Finished, .. }) && matches!(status, ToolStatus::Running | ToolStatus::Finished)) {
-                return;
+            let MessageKind::Tool { status: saved, .. } = message.kind else { return; };
+            let preserve = stale_tool_status(saved, status)
+                || (saved == status && !matches!(saved, ToolStatus::Running | ToolStatus::Unknown));
+            let enrich_name = !name.trim().is_empty()
+                && (!preserve || message.tool_name.trim().is_empty())
+                && message.tool_name != name;
+            if preserve && !enrich_name { return; }
+            if enrich_name { message.tool_name = name; }
+            if !preserve {
+                message.kind = MessageKind::Tool { call_id, status };
+                if message.output != CellOutput::Printed { message.output = CellOutput::Mutable; }
             }
-            message.tool_name = name;
-            message.kind = MessageKind::Tool { call_id, status };
-            if message.output != CellOutput::Printed { message.output = CellOutput::Mutable; }
             message.rendered = None;
             self.invalidate(index);
         } else {
@@ -1100,27 +1104,19 @@ impl State {
             final_chunk,
             ..
         } = message;
-        let label = (presentation.is_some() || continuation).then_some(text);
+        let label = text;
         let identity = tool.call_id.clone();
         let name = tool.name.clone();
         let terminal = tool.status != ToolStatus::Running && final_chunk;
         let index = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &tool.call_id));
         let stale = index.is_some_and(|index| match self.messages[index].kind {
-            MessageKind::Tool { status, .. } => {
-                (status != ToolStatus::Running
-                    && status != ToolStatus::Unknown
-                    && tool.status == ToolStatus::Running)
-                    || (matches!(
-                        status,
-                        ToolStatus::Failed | ToolStatus::Declined | ToolStatus::Interrupted
-                    ) && status != tool.status)
-            }
+            MessageKind::Tool { status, .. } => stale_tool_status(status, tool.status),
             _ => false,
         });
         if let Some(index) = index {
             let call = matches!(tool.status, ToolStatus::Running);
             self.tool(tool.call_id, name.clone(), tool.status);
-            if let Some(label) = label.filter(|_| !stale) {
+            if !stale {
                 if continuation && self.messages[index].body_entry.as_ref() == Some(&entry_id) {
                     self.messages[index].append(&label);
                 } else {
@@ -1142,7 +1138,7 @@ impl State {
                 self.messages[index].id = Some(entry_id);
             }
         } else {
-            let mut message = Message::new(Some(entry_id), Role::Tool, label.unwrap_or_default());
+            let mut message = Message::new(Some(entry_id), Role::Tool, label);
             message.body_entry = message.id.clone();
             message.output = if historical && self.loading_history.is_some() {
                 CellOutput::Retained
@@ -1179,7 +1175,7 @@ impl State {
         if let Some(message) = self.messages.iter_mut().find(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
         {
             message.presentation = merge_tool_presentation(message.presentation.take(), presentation, stale);
-            message.tool_name = name;
+            if !name.trim().is_empty() && (!stale || message.tool_name.trim().is_empty()) { message.tool_name = name; }
             message.rendered = None;
             if terminal && !matches!(message.output, CellOutput::Printed | CellOutput::Retained) { message.output = CellOutput::Ready; }
         }
@@ -2289,13 +2285,29 @@ impl State {
         }
     }
 }
+fn stale_tool_status(saved: ToolStatus, incoming: ToolStatus) -> bool {
+    (incoming == ToolStatus::Running
+        && saved != ToolStatus::Running
+        && saved != ToolStatus::Unknown)
+        || (incoming == ToolStatus::Unknown && saved != ToolStatus::Unknown)
+        || (matches!(
+            saved,
+            ToolStatus::Failed | ToolStatus::Declined | ToolStatus::Interrupted
+        ) && saved != incoming)
+}
+
 fn merge_tool_presentation(
     saved: Option<Box<crate::protocol::MessagePresentation>>,
     incoming: Option<Box<crate::protocol::MessagePresentation>>,
     stale: bool,
 ) -> Option<Box<crate::protocol::MessagePresentation>> {
     use crate::protocol::MessagePresentation;
-    match (saved.map(|value| *value), incoming.map(|value| *value)) {
+    let (first, second) = if stale {
+        (saved, incoming)
+    } else {
+        (incoming, saved)
+    };
+    match (first.map(|value| *value), second.map(|value| *value)) {
         (
             Some(MessagePresentation::Command {
                 command,
@@ -2303,38 +2315,59 @@ fn merge_tool_presentation(
                 duration_ms,
             }),
             Some(MessagePresentation::Command {
-                command: next_command,
-                exit_code: next_exit,
-                duration_ms: next_duration,
+                command: other_command,
+                exit_code: other_exit,
+                duration_ms: other_duration,
             }),
-        ) => {
-            let (command, exit_code, duration_ms) = if stale {
-                (
-                    command.or(next_command),
-                    exit_code.or(next_exit),
-                    duration_ms.or(next_duration),
-                )
+        ) => Some(MessagePresentation::Command {
+            command: command.or(other_command),
+            exit_code: exit_code.or(other_exit),
+            duration_ms: duration_ms.or(other_duration),
+        }),
+        (
+            Some(MessagePresentation::FileChanges { changes }),
+            Some(MessagePresentation::FileChanges {
+                changes: other_changes,
+            }),
+        ) => Some(MessagePresentation::FileChanges {
+            changes: if changes.is_empty() {
+                other_changes
             } else {
-                (
-                    next_command.or(command),
-                    next_exit.or(exit_code),
-                    next_duration.or(duration_ms),
-                )
-            };
-            Some(Box::new(MessagePresentation::Command {
-                command,
-                exit_code,
-                duration_ms,
-            }))
-        }
-        (saved, incoming) => if stale {
-            saved.or(incoming)
-        } else {
-            incoming.or(saved)
-        }
-        .map(Box::new),
+                changes
+            },
+        }),
+        (
+            Some(MessagePresentation::AgentCoordination {
+                action,
+                sender_thread_id,
+                receiver_thread_ids,
+                agents,
+            }),
+            Some(MessagePresentation::AgentCoordination {
+                action: other_action,
+                sender_thread_id: other_sender,
+                receiver_thread_ids: other_receivers,
+                agents: other_agents,
+            }),
+        ) => Some(MessagePresentation::AgentCoordination {
+            action: action.or(other_action),
+            sender_thread_id: sender_thread_id.or(other_sender),
+            receiver_thread_ids: if receiver_thread_ids.is_empty() {
+                other_receivers
+            } else {
+                receiver_thread_ids
+            },
+            agents: if agents.is_empty() {
+                other_agents
+            } else {
+                agents
+            },
+        }),
+        (first, second) => first.or(second),
     }
+    .map(Box::new)
 }
+
 fn editor() -> TextArea<'static> {
     let mut editor = TextArea::default();
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
@@ -2534,6 +2567,7 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    mod tool_merge;
     use crate::{
         models::{ModelSelection, Reasoning},
         protocol::{HistoryMessage, HistoryRole, ModelActivity, RuntimeEventKind},
@@ -4789,7 +4823,8 @@ mod tests {
             },
         });
         let text = rendered(&mut view, 100, 30);
-        assert_eq!(text.matches("read_source").count(), 1);
+        assert_eq!(text.matches("• Tool read_source").count(), 1);
+        assert_eq!(text.matches("read_source finished").count(), 1);
         assert!(text.find("• Tool read_source").unwrap() < text.find("NEW_REQUEST").unwrap());
         assert!(!text.contains("✓ read_source"));
     }

@@ -1,7 +1,7 @@
-.PHONY: bindings runtime build check
+.PHONY: bindings runtime build check check-prepared
 
 bindings:
-	TS_RS_IMPORT_EXTENSION=js cargo run --bin export-protocol
+	cargo run --locked --bin export-protocol
 
 runtime: bindings
 	npm --prefix runtime ci --ignore-scripts
@@ -11,6 +11,8 @@ build: runtime
 	cargo build
 
 check: runtime
+
+check check-prepared:
 	cargo fmt --check
 	cargo clippy --all --benches --tests --examples --all-features -- -D warnings
 	cargo build --example terminal-fixture

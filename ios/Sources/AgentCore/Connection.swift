@@ -86,6 +86,16 @@ public enum ConnectionError: Error, LocalizedError, Sendable {
     return error.localizedDescription
   }
   static func shouldReconnect(after error: any Error) -> Bool {
+    if let rejection = error as? CoordinatorRejection {
+      switch rejection.code {
+      case .coordinatorUnavailable?, .internal?: return true
+      // Legacy failures have no safe transient classification. Keep requiring
+      // correction rather than guessing from their human-readable message.
+      case .invalidRequest?, .authenticationRequired?, .authenticationFailed?,
+        .providerUnavailable?, .storageUnavailable?, nil:
+        return false
+      }
+    }
     if let error = error as? ConnectionError {
       switch error {
       case .closed, .timedOut, .incompleteFrame, .dnsUnavailable, .vpnUnavailable: return true

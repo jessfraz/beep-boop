@@ -163,7 +163,7 @@ For development:
 
 ```sh
 nix develop
-make runtime check
+make check
 nix build
 ```
 
@@ -173,3 +173,5 @@ and package builds on Linux and macOS without personal accounts. Paired
 cached indexing. Reconnect tests start the real coordinator and Pi database;
 macOS also runs the native Swift client against it. Separate fault-injection
 tests use controlled external peers.
+See the [build and publication flow](docs/builds.md) for runtime preparation and
+the qualified package cache.

@@ -22,6 +22,7 @@ import type { SourceEvent } from "../src/generated/SourceEvent.js";
 import type { SourceScanProgress } from "../src/generated/SourceScanProgress.js";
 import type { SourceState } from "../src/generated/SourceState.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { TaskOutcome } from "../src/generated/TaskOutcome.js";
 
 function event(id: string, account = "alpha", version = "v1"): SourceEvent {
   return { id, version, source: { provider: "mail", account, thread_id: "thread-" + id },
@@ -30,6 +31,107 @@ function event(id: string, account = "alpha", version = "v1"): SourceEvent {
 function batch(events: SourceEvent[], cursor: string, account = "alpha"): SourceBatch {
   return { source: { provider: "mail", account }, events, checkpoint: { value: cursor }, coverage: { status: "complete" } };
 }
+
+test("source-status observers coalesce native publications and retire queued refreshes on close", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-observer-bound-")), app = await open(directory);
+  let release = () => {}, stop: (() => Promise<void>) | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Observed task", outcome: "Retain source outcomes" });
+    let entered = () => {}, reads = 0;
+    const started = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+    const states = app.sources.states.bind(app.sources);
+    app.sources.states = async () => {
+      const result = await states();
+      if (++reads === 2) { entered(); await held; }
+      return result;
+    };
+    const published: SourceState[][] = [];
+    stop = await app.sources.watchStates(value => published.push(value), error => { throw error; });
+    const outcome = (index: number): TaskOutcome => ({ task_id: task.id, conversation_id: task.conversation_id,
+      entry_id: null, tool_call_id: null, summary: `Native progress ${index}`, sources: [], state: { state: "progress" } });
+    await app.session.commit(tx => app.sources.recordIn(tx, outcome(0), false), BACKGROUND_CONTEXT);
+    await started;
+    for (let index = 1; index <= 64; index += 1) await app.session.commit(tx => app.sources.recordIn(tx, outcome(index), false), BACKGROUND_CONTEXT);
+    const closing = stop(); release(); await closing; stop = undefined;
+    assert.equal(reads, 2, "Closing must retire coalesced notifications without reading each queued journal version");
+    assert.equal(published.length, 1, "The held state read cannot publish after its owner closes");
+    assert.equal((await app.sources.events({ provider: "task_outcomes", pending: true })).length, 1,
+      "Coalescing display work must preserve canonical supersession decisions");
+  } finally { release(); await stop?.(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("canceling an owned native source judgment settles its input before releasing execution", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-cancel-")), app = await open(directory), controller = new AbortController();
+  let releaseSource = () => {}, releaseOther = () => {}, running: Promise<void> | undefined, other: Promise<unknown> | undefined, timer: NodeJS.Timeout | undefined;
+  try {
+    const original = batch([event("cancel-owned")], "preserved"); await app.sources.admit(original, null);
+    const before = await app.sources.events(), coverage = await app.sources.states();
+    let enteredSource = () => {}, enteredOther = () => {}, sourceAborted = false, otherAborted = false, releases = 0;
+    const sourceStarted = new Promise<void>(resolve => { enteredSource = resolve; });
+    const otherStarted = new Promise<void>(resolve => { enteredOther = resolve; });
+    const heldSource = new Promise<void>(resolve => { releaseSource = resolve; }), heldOther = new Promise<void>(resolve => { releaseOther = resolve; });
+    app.faux.setResponses([
+      async (_input, options) => { options?.signal?.addEventListener("abort", () => { otherAborted = true; releaseOther(); }, { once: true });
+        enteredOther(); await heldOther; return fauxAssistantMessage("Independent work finished"); },
+      async (_input, options) => { options?.signal?.addEventListener("abort", () => { sourceAborted = true; releaseSource(); }, { once: true });
+        enteredSource(); await heldSource; return fauxAssistantMessage(""); },
+    ]);
+    const independent = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    await independent.configure({ model: { provider: "openai", modelId: "fixture" } }, BACKGROUND_CONTEXT);
+    other = independent.submit({ type: "input", content: "Independent actor" }, BACKGROUND_CONTEXT).then(input => input.wait(BACKGROUND_CONTEXT));
+    await otherStarted;
+    const triage: (request: typeof command, bind: Parameters<SourceJournal["triage"]>[1], extensions: Parameters<SourceJournal["triage"]>[2], signal?: AbortSignal) => Promise<void>
+      = app.sources.triage.bind(app.sources);
+    running = triage(command, conversation => {
+      const release = app.executions.bind(conversation.id.toString(), { cwd: "/", hosts: [], role: "triage", call: async () => ({ type: "written" }) });
+      return () => { releases += 1; release(); };
+    }, [app.tools.host, app.tools.main, app.sourceTools.main], controller.signal);
+    const stopped = assert.rejects(running, /did not complete|stopped/); await sourceStarted; controller.abort();
+    await Promise.race([stopped, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("A canceled source owner must retire its native judgment")), 2_000);
+    })]);
+    assert.equal(sourceAborted, true); assert.equal(otherAborted, false); assert.equal(releases, 1);
+    assert.deepEqual(await app.sources.events(), before); assert.deepEqual(await app.sources.states(), coverage);
+    releaseOther(); await other;
+  } finally {
+    clearTimeout(timer); controller.abort(); releaseSource(); releaseOther(); await Promise.allSettled([running, other]);
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("canceling recovery during preflight retires the already placed source judgment", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-recovery-cancel-")), app = await open(directory), controller = new AbortController();
+  let releaseSource = () => {}, releasePreflight = () => {}, running: Promise<void> | undefined, recovery: Promise<void> | undefined, timer: NodeJS.Timeout | undefined;
+  try {
+    await app.sources.admit(batch([event("recover-owned")], "preserved"), null);
+    const before = await app.sources.events(), coverage = await app.sources.states();
+    let enteredSource = () => {}, enteredPreflight = () => {}, aborted = () => {};
+    const sourceStarted = new Promise<void>(resolve => { enteredSource = resolve; });
+    const preflightStarted = new Promise<void>(resolve => { enteredPreflight = resolve; });
+    const sourceAborted = new Promise<void>(resolve => { aborted = resolve; });
+    const heldSource = new Promise<void>(resolve => { releaseSource = resolve; }), heldPreflight = new Promise<void>(resolve => { releasePreflight = resolve; });
+    app.faux.setResponses([async (_input, options) => {
+      options?.signal?.addEventListener("abort", () => { aborted(); releaseSource(); }, { once: true });
+      enteredSource(); await heldSource; return fauxAssistantMessage("");
+    }]);
+    running = app.triage(); void running.catch(() => {}); await sourceStarted;
+    const preflight = app.tasks.inference.preflight.bind(app.tasks.inference);
+    app.tasks.inference.preflight = async selected => { await preflight(selected); enteredPreflight(); await heldPreflight; };
+    const other = new SourceJournal(app.session, app.tasks);
+    const triage: (request: typeof command, bind: Parameters<SourceJournal["triage"]>[1], extensions: Parameters<SourceJournal["triage"]>[2], signal?: AbortSignal) => Promise<void>
+      = other.triage.bind(other);
+    recovery = triage(command, () => { assert.fail("Canceled recovery cannot acquire a new execution binding"); }, [], controller.signal);
+    void recovery.catch(() => {}); await preflightStarted; controller.abort();
+    await Promise.race([sourceAborted, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Canceling preflight must retire its already placed native source input")), 2_000);
+    })]);
+    releasePreflight(); await assert.rejects(recovery, /stopped/); await assert.rejects(running, /did not complete/);
+    assert.deepEqual(await app.sources.events(), before); assert.deepEqual(await app.sources.states(), coverage);
+  } finally {
+    clearTimeout(timer); controller.abort(); releasePreflight(); releaseSource(); await Promise.allSettled([running, recovery]);
+    await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("source scan completion survives refreshing, failures, stale cursors and reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-progress-")); let app = await open(directory);

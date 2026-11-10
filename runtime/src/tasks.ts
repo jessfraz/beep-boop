@@ -3,7 +3,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AgentDoc, AssistantEntry, defineDoc, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -37,6 +37,7 @@ import type { InputMode } from "./generated/InputMode.js";
 import type { AllocationOperation } from "./generated/AllocationOperation.js";
 import type { AllocationResult } from "./generated/AllocationResult.js";
 import { AllocationDecisionEntry, allocationResult } from "./allocation.js";
+import { PartitionedRecords } from "./partitioned-records.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
@@ -71,6 +72,10 @@ const Tasks = defineDoc<TaskIndex>({
   initial: () => ({ tasks: [] }), checkpointWhen: () => true,
 });
 const SourceLinksEntry = defineEntry<{ task_id: string; added: SourceRef[]; removed: SourceRef[] }>("agent.source_links");
+const SourceOwners = defineDocFamily<{ ids: string[] }, null>({ kind: "agent.task.sources", scope: "session", family: true, version: 1,
+  initial: () => ({ ids: [] }), checkpointWhen: () => false });
+const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: string | null }, null>({ kind: "agent.task.owners", scope: "session", family: true, version: 1,
+  initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
 function conversationIdentity(value: unknown): value is ConversationId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -78,6 +83,7 @@ function conversationIdentity(value: unknown): value is ConversationId {
 export class TaskError extends Error {}
 export type NoticePublication = "published" | "queued";
 export type OutcomeSink = {
+  prepare?(): Promise<void>;
   recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void>;
   deliveredIn(tx: Tx, outcome: TaskOutcome): Promise<void>;
   assertSourceRemovalIn(tx: Tx, taskId: string, sources: readonly SourceRef[]): Promise<void>;
@@ -148,6 +154,7 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
 
 /** Application metadata lives on Pi's commit line, beside its conversations. */
 export class TaskStore {
+  private readonly recordsStore = new PartitionedRecords<TaskRecord>("agent.task");
   private readonly running = new Map<string, AttachedWorker>();
   private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
@@ -158,6 +165,39 @@ export class TaskStore {
   private attachments: AttachmentStore | undefined;
   private background: BackgroundExecution | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
+  async prepare(): Promise<void> {
+    await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
+      (tx, task) => this.indexTaskIn(tx, task));
+    await this.outcomes?.prepare?.();
+  }
+  private async indexTaskIn(tx: Tx, task: TaskRecord, previous: readonly SourceRef[] = []): Promise<void> {
+    for (const source of previous) if (!task.sources.some(saved => related(saved, source))) {
+      const owners = await tx.doc(SourceOwners, sourceReference(source), null), index = owners.ids.indexOf(task.id);
+      if (index >= 0) owners.ids.splice(index, 1);
+    }
+    for (const source of task.sources) {
+      const owners = await tx.doc(SourceOwners, sourceReference(source), null);
+      if (!owners.ids.includes(task.id)) owners.ids.push(task.id);
+    }
+    for (const actor of [task, ...task.agents ?? []]) {
+      const owner = await tx.doc(ConversationOwner, actor.conversation_id, null);
+      const agentId = actor === task ? null : actor.id;
+      if (owner.task_id !== null && (owner.task_id !== task.id || owner.agent_id !== agentId)) {
+        throw new TaskError("A conversation already belongs to another task actor");
+      }
+      owner.task_id = task.id; owner.agent_id = agentId;
+    }
+  }
+  private async taskIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
+    const saved = await this.recordsStore.valueIn(tx, id);
+    if (saved !== undefined) return saved;
+    if ((await tx.doc(this.recordsStore.directory)).complete) return undefined;
+    // Transaction-only admission callers can meet an old store before startup
+    // catchup. Read through once; the migration never overwrites a keyed owner.
+    const legacy = (await tx.doc(Tasks)).tasks.find(task => task.id === id);
+    if (legacy === undefined) return undefined;
+    const copied = await this.recordsStore.insertIn(tx, id, legacy); await this.indexTaskIn(tx, copied); return copied;
+  }
   useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
   useHistory(history: HistoryStore): void { this.histories = history; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
@@ -300,6 +340,13 @@ export class TaskStore {
       ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : { text }), notice_origin: origin,
     } } };
   }
+  private async admit<T>(refs: readonly AttachmentRef[] | undefined, commit: () => Promise<T>): Promise<T> {
+    if (refs === undefined || refs.length === 0) return commit();
+    if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
+    const result = await this.attachments.admit(refs, async () => ({ value: await commit() }));
+    if (result === undefined) throw new TaskError("Attachment admission did not start");
+    return result.value;
+  }
   /** Anchor publication to its actual input, including a queued or recovered run.
    * Stop at unknown legacy input rather than borrowing an earlier job's name. */
   async noticeOrigin(conversation: Conversation, at: EntryId): Promise<NoticeOrigin | undefined> {
@@ -368,6 +415,7 @@ export class TaskStore {
   }
   async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; remove_sources?: SourceRef[]; reconciles_input?: string },
     provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }): Promise<TaskRecord> {
+    await this.prepare();
     if (input.sources?.some((source) => input.remove_sources?.some((removed) => related(source, removed)))) {
       throw new TaskError("Choose separate source references to add and remove");
     }
@@ -394,9 +442,8 @@ export class TaskStore {
     }
     await this.session.commit(async (tx) => {
       this.assertSource(provenance.conversation_id);
-      const index = await tx.doc(Tasks);
+      const task = await this.taskIn(tx, id);
       this.assertSource(provenance.conversation_id);
-      const task = index.tasks.find((task) => task.id === id);
       if (task === undefined) throw new TaskError("Unknown task");
       task.agents ??= [];
       let reconciliation: TaskInputReconciliation | undefined;
@@ -448,27 +495,37 @@ export class TaskStore {
     return agent;
   }
   async owner(conversationId: string): Promise<{ task: TaskRecord; agent?: TaskAgentRecord }> {
-    for (const task of await this.list()) {
-      if (task.conversation_id === conversationId) return { task };
-      const agent = task.agents.find((item) => item.conversation_id === conversationId);
-      if (agent !== undefined) return { task, agent };
-    }
+    const owner = await this.findOwner(conversationId);
+    if (owner !== undefined) return owner;
     throw new TaskError("No task owns this conversation");
+  }
+  async findOwner(conversationId: string): Promise<{ task: TaskRecord; agent?: TaskAgentRecord } | undefined> {
+    await this.prepare();
+    const owner = await this.session.snapshot(ConversationOwner, conversationId, BACKGROUND_CONTEXT);
+    if (owner?.task_id === null || owner?.task_id === undefined) return undefined;
+    const task = await this.get(owner.task_id);
+    if (owner.agent_id === null) return { task };
+    const agent = task.agents.find(agent => agent.id === owner.agent_id && agent.conversation_id === conversationId);
+    if (agent === undefined) throw new TaskError("Task conversation ownership is incomplete");
+    return { task, agent };
   }
 
   async list(): Promise<TaskRecord[]> {
-    const state = await this.session.snapshot(Tasks, BACKGROUND_CONTEXT);
-    return (state?.tasks ?? []).map((task) => this.savedTask(task))
+    await this.prepare();
+    const tasks: TaskRecord[] = [];
+    for await (const task of this.recordsStore.values(this.session)) tasks.push(this.savedTask(task));
+    return tasks
       .sort((a, b) => b.updated_at - a.updated_at || a.id.localeCompare(b.id));
   }
   async get(id: string): Promise<TaskRecord> {
-    const task = (await this.list()).find((task) => task.id === id);
+    await this.prepare();
+    const saved = await this.recordsStore.get(this.session, id);
+    const task = saved === undefined ? undefined : this.savedTask(saved);
     if (task === undefined) throw new TaskError("Unknown task");
     return task;
   }
   async canReleaseIn(tx: Tx, id: string): Promise<boolean> {
-    const index = await tx.doc(Tasks);
-    const task = index.tasks.find((item) => item.id === id);
+    const task = await this.taskIn(tx, id);
     if (task === undefined) return false;
     return this.quiescent(task) && task.state.state === "resolved";
   }
@@ -479,7 +536,7 @@ export class TaskStore {
   }
   /** Scheduled settlement also waits for native inputs, independently of resource cleanup. */
   async canSettleScheduledIn(tx: Tx, id: string, conversationId: ConversationId): Promise<boolean> {
-    const task = (await tx.doc(Tasks)).tasks.find((item) => item.id === id);
+    const task = await this.taskIn(tx, id);
     return task !== undefined && this.quiescent(task) &&
       (await tx.doc(LiveDoc, conversationId)).run === undefined &&
       (await tx.doc(InboxDoc, conversationId)).items.every((item) => item.mode === "write");
@@ -624,20 +681,21 @@ export class TaskStore {
       .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
   async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
+    await this.prepare();
     const imported = await this.histories?.byConversation(conversationId);
     if (imported === undefined || this.histories === undefined) throw new TaskError("Only an imported historical conversation can be adopted");
     if (input.outcome.trim().length === 0) throw new TaskError("A task outcome is required");
     const id = await this.histories.adopt(imported.thread.id, input.id, input.evidence, async (tx, native, record) => {
-      const index = await tx.doc(Tasks);
-      if (index.tasks.some((task) => task.id === input.id)) throw new TaskError("This task ID already belongs to another conversation");
-      index.tasks.push({ id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
+      if (await this.taskIn(tx, input.id) !== undefined) throw new TaskError("This task ID already belongs to another conversation");
+      const task = await this.recordsStore.insertIn(tx, input.id, { id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         sources: [{ provider: "codex", account: "local", thread_id: record.thread.id }, ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now() });
+      await this.indexTaskIn(tx, task);
     });
     return this.get(id);
   }
   async *records(conversationId: string): AsyncIterable<SearchRecord> {
-    const task = (await this.list()).find((task) => task.conversation_id === conversationId || task.agents.some((agent) => agent.conversation_id === conversationId));
+    const task = (await this.findOwner(conversationId))?.task;
     const imported = await this.histories?.byConversation(conversationId);
     if (conversationId !== ROOT_CONVERSATION_ID.toString() && task === undefined && imported === undefined) return;
     const conversation = await this.conversation(conversationId);
@@ -672,27 +730,31 @@ export class TaskStore {
     return revisionStatus(entry.id, view);
   }
   async findIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
-    const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);
+    const task = await this.taskIn(tx, id);
     return task === undefined ? undefined : this.savedTask(task);
   }
   async sourceLinksIn(tx: Tx, sources: readonly SourceRef[]): Promise<{ task_id: string; source: SourceRef }[]> {
-    return (await tx.doc(Tasks)).tasks.flatMap((task) => task.sources.filter((source) => sources.some((other) => related(source, other)))
-      .map((source) => ({ task_id: task.id, source: { ...source } })));
+    const links: { task_id: string; source: SourceRef }[] = [];
+    for (const ref of new Map(sources.map(source => [sourceReference(source), source])).values()) {
+      for (const id of (await tx.doc(SourceOwners, sourceReference(ref), null)).ids) links.push({ task_id: id, source: { ...ref } });
+    }
+    return links;
   }
   /** Creation can share the admission commit with durable background work. */
   async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
-    const index = await tx.doc(Tasks), previous = index.tasks.find((task) => task.id === id);
+    const previous = await this.taskIn(tx, id);
     if (previous !== undefined) return { id: previous.id };
     const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
-    index.tasks.push(task);
+    const saved = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     return { id, native: conversation.id };
   }
   async create(input: TaskCreate): Promise<TaskRecord> {
+    await this.prepare();
     const result = await this.session.commit((tx) => this.createIn(tx, input), BACKGROUND_CONTEXT);
     if (result.native !== undefined) this.rememberConversation(result.native);
     // Existing records contain nested Chord drafts during the commit. Return
@@ -701,16 +763,17 @@ export class TaskStore {
   }
   rememberConversation(id: ConversationId): void { this.nativeIds.set(id.toString(), id); }
   async updateIn(tx: Tx, id: string, change: (task: TaskRecord) => void | Promise<void>): Promise<void> {
-    const index = await tx.doc(Tasks);
-    const task = index.tasks.find((task) => task.id === id);
+    const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
     Object.assign(task, this.savedTask(task));
+    const sources = task.sources.map(source => ({ ...source }));
     await change(task);
+    await this.indexTaskIn(tx, task, sources);
     task.updated_at = Date.now();
   }
   /** Journal decisions and current routing change atomically; immutable receipts advance every affected index tail. */
   async relinkSourcesIn(tx: Tx, id: string, add: readonly SourceRef[], remove: readonly SourceRef[]): Promise<void> {
-    const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === id);
+    const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
     const added = add.filter((source, index) => !task.sources.some((saved) => related(saved, source)) &&
       add.findIndex((other) => related(other, source)) === index).map((source) => ({ ...source }));
@@ -719,6 +782,7 @@ export class TaskStore {
     if (added.length === 0 && removed.length === 0) return;
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
+    await this.indexTaskIn(tx, task, [...sources, ...removed]);
     // Child records inherit their parent's source references. Each native tail
     // must change so restart catchup also replaces its published provenance.
     for (const value of [task.conversation_id, ...(task.agents ?? []).map((agent) => agent.conversation_id)]) {
@@ -730,6 +794,7 @@ export class TaskStore {
     }
   }
   async update(id: string, change: (task: TaskRecord) => void): Promise<TaskRecord> {
+    await this.prepare();
     await this.session.commit((tx) => this.updateIn(tx, id, change), BACKGROUND_CONTEXT);
     return this.get(id);
   }
@@ -779,21 +844,25 @@ export class TaskStore {
       if (store === undefined) throw new TaskError("Attachment storage is unavailable");
       attachments = await store.resolve(attachments);
     }
+    const validate = (actor: TaskRecord | TaskAgentRecord) => {
+      const previous = actor.pending.find(input => input.id === inputId);
+      if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
+          JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []) ||
+          JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin)) {
+        throw new TaskError("A task input ID cannot be reused with different content or mode");
+      }
+      return previous;
+    };
+    validate(this.actor(await this.get(id), agentId));
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
       await this.resources?.attach(id);
-      await this.session.commit(async (tx) => {
+      await this.admit(attachments, () => this.session.commit(async (tx) => {
       await this.updateIn(tx, id, async (task) => {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
         const actor = this.actor(task, agentId);
-        const previous = actor.pending.find((input) => input.id === inputId);
-        if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
-            JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []) ||
-            JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin)) {
-          throw new TaskError("A task input ID cannot be reused with different content or mode");
-        }
-        if (previous === undefined && store !== undefined && attachments !== undefined) await store.retain(attachments);
+        const previous = validate(actor);
         if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }),
           ...(attachments === undefined ? {} : { attachments }),
           ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }) });
@@ -801,7 +870,7 @@ export class TaskStore {
         task.state = { state: "open" };
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
-      }, BACKGROUND_CONTEXT);
+      }, BACKGROUND_CONTEXT));
       if (mode !== undefined && active !== undefined) await this.admitActiveInputs(active);
     } finally {
       if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
@@ -843,27 +912,29 @@ export class TaskStore {
     }
     const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
     const owner = await this.get(taskId);
+    const previous = owner.agents.find(agent => agent.id === input.id);
+    if (previous !== undefined) return previous;
+    if (owner.agents.filter(agent => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
     const parent = await this.conversation(owner.conversation_id);
     if (owner.worker.state === "bound") await this.workerHost(taskId);
     await this.resources?.attach(taskId);
-    const native = await this.session.commit(async (tx) => {
-      const index = await tx.doc(Tasks);
-      const task = index.tasks.find((item) => item.id === taskId);
+    const native = await this.admit(input.attachments, () => this.session.commit(async (tx) => {
+      const task = await this.taskIn(tx, taskId);
       if (task === undefined) throw new TaskError("Unknown task");
       task.agents ??= [];
       if (task.agents.some((agent) => agent.id === input.id)) return;
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
-      if (store !== undefined && input.attachments !== undefined) await store.retain(input.attachments);
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       const lineage = await tx.doc(NoticeLineage, parent.id);
       if (lineage.origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...lineage.origin };
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
+      await this.indexTaskIn(tx, task);
       task.state = { state: "open" };
       task.updated_at = Date.now();
       return conversation.id;
-    }, BACKGROUND_CONTEXT);
+    }, BACKGROUND_CONTEXT));
     if (native !== undefined) this.nativeIds.set(native.toString(), native);
     const agent = (await this.get(taskId)).agents.find((item) => item.id === input.id);
     if (agent === undefined) throw new TaskError("Agent creation did not commit");
@@ -930,7 +1001,7 @@ export class TaskStore {
             const actor = this.actor(saved, agentId); this.requireResume(actor.worker, previous);
             actor.worker = result.type === "spawned" && result.binding.host_id === previous.binding.host_id && result.binding.session_id === previous.binding.session_id
               ? { ...previous, state: "bound", binding: result.binding }
-              : result.type === "written" || result.type === "failed" || (result.type === "worker_presence" && result.presence.state === "pending")
+              : result.type === "written" || (result.type === "failed" && result.delivery === "not_started") || (result.type === "worker_presence" && result.presence.state === "pending")
                 ? previous : { ...previous, state: "resume_uncertain" };
             return { result: allocationResult(result), reason: "Retained the agent identity and task folder while reconciling its terminal" };
           }, agentId);
@@ -965,12 +1036,12 @@ export class TaskStore {
   }
   async reportAgent(taskId: string, agentId: string, summary: string, failure?: string,
     provenance?: { conversation_id: string; call_id: string }): Promise<TaskRecord> {
+    await this.prepare();
     const origin = provenance === undefined ? undefined
       : await this.origin(await this.conversation(provenance.conversation_id), provenance.call_id);
     await this.session.commit(async (tx) => {
       if (provenance !== undefined) this.assertSource(provenance.conversation_id);
-      const index = await tx.doc(Tasks);
-      const task = index.tasks.find((task) => task.id === taskId);
+      const task = await this.taskIn(tx, taskId);
       const agent = task?.agents.find((item) => item.id === agentId);
       if (task === undefined || agent === undefined) throw new TaskError("Unknown task agent");
       await this.reportAgentIn(tx, task, agent, summary, failure,
@@ -1083,7 +1154,7 @@ export class TaskStore {
           this.requireResume(task.worker, previous);
           if (result.type === "spawned" && result.binding.session_id === previous.binding.session_id &&
               result.binding.host_id === previous.binding.host_id) task.worker = { ...previous, binding: result.binding };
-          else if (result.type === "written" || result.type === "failed" ||
+          else if (result.type === "written" || (result.type === "failed" && result.delivery === "not_started") ||
               (result.type === "worker_presence" && result.presence.state === "pending")) task.worker = previous;
           else task.worker = { ...previous, state: "resume_uncertain" };
           return { result: allocationResult(result), reason: task.worker.state === "bound"
@@ -1091,6 +1162,7 @@ export class TaskStore {
               : "Continued the same session with its confirmed terminal binding"
             : "Resume response was uncertain; retained the complete original binding for reconciliation" };
         });
+        if (resumed.worker.state !== "bound") throw new TaskError("Worker resume needs reconciliation; its known session and pending input are retained");
         if (result.type === "failed") {
           const presence = await this.inspect(previous.binding, call);
           if (presence?.state === "missing_session") return await this.reopen(id, previous, call);
@@ -1183,7 +1255,7 @@ export class TaskStore {
     if (input.agent_id === undefined) throw new TaskError("Only a task agent returns an agent result");
     const agentId = input.agent_id;
     await this.session.commit(async (tx) => {
-      const task = (await tx.doc(Tasks)).tasks.find((task) => task.id === input.task_id);
+      const task = await this.taskIn(tx, input.task_id);
       const agent = task?.agents.find((agent) => agent.id === agentId);
       if (task === undefined || agent === undefined) throw new TaskError("Unknown task agent");
       this.assertSource(agent.conversation_id);

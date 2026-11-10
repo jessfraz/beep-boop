@@ -153,7 +153,7 @@ test("a failed Rex resume retains its binding for a later retry without substitu
     const original = await app.tasks.get(task.id);
     await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
       if (command.type === "spawn_worker") creates += 1;
-      return { type: "failed", message: "The owning host is unreachable" };
+      return { type: "failed", delivery: "not_started", message: "The owning host is unreachable" };
     }), /resume failed/);
     const retained = await app.tasks.get(task.id);
     assert.deepEqual(retained.worker, original.worker); assert.equal(creates, 0);
@@ -164,6 +164,39 @@ test("a failed Rex resume retains its binding for a later retry without substitu
     assert.equal(creates, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+for (const delivery of [undefined, "outcome_uncertain"]) for (const child of [false, true]) {
+  test(`${child ? "child" : "task"} resume keeps ${delivery ?? "legacy"} failures uncertain until native reconciliation`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-resume-delivery-")); let app = await open(directory);
+    try {
+      const task = await app.tasks.create({ title: "Retain native ownership", outcome: "Continue exact work" });
+      await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+      const agent = child ? await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Retain child", input: "Review", inputId: "first" }) : undefined;
+      if (agent !== undefined) await app.tasks.dispatchAgent(task.id, agent.id, async () => ({ type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } }));
+      const before = await app.tasks.get(task.id), actor = agent === undefined ? before : before.agents[0]; assert.ok(actor?.worker.state === "bound");
+      let resumes = 0;
+      const failed: (command: HostCommand) => Promise<HostResult> = async command => {
+        if (command.type === "on_node") return { type: "worker_presence", presence: { state: "present", running: false } };
+        assert.equal(command.type, child ? "resume_agent_worker" : "resume_worker"); resumes += 1;
+        return delivery === undefined ? { type: "failed", message: "Receipt is unavailable" }
+          : { type: "failed", message: "Receipt is unavailable", delivery: "outcome_uncertain" };
+      };
+      await assert.rejects(agent === undefined ? app.tasks.dispatch(task.id, host, failed) : app.tasks.dispatchAgent(task.id, agent.id, failed));
+      const retained = await app.tasks.get(task.id), uncertain = agent === undefined ? retained : retained.agents[0];
+      assert.equal(uncertain?.worker.state, "resume_uncertain", "Unproven delivery cannot make an issued resume reusable");
+      assert.equal(resumes, 1); assert.equal(uncertain?.conversation_id, actor.conversation_id);
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+      let inspections = 0;
+      const reconcile: (command: HostCommand) => Promise<HostResult> = async command => {
+        assert.equal(command.type, "on_node"); inspections += 1;
+        return { type: "worker_presence", presence: { state: "present", running: true } };
+      };
+      const recovered = agent === undefined ? await app.tasks.dispatch(task.id, host, reconcile) : await app.tasks.dispatchAgent(task.id, agent.id, reconcile);
+      assert.equal((agent === undefined ? recovered : recovered.agents[0])?.worker.state, "bound");
+      assert.equal(inspections, 1, "Reconciliation must inspect the retained binding without issuing another resume");
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("an interactive task serializes local and chief inputs, wakes while idle and reopens its actual history", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-interactive-")); let app = await open(directory);

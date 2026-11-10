@@ -7,6 +7,7 @@ import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import { AuthError } from "./auth.js";
+import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
 
 const ajv = new Ajv2020({ strict: true });
 ajv.addFormat("ipv4", { type: "string", validate: isIPv4 });
@@ -91,6 +92,44 @@ export function errorEvent(error: unknown): Extract<RuntimeEventKind, { type: "f
       message: error.message,
     };
   }
-  return { type: "failure", code: "provider_unavailable",
-    message: "The operation could not complete. Its saved state is retained." };
+  if (error instanceof ModelsError) {
+    return { type: "failure", code: error.code === "auth" || error.code === "oauth" ? "authentication_failed"
+      : error.code === "model_validation" ? "invalid_request" : "provider_unavailable",
+    message: error.code === "auth" || error.code === "oauth" ? "Model authentication failed. Saved credentials are retained."
+      : error.code === "model_validation" ? "The model configuration is invalid."
+        : "The model provider is unavailable. Saved state is retained." };
+  }
+  const storage = storageFailure(error);
+  if (storage !== undefined) return { type: "failure", code: "storage_unavailable", message: storage + " Saved state is retained." };
+  return { type: "failure", code: "internal", message: "The operation failed internally. Saved state is retained." };
+}
+
+/** Classify native causes, never provider text or paths that may contain secrets. */
+function storageFailure(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  try {
+    for (let depth = 0; depth < 4 && object(error) && !seen.has(error); depth += 1) {
+      seen.add(error);
+      if (error.code === "ERR_SQLITE_ERROR" && typeof error.errcode === "number" && Number.isInteger(error.errcode)) {
+        // Extended SQLite result codes retain the primary code in their low byte.
+        switch (error.errcode & 0xff) {
+          case 5: case 6: return "Storage is busy.";
+          case 8: return "Storage is read-only.";
+          case 10: return "Storage could not be read or written.";
+          case 11: case 26: return "Stored data could not be read.";
+          case 13: return "Storage is full.";
+          case 14: return "Storage could not be opened.";
+        }
+      }
+      switch (error.code) {
+        case "EACCES": case "EPERM": return "Storage permission was denied.";
+        case "EROFS": return "Storage is read-only.";
+        case "ENOSPC": return "Storage is full.";
+        case "EIO": return "Storage could not be read or written.";
+        case "EMFILE": case "ENFILE": return "Too many files are open.";
+      }
+      error = error.cause;
+    }
+  } catch { /* An unknown cause cannot replace the original failure. */ }
+  return undefined;
 }

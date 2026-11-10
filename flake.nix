@@ -67,7 +67,14 @@
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [./src ./tests ./examples ./Cargo.toml ./Cargo.lock];
+          fileset = pkgs.lib.fileset.unions [
+            ./src
+            ./tests
+            ./examples
+            ./Cargo.toml
+            ./Cargo.lock
+            ./ios/Tests/AgentCoreTests/Fixtures/tool-merge-traces.json
+          ];
         };
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = ["--bin" "beep-boop"];

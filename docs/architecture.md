@@ -89,6 +89,19 @@ effects retain ownership until their actual results arrive. Transport-specific
 disconnect behavior stays explicit instead of being inferred from separate
 flags in each connection loop.
 
+Background planner, polling, triage, collection and indexing effects retain
+their native invocation's cancellation signal. Retiring one invocation stops
+its next operation without cancelling unrelated lanes. Issued resource writes
+still adopt their actual receipt before stopping. Retrieval closes its workers
+and drains queued indexing; closing prevents a lazy reopen or late publication.
+
+Failures retain their typed category through runtime and native clients.
+Storage failures, provider availability, authentication and internal errors
+remain distinct. Host failures also distinguish a request that never started
+from an admitted request whose outcome is uncertain. Reconnect reconciles an
+uncertain input's stable identity instead of resending it. Omitted delivery
+evidence from older peers remains uncertain.
+
 Workers connect to the coordinator and announce their actual Rex host ID, name,
 executable and local launch paths. Beep Boop reuses Rex's shared host inventory when
 available; each node can announce its own native Rex metadata even when that
@@ -144,6 +157,9 @@ bounded chunks over the existing authenticated connection, are verified by
 SHA-256, and are materialized on the selected execution host. Pi receives its
 native image content or a tool-readable file reference. History contains file
 metadata; the phone fetches preview bytes only when requested.
+Attachment validation and retention finish before the short Pi admission
+commit. Slow filesystem work cannot hold the shared conversation writer;
+failed retention admits no input and a retry keeps its original identity.
 
 Main and saved-conversation observations share a snapshot-to-live gate, bounded
 to 512 frames and 4 MiB while attaching. The gate owns buffering, delivery order,
@@ -157,6 +173,15 @@ coordinator is down, the client reports that it is unavailable. Copying a live
 SQLite database or starting two coordinators is not a recovery mechanism.
 
 ## Tasks and execution
+
+Task metadata and source-event bodies live in independently keyed Pi documents.
+Small directories and indexes locate owners and related versions. Startup
+migrates legacy records in resumable batches before accepting work, retaining
+the original documents. Source decisions, task links and cursor advances keep
+their existing atomic commit boundary. Subsequent writes use the keyed records;
+rolling back only the binary would expose stale legacy state. A rollback needs
+the verified pre-upgrade database backup, restored with the coordinator stopped.
+See [performance](performance.md) for migration and steady-state measurements.
 
 A task has a stable ID, title, intended outcome, source links, summary, pending
 inputs and one owning conversation. An interactive task's Rex binding records

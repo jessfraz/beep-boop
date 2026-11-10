@@ -236,6 +236,7 @@ struct Transcript: Sendable {
         } else {
           merged.positionID = current.positionID ?? row.positionID
         }
+        merged.tool = mergeTool(saved, incoming, preferIncoming: preferIncoming)
         merged.presentation = mergePresentation(
           current.presentation, row.presentation, preferIncoming: preferIncoming)
         return merged
@@ -311,6 +312,7 @@ struct Transcript: Sendable {
           storage[index].positionID = incoming
         }
         let stale = storage[index].tool.map { staleTool($0.status, tool.status) } ?? false
+        storage[index].tool = mergeTool(storage[index].tool, tool, preferIncoming: !stale)
         storage[index].presentation = mergePresentation(
           storage[index].presentation, message.presentation, preferIncoming: !stale)
         if !stale {
@@ -318,7 +320,6 @@ struct Transcript: Sendable {
             message.continuation && storage[index].entryID == message.entryId
             ? storage[index].text + message.text : message.text
           storage[index].text = boundedText(text)
-          storage[index].tool = tool
           storage[index].entryID = message.entryId
           dirtyRows.insert(id)
         }
@@ -390,17 +391,18 @@ struct Transcript: Sendable {
       thinkingID = nil
       let info = ToolHistory(callId: tool.callId, name: tool.name, status: .running)
       if let index = storage.firstIndex(where: { $0.id == "tool:\(tool.callId)" }) {
-        if !staleTool(storage[index].tool?.status ?? .unknown, .running) {
-          storage[index].tool = info
-        }
+        storage[index].tool = mergeTool(
+          storage[index].tool, info,
+          preferIncoming: !staleTool(storage[index].tool?.status ?? .unknown, .running))
       } else {
         append(ChatRow(id: "tool:\(tool.callId)", role: .tool, text: "", tool: info))
       }
     case .toolFinished(let tool):
-      if let index = storage.firstIndex(where: { $0.id == "tool:\(tool.callId)" }),
-        storage[index].tool?.status == .running
-      {
-        storage[index].tool?.status = .finished
+      if let index = storage.firstIndex(where: { $0.id == "tool:\(tool.callId)" }) {
+        storage[index].tool = mergeTool(
+          storage[index].tool,
+          .init(callId: tool.callId, name: tool.name, status: .finished),
+          preferIncoming: storage[index].tool?.status == .running)
       }
     case .compaction(let value):
       let text =
@@ -455,6 +457,16 @@ private func staleTool(_ saved: ToolStatus, _ incoming: ToolStatus) -> Bool {
   (incoming == .running && saved != .running && saved != .unknown)
     || (incoming == .unknown && saved != .unknown)
     || ([ToolStatus.failed, .declined, .interrupted].contains(saved) && saved != incoming)
+}
+
+private func mergeTool(
+  _ saved: ToolHistory?, _ incoming: ToolHistory, preferIncoming: Bool
+) -> ToolHistory {
+  guard let saved else { return incoming }
+  var preferred = preferIncoming ? incoming : saved
+  let fallback = preferIncoming ? saved : incoming
+  if preferred.name.isEmpty { preferred.name = fallback.name }
+  return preferred
 }
 
 private func mergePresentation(

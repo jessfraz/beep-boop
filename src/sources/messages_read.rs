@@ -101,12 +101,14 @@ pub async fn capture(argv: &[String]) -> Result<HostResult> {
     // runner's ordinary cleanup path rather than abandoning a detached child.
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
-    host::run_process_until(
-        program,
-        args,
-        &request.cwd,
-        Duration::from_secs(request.timeout_seconds.into()),
-        request.capture.limit(),
+    Ok(host::run_process_until(
+        host::ProcessRequest::new(
+            program,
+            args,
+            &request.cwd,
+            Duration::from_secs(request.timeout_seconds.into()),
+            request.capture.limit(),
+        )?,
         async move {
             tokio::select! {
                 _ = terminate.recv() => {},
@@ -114,7 +116,8 @@ pub async fn capture(argv: &[String]) -> Result<HostResult> {
             }
         },
     )
-    .await
+    .await?
+    .into())
 }
 
 #[cfg(test)]

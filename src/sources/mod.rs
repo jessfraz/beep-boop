@@ -14,15 +14,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{
-    host,
-    protocol::{HostResult, SourceRef},
-};
+use crate::{host, protocol::SourceRef};
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 pub struct SourceKey {
@@ -488,28 +485,19 @@ pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {
         .split_first()
         .context("Source helper command is empty")?;
     ensure!(!program.is_empty(), "Source helper program is empty");
-    match host::run_process(
+    let output = host::run_process(host::ProcessRequest::new(
         program,
         args,
         Path::new("/"),
         Duration::from_secs(host::DEFAULT_TIMEOUT_SECONDS.into()),
         crate::runtime::MAX_FRAME_BYTES / 2,
-    )
-    .await?
-    {
-        HostResult::Process {
-            exit_code,
-            stdout,
-            truncated,
-            ..
-        } => Ok(ReadOutput {
-            exit_code,
-            stdout,
-            truncated,
-        }),
-        HostResult::Failed { message } => bail!(message),
-        _ => bail!("Source helper did not return a process result"),
-    }
+    )?)
+    .await?;
+    Ok(ReadOutput {
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        truncated: output.truncated,
+    })
 }
 
 fn now_seconds() -> Result<u64> {

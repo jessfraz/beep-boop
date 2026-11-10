@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "typebox";
-import { defineDoc, defineExtension, defineTool, LiveDoc, ROOT_CONVERSATION_ID, type Conversation,
+import { defineDoc, defineDocFamily, defineExtension, defineTool, LiveDoc, ROOT_CONVERSATION_ID, type Conversation,
   type ConversationId, type Extension, type Harness, type TaskId, type TaskInspection, type Tx, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { SourceBatch } from "./generated/SourceBatch.js";
 import type { SourceCheckpoint } from "./generated/SourceCheckpoint.js";
@@ -15,6 +15,7 @@ import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions } from "./tools.js";
+import { PartitionedRecords } from "./partitioned-records.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
 type StoredEvent = { key: string; event: SourceEvent; decision: Decision | null; outcome?: TaskOutcome; occurred_at?: number };
@@ -31,6 +32,19 @@ const Sources = defineDoc<Journal>({
   // Keep native deltas; reopening replays their retained tail.
   checkpointWhen: () => false,
 });
+type Control = Omit<Journal, "events"> & { initialized: boolean };
+const Control = defineDoc<Control>({ kind: "agent.source.control", scope: "session", version: 1,
+  initial: () => ({ initialized: false, sources: [outcomeState()], conversation_id: null, active: null }), checkpointWhen: () => true });
+type PendingEvent = { key: string; occurred_at?: number; task_id?: string };
+const Pending = defineDocFamily<{ items: PendingEvent[] }, null>({ kind: "agent.source.pending", scope: "session", family: true, version: 1,
+  initial: () => ({ items: [] }), checkpointWhen: () => false });
+const Related = defineDocFamily<{ keys: string[] }, null>({ kind: "agent.source.related", scope: "session", family: true, version: 1,
+  initial: () => ({ keys: [] }), checkpointWhen: () => false });
+function streamKey(source: SourceKey): string { return JSON.stringify([source.provider, source.account]); }
+function relatedKey(record: StoredEvent): string {
+  return record.outcome === undefined ? "source:" + sourceReference(record.event.source)
+    : "outcome:" + JSON.stringify([record.outcome.task_id, record.outcome.conversation_id]);
+}
 function sameSource(left: SourceKey, right: SourceKey): boolean {
   return left.provider === right.provider && left.account === right.account;
 }
@@ -70,24 +84,78 @@ export async function recoverSourceRun(session: Harness, conversation: Conversat
 /** Admission and checkpoints share Pi's atomic commit boundary. */
 export class SourceJournal {
   private triaging = false;
+  private readonly records = new PartitionedRecords<StoredEvent>("agent.source.event", false);
+  private preparing: Promise<void> | undefined;
   constructor(readonly session: Harness, readonly tasks: TaskStore, private readonly executions?: Executions) { tasks.trackOutcomes(this); }
+  prepare(): Promise<void> {
+    return this.preparing ??= this.migrate().catch((error: unknown) => { this.preparing = undefined; throw error; });
+  }
+  private async migrate(): Promise<void> {
+    const control = await this.session.snapshot(Control, BACKGROUND_CONTEXT);
+    if (control?.initialized && (await this.session.snapshot(this.records.directory, BACKGROUND_CONTEXT))?.complete) return;
+    const legacy = await this.session.snapshot(Sources, BACKGROUND_CONTEXT);
+    if (legacy === undefined && control === undefined) {
+      await this.records.prepare(this.session, async () => [], record => record.key); return;
+    }
+    await this.session.commit(async (tx) => {
+      const saved = await tx.doc(Control);
+      if (!saved.initialized) {
+        if (legacy !== undefined) {
+          saved.sources = structuredClone(legacy.sources); saved.conversation_id = legacy.conversation_id;
+          if (!saved.sources.some(state => sameSource(state.source, OUTCOMES))) saved.sources.unshift(outcomeState());
+          saved.active = structuredClone(legacy.active);
+          if (legacy.last_claimed_source !== undefined) saved.last_claimed_source = { ...legacy.last_claimed_source };
+          if (legacy.next_event !== undefined) saved.next_event = { ...legacy.next_event };
+        }
+        saved.initialized = true;
+      }
+    }, BACKGROUND_CONTEXT);
+    await this.records.prepare(this.session, async () => legacy?.events ?? [], record => record.key,
+      (tx, record) => this.indexIn(tx, record));
+  }
+  private async indexIn(tx: Tx, record: StoredEvent): Promise<void> {
+    const related = await tx.doc(Related, relatedKey(record), null);
+    if (!related.keys.includes(record.key)) related.keys.push(record.key);
+    const pending = await tx.doc(Pending, streamKey(record.event.source), null);
+    const index = pending.items.findIndex(item => item.key === record.key);
+    if (record.decision !== null) { if (index >= 0) pending.items.splice(index, 1); }
+    else if (index < 0) {
+      const occurred_at = record.occurred_at ?? record.event.occurred_at;
+      pending.items.push({ key: record.key, ...(occurred_at === undefined ? {} : { occurred_at }),
+        ...(record.outcome === undefined ? {} : { task_id: record.outcome.task_id }) });
+    }
+  }
+  private async relatedIn(tx: Tx, key: string): Promise<StoredEvent[]> {
+    const result: StoredEvent[] = [];
+    for (const id of (await tx.doc(Related, key, null)).keys) {
+      const record = await this.records.valueIn(tx, id);
+      if (record === undefined) throw new TaskError("Source event index is incomplete");
+      result.push(record);
+    }
+    return result;
+  }
+  private async decideIn(tx: Tx, record: StoredEvent, decision: Decision): Promise<void> {
+    record.decision = decision; await this.indexIn(tx, record);
+  }
   /** Called inside the task mutation's transaction, never from a polling CLI. */
   async recordIn(tx: Tx, outcome: TaskOutcome, settled: boolean, attemptId?: string): Promise<void> {
-    const journal = await tx.doc(Sources);
+    const journal = await tx.doc(Control);
+    journal.initialized = true;
     const event: SourceEvent = { id: outcome.task_id + ":" + outcome.conversation_id,
       version: createHash("sha256").update(JSON.stringify([outcome, attemptId ?? null])).digest("hex"),
       source: { ...OUTCOMES, thread_id: outcome.task_id }, title: "Task " + outcome.state.state,
       text: JSON.stringify(outcome) };
     const key = eventKey(event);
-    if (journal.events.some((record) => record.key === key)) return;
-    for (const record of journal.events) {
-      if (record.decision === null && record.outcome?.task_id === outcome.task_id &&
+    if (await this.records.valueIn(tx, key) !== undefined) return;
+    for (const record of await this.relatedIn(tx, "outcome:" + JSON.stringify([outcome.task_id, outcome.conversation_id]))) {
+      if (record.decision === null && record.outcome !== undefined && record.outcome.task_id === outcome.task_id &&
           record.outcome.conversation_id === outcome.conversation_id) {
-        record.decision = { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" };
+        await this.decideIn(tx, record, { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" });
       }
     }
-    journal.events.push({ key, event, outcome,
+    const record = await this.records.insertIn(tx, key, { key, event, outcome,
       decision: settled ? { type: "dismissed", reason: "Already handled by the coordinator" } : null });
+    await this.indexIn(tx, record);
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
     const state = { ...outcomeState(), checked_at: Date.now() };
     if (previous === undefined) journal.sources.push(state); else Object.assign(previous, state);
@@ -96,8 +164,7 @@ export class SourceJournal {
   async reconcilesIn(tx: Tx, taskId: string, conversationId: ConversationId, requestId: string): Promise<boolean> {
     const original = await tx.submissionByRequest(conversationId, requestId);
     if (original?.type !== "input" || original.status !== "unanswered") return false;
-    const journal = await tx.doc(Sources);
-    for (const { outcome } of journal.events) {
+    for (const { outcome } of await this.relatedIn(tx, "outcome:" + JSON.stringify([taskId, conversationId.toString()]))) {
       const receipt = outcome?.reconciliation;
       if (outcome?.task_id !== taskId || outcome.conversation_id !== conversationId.toString() ||
           outcome.entry_id === null || outcome.tool_call_id === null || receipt === undefined ||
@@ -113,75 +180,93 @@ export class SourceJournal {
     return false;
   }
   async deliveredIn(tx: Tx, outcome: TaskOutcome): Promise<void> {
-    const journal = await tx.doc(Sources);
-    const record = [...journal.events].reverse().find((record) => record.decision === null && record.outcome !== undefined &&
+    const record = (await this.relatedIn(tx, "outcome:" + JSON.stringify([outcome.task_id, outcome.conversation_id]))).reverse().find((record) => record.decision === null && record.outcome !== undefined &&
       JSON.stringify(record.outcome) === JSON.stringify(outcome));
-    if (record !== undefined) record.decision = { type: "dismissed", reason: "Delivered to the parent task" };
+    if (record !== undefined) await this.decideIn(tx, record, { type: "dismissed", reason: "Delivered to the parent task" });
   }
   async assertSourceRemovalIn(tx: Tx, taskId: string, sources: readonly SourceRef[]): Promise<void> {
-    const refs = new Set(sources.map(sourceReference));
-    for (const record of (await tx.doc(Sources)).events) if (record.outcome === undefined && record.decision?.type === "task" &&
-        record.decision.task_id === taskId && refs.has(sourceReference(record.event.source))) {
-      throw new TaskError("Relink or dismiss every source event/version linked to this task before removing its source reference");
+    for (const source of sources) for (const record of await this.relatedIn(tx, "source:" + sourceReference(source))) {
+      if (record.outcome === undefined && record.decision?.type === "task" && record.decision.task_id === taskId) {
+        throw new TaskError("Relink or dismiss every source event/version linked to this task before removing its source reference");
+      }
     }
   }
   private async settlePublished(): Promise<void> {
+    await this.prepare();
     const root = await this.session.root(BACKGROUND_CONTEXT);
     await this.session.commit(async (tx) => {
-      const journal = await tx.doc(Sources);
-      for (const record of journal.events) {
+      const pending = [...(await tx.doc(Pending, streamKey(OUTCOMES), null)).items];
+      for (const item of pending) {
+        const record = await this.records.valueIn(tx, item.key);
+        if (record === undefined) throw new TaskError("Pending source event is unavailable");
         const outcome = record.outcome;
         if (record.decision !== null || outcome === undefined || outcome.entry_id === null ||
             (outcome.state.state !== "resolved" && outcome.state.state !== "waiting")) continue;
         if (await tx.submissionByRequest(root.id, "notice:" + outcome.entry_id) !== undefined) {
-          record.decision = { type: "dismissed", reason: "Publication recovered from the main conversation" };
+          await this.decideIn(tx, record, { type: "dismissed", reason: "Publication recovered from the main conversation" });
         }
       }
     }, BACKGROUND_CONTEXT);
   }
-  private ready(record: StoredEvent): boolean {
-    return record.decision === null && (record.outcome === undefined || !this.tasks.isRunning(record.outcome.task_id));
-  }
   async states(): Promise<SourceState[]> {
-    const states = [...((await this.session.snapshot(Sources, BACKGROUND_CONTEXT))?.sources ?? [])];
+    await this.prepare();
+    const states = [...((await this.session.snapshot(Control, BACKGROUND_CONTEXT))?.sources ?? [])];
     if (!states.some((state) => sameSource(state.source, OUTCOMES))) states.unshift(outcomeState());
     return states;
   }
   /** Coverage is client status, not transcript content. Cursor advances and
    * repeated failed polls must not publish the same warning again. */
   async watchStates(emit: (states: SourceState[]) => void, failed: (error: unknown) => void): Promise<() => Promise<void>> {
-    let closed = false, previous: string | undefined;
-    let pending = Promise.resolve();
-    const publish = async () => {
-      const states = await this.states();
-      const identity = JSON.stringify(states.map(({ source, coverage, checked_at, last_completed_at, progress }) =>
-        ({ source, coverage, checked_at, last_completed_at, progress })));
-      if (closed || identity === previous) return;
-      previous = identity; emit(states);
+    await this.prepare();
+    let closed = false, previous: string | undefined, dirty = false, pending: Promise<void> | undefined;
+    const refresh = (): Promise<void> => {
+      if (closed) return Promise.resolve();
+      dirty = true;
+      return pending ??= (async () => {
+        try {
+          while (dirty && !closed) {
+            dirty = false;
+            const states = await this.states();
+            const identity = JSON.stringify(states.map(({ source, coverage, checked_at, last_completed_at, progress }) =>
+              ({ source, coverage, checked_at, last_completed_at, progress })));
+            if (closed) return;
+            if (identity !== previous) { previous = identity; emit(states); }
+          }
+        } catch (error) { dirty = false; throw error; }
+      })().finally(() => {
+        pending = undefined;
+        if (dirty && !closed) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
+      });
     };
     const stop = this.session.subscribeCommits((publication) => {
-      if (!publication.changes.some((change) => change.type === "document" && change.record.kind === Sources.definition.kind)) return;
-      pending = pending.then(publish).catch((error: unknown) => { if (!closed) failed(error); });
+      if (!publication.changes.some((change) => change.type === "document" && change.record.kind === Control.definition.kind)) return;
+      dirty = true;
+      if (pending === undefined) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
     });
-    try { await publish(); } catch (error) { closed = true; stop(); throw error; }
+    try { await refresh(); } catch (error) { closed = true; stop(); throw error; }
     return async () => { closed = true; stop(); await pending; };
   }
   async events(options: { keys?: readonly string[]; provider?: string; account?: string; thread_id?: string;
     query?: string; limit?: number; pending?: boolean } = {}): Promise<StoredEvent[]> {
-    const journal = await this.session.snapshot(Sources, BACKGROUND_CONTEXT);
+    await this.prepare();
     const query = options.query?.toLocaleLowerCase();
-    return [...(journal?.events ?? [])].filter((record) =>
-      (options.keys === undefined || options.keys.includes(record.key)) &&
+    const selected: StoredEvent[] = [], limit = Math.min(100, Math.max(1, options.limit ?? 20));
+    const read = options.keys === undefined ? this.records.values(this.session, true)
+      : await this.records.selected(this.session, options.keys);
+    for await (const record of read) if (
       (options.provider === undefined || record.event.source.provider === options.provider) &&
       (options.account === undefined || record.event.source.account === options.account) &&
       (options.thread_id === undefined || record.event.source.thread_id === options.thread_id) &&
       (options.pending !== true || record.decision === null) &&
-      (query === undefined || (record.event.title + " " + record.event.text).toLocaleLowerCase().includes(query)))
-      .slice(-Math.min(100, Math.max(1, options.limit ?? 20))).reverse();
+      (query === undefined || (record.event.title + " " + record.event.text).toLocaleLowerCase().includes(query))) {
+      selected.push(record); if (selected.length === limit) break;
+    }
+    return selected;
   }
   async admit(batch: SourceBatch, expected: SourceCheckpoint | null): Promise<{
     new_events: number; checkpoint_advanced: boolean; state: SourceState;
   }> {
+    await this.prepare();
     if (batch.source.provider === OUTCOMES.provider) throw new TaskError("Task outcomes are admitted by the owned task lifecycle");
     for (const event of batch.events) {
       if (!sameSource(event.source, batch.source) || event.id.length === 0 || event.version.length === 0) {
@@ -192,21 +277,18 @@ export class SourceJournal {
       }
     }
     const result = await this.session.commit(async (tx) => {
-      const journal = await tx.doc(Sources);
+      const journal = await tx.doc(Control);
+      journal.initialized = true;
       let new_events = 0;
       // Validate the whole page before changing originals or their decisions.
       // A broken provider version must not put every source into global backoff.
       const originals = new Map<string, SourceEvent>();
-      const indices = new Map<string, number>();
-      const remaining = new Set<string>();
+      const records = new Map<string, StoredEvent>();
       for (const event of batch.events) {
-        remaining.add(eventKey(event));
-        if (event.legacy_version !== undefined) remaining.add(eventKey({ ...event, version: event.legacy_version }));
-      }
-      // Resolve only this page's identities in one pass over retained evidence.
-      for (const [index, record] of journal.events.entries()) {
-        if (remaining.size === 0) break;
-        if (remaining.delete(record.key)) indices.set(record.key, index);
+        for (const key of [eventKey(event), ...(event.legacy_version === undefined ? [] : [eventKey({ ...event, version: event.legacy_version })])]) {
+          const saved = await this.records.valueIn(tx, key);
+          if (saved !== undefined) records.set(key, saved);
+        }
       }
       const changed: string[] = [];
       const conflict = batch.events.some((event) => {
@@ -215,15 +297,14 @@ export class SourceJournal {
         if (original === undefined) {
           const legacyVersion = event.legacy_version;
           const legacyKey = legacyVersion === undefined ? undefined : eventKey({ ...event, version: legacyVersion });
-          const legacyIndex = legacyKey === undefined ? -1 : indices.get(legacyKey) ?? -1;
-          const index = indices.get(key) ?? -1;
-          original = journal.events[index]?.event;
-          const legacy = journal.events[legacyIndex]?.event;
+          const saved = records.get(key), legacyRecord = legacyKey === undefined ? undefined : records.get(legacyKey);
+          original = saved?.event;
+          const legacy = legacyRecord?.event;
           // Upgrade a producer's version scheme without reopening an unchanged
           // handled original. Exact current versions always take precedence.
-          const unchanged = index < 0 && legacyVersion !== undefined && legacy !== undefined &&
+          const unchanged = saved === undefined && legacyVersion !== undefined && legacy !== undefined &&
             sameEvent(legacy, { ...event, version: legacyVersion });
-          indices.set(key, unchanged ? legacyIndex : index);
+          if (unchanged && legacyRecord !== undefined) records.set(key, legacyRecord);
         }
         originals.set(key, event);
         if (original === undefined || sameEvent(original, event)) return false;
@@ -234,14 +315,18 @@ export class SourceJournal {
       });
       for (const event of conflict ? [] : batch.events) {
         const key = eventKey(event);
-        const saved = journal.events[indices.get(key) ?? -1];
+        const saved = records.get(key);
         if (saved !== undefined) {
           // Enrich scheduling metadata without rewriting an admitted original.
           if (saved.event.occurred_at === undefined && saved.occurred_at === undefined && event.occurred_at !== undefined) {
             saved.occurred_at = event.occurred_at;
+            const pending = await tx.doc(Pending, streamKey(saved.event.source), null);
+            const position = pending.items.find(item => item.key === saved.key);
+            if (position !== undefined) position.occurred_at = event.occurred_at;
           }
         } else {
-          journal.events.push({ key, event, decision: null }); indices.set(key, journal.events.length - 1); new_events += 1;
+          const record = await this.records.insertIn(tx, key, { key, event, decision: null });
+          await this.indexIn(tx, record); records.set(key, record); new_events += 1;
         }
       }
       const previous = journal.sources.find((state) => sameSource(state.source, batch.source));
@@ -271,15 +356,16 @@ export class SourceJournal {
     return { ...result, state };
   }
   async decide(keys: readonly string[], decision: Decision): Promise<{ unverified_source_links: { task_id: string; source: SourceRef }[] }> {
+    await this.prepare(); await this.tasks.prepare();
     if (keys.length === 0) throw new TaskError("Choose source events to account for");
     if (decision.type === "dismissed" && decision.reason.trim().length === 0) throw new TaskError("A no-action judgment needs a reason");
     return this.session.commit(async (tx) => {
-      const journal = await tx.doc(Sources);
-      const records = keys.map((key) => {
-        const record = journal.events.find((record) => record.key === key);
+      const records: StoredEvent[] = [];
+      for (const key of keys) {
+        const record = await this.records.valueIn(tx, key);
         if (record === undefined) throw new TaskError("Unknown source event");
-        return record;
-      });
+        records.push(record);
+      }
       if (decision.type === "task" && await this.tasks.findIn(tx, decision.task_id) === undefined) throw new TaskError("Unknown task");
       const changes = new Map<string, { add: SourceRef[]; remove: SourceRef[] }>();
       const correcting = records.some((record) => record.outcome === undefined && record.decision !== null);
@@ -295,12 +381,13 @@ export class SourceJournal {
           change(previous.task_id).remove.push(event.source);
         }
       }
-      for (const record of records) record.decision = decision;
+      for (const record of records) await this.decideIn(tx, record, decision);
       // A different event/version may legitimately keep the same thread linked
       // to the old task. Only release references whose last current owner moved.
       const retained = new Set<string>();
       if (correcting) {
-        for (const record of journal.events) if (record.outcome === undefined && record.decision?.type === "task") {
+        const related = new Set(records.filter(record => record.outcome === undefined).map(relatedKey));
+        for (const key of related) for (const record of await this.relatedIn(tx, key)) if (record.outcome === undefined && record.decision?.type === "task") {
           retained.add(JSON.stringify([record.decision.task_id, sourceReference(record.event.source)]));
         }
       }
@@ -315,9 +402,12 @@ export class SourceJournal {
   }
   async hasWork(): Promise<boolean> {
     await this.settlePublished();
-    const journal = await this.session.snapshot(Sources, BACKGROUND_CONTEXT);
+    const journal = await this.session.snapshot(Control, BACKGROUND_CONTEXT);
     if (journal?.active !== null && journal?.active !== undefined) return true;
-    if (journal?.events.some((record) => this.ready(record))) return true;
+    for (const { source } of journal?.sources ?? []) {
+      const pending = await this.session.snapshot(Pending, streamKey(source), BACKGROUND_CONTEXT);
+      if (pending?.items.some(item => item.task_id === undefined || !this.tasks.isRunning(item.task_id))) return true;
+    }
     return (await this.due()).length > 0;
   }
   private async due(): Promise<DueTask[]> {
@@ -330,17 +420,16 @@ export class SourceJournal {
     await this.settlePublished();
     const due = await this.due();
     await this.session.commit(async (tx) => {
-      const journal = await tx.doc(Sources);
+      const journal = await tx.doc(Control);
       if (journal.active !== null) return;
+      journal.initialized = true;
       const streams = new Map<string, { source: SourceKey; keys: { key: string; occurred_at: number | undefined }[];
         oldest: number; newest: number }>();
-      for (const record of journal.events) {
-        if (!this.ready(record)) continue;
-        const { provider, account } = record.event.source, id = JSON.stringify([provider, account]);
-        let stream = streams.get(id);
-        if (stream === undefined) { stream = { source: { provider, account }, keys: [], oldest: 0, newest: -1 }; streams.set(id, stream); }
-        stream.keys.push({ key: record.key, occurred_at: record.occurred_at ?? record.event.occurred_at });
-        stream.newest += 1;
+      for (const { source } of journal.sources) {
+        const pending = await tx.doc(Pending, streamKey(source), null);
+        const keys = pending.items.filter(item => item.task_id === undefined || !this.tasks.isRunning(item.task_id))
+          .map(item => ({ key: item.key, occurred_at: item.occurred_at }));
+        if (keys.length > 0) streams.set(streamKey(source), { source, keys, oldest: 0, newest: keys.length - 1 });
       }
       // Stable sorting retains admission order for missing/equal times. Legacy
       // undated evidence stays at the old end while dated current mail stays new.
@@ -377,31 +466,41 @@ export class SourceJournal {
       }
       journal.active = { id: randomUUID(), events, due: due.slice(0, 20), attempt: 0, content: null };
     }, BACKGROUND_CONTEXT);
-    const journal = await this.session.snapshot(Sources, BACKGROUND_CONTEXT);
+    const journal = await this.session.snapshot(Control, BACKGROUND_CONTEXT);
     if (journal?.active === null || journal?.active === undefined || journal.conversation_id === null) return null;
     return { work: journal.active, conversation: journal.conversation_id };
   }
   async triage(command: Extract<RuntimeCommand, { type: "triage_sources" }>,
-    bind: (conversation: Conversation, model: ModelSelection) => () => void, extensions: readonly Extension[]): Promise<void> {
+    bind: (conversation: Conversation, model: ModelSelection) => () => void, extensions: readonly Extension[], signal?: AbortSignal): Promise<void> {
+    const requireActive = () => { if (signal?.aborted) throw new TaskError("Source judgment stopped; its admitted work is retained"); };
+    requireActive();
     if (this.triaging) return;
     this.triaging = true;
     let release: (() => void) | undefined;
     let admittedWork: TriageWork | undefined;
+    let owned: Conversation | undefined, admitted = false, stopping: Promise<void> | undefined;
+    const abort = () => { if (admitted && owned !== undefined) { stopping ??= owned.abort(BACKGROUND_CONTEXT); void stopping.catch(() => {}); } };
+    signal?.addEventListener("abort", abort, { once: true });
     try {
       const claimed = await this.claim();
       if (claimed === null) return;
       admittedWork = claimed.work;
       const conversation = await this.tasks.conversation(claimed.conversation);
+      owned = conversation;
       const prior = await this.session.commit((tx) => tx.submissionByRequest(conversation.id,
         claimed.work.id + ":" + claimed.work.attempt), BACKGROUND_CONTEXT);
+      admitted = prior?.status === "queued" || prior?.status === "placed";
+      if (signal?.aborted) { abort(); requireActive(); }
       const selected = claimed.work.model ?? (prior === undefined ? command.model
         : await this.tasks.inference.legacy(conversation, command.model));
       await this.tasks.inference.preflight(selected);
+      requireActive();
       await this.session.commit(async (tx) => {
-        const journal = await tx.doc(Sources);
+        const journal = await tx.doc(Control);
         if (journal.active?.id === claimed.work.id) journal.active.model ??= selected;
       }, BACKGROUND_CONTEXT);
       release = bind(conversation, selected);
+      if (signal?.aborted) { abort(); requireActive(); }
       await this.tasks.inference.configure(conversation, selected, { cwd: command.cwd,
         instructions: (await this.tasks.instructions(command.instructions)) + "\n\nAct on new signals using current workspace guidance and the owning workflow's authorization. " +
           "Reuse or steer the owning worker now when evidence enables a next step; linking evidence or saving notes is not execution. Do not defer useful work to the next scheduled pass. " +
@@ -425,15 +524,16 @@ export class SourceJournal {
           due_followups: due, related_tasks: related.matches, retrieval_gaps: related.gaps,
         });
         await this.session.commit(async (tx) => {
-          const journal = await tx.doc(Sources);
+          const journal = await tx.doc(Control);
           if (journal.active?.id !== claimed.work.id || journal.active.attempt !== claimed.work.attempt) {
             throw new TaskError("Source judgment ownership changed before admission");
           }
           journal.active.content ??= prepared;
         }, BACKGROUND_CONTEXT);
-        content = (await this.session.snapshot(Sources, BACKGROUND_CONTEXT))?.active?.content ?? null;
+        content = (await this.session.snapshot(Control, BACKGROUND_CONTEXT))?.active?.content ?? null;
       }
       if (content === null) throw new TaskError("The admitted source input is unavailable");
+      requireActive(); admitted = true;
       const submission = await conversation.submit({ type: "input", requestId: claimed.work.id + ":" + claimed.work.attempt,
         content }, BACKGROUND_CONTEXT);
       const result = await submission.wait(BACKGROUND_CONTEXT);
@@ -444,19 +544,24 @@ export class SourceJournal {
         current.id === original.id && current.next_check === original.next_check));
       if (remaining.length > 0 || dueUnchanged) throw new TaskError("Source judgment left work unaccounted for; pending events and follow-ups are retained");
       await this.session.commit(async (tx) => {
-        const journal = await tx.doc(Sources);
+        const journal = await tx.doc(Control);
         if (journal.active?.id === claimed.work.id) journal.active = null;
       }, BACKGROUND_CONTEXT);
     } catch (error) {
       if (admittedWork !== undefined) {
         const work = admittedWork;
         await this.session.commit(async (tx) => {
-          const journal = await tx.doc(Sources);
+          const journal = await tx.doc(Control);
           if (journal.active?.id === work.id) { journal.active.attempt += 1; journal.active.content = null; }
         }, BACKGROUND_CONTEXT);
       }
       throw error;
-    } finally { release?.(); this.triaging = false; }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) abort();
+      try { await stopping; }
+      finally { release?.(); this.triaging = false; }
+    }
   }
   async notify(conversationId: string, callId: string, keys: readonly string[], taskId: string | null,
     text: string, emit?: (task: string | null, text: string) => void): Promise<NoticePublication> {

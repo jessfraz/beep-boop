@@ -1051,7 +1051,18 @@ pub enum HostResult {
     },
     Failed {
         message: String,
+        /// Missing on older workers; absence makes no claim about execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        delivery: Option<HostDelivery>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDelivery {
+    NotStarted,
+    OutcomeUncertain,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1639,7 +1650,7 @@ pub enum ModelActivity {
     Compaction { active: bool, failed: bool },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,

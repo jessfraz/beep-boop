@@ -1,13 +1,13 @@
 //! Node capabilities come from the machine, while Rex owns its peer inventory.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 use crate::{
     config, host,
-    protocol::{AgentNode, HostCommand, HostResult, WorkerLaunch},
+    protocol::{AgentNode, WorkerLaunch},
     rex::{HostId, RexClient},
 };
 
@@ -30,20 +30,22 @@ pub async fn local_node(
     daemon: &crate::tailnet::Daemon,
 ) -> Result<AgentNode> {
     let identity = RexClient::new(None).whoami().await?;
-    let output = host::execute(HostCommand::Exec {
-        program: "rex".into(),
-        args: vec!["--autostart=false".into(), "hosts".into(), "--json".into()],
-        cwd: "/".into(),
-        timeout_seconds: 15,
-    })
+    let args = ["--autostart=false".into(), "hosts".into(), "--json".into()];
+    let output = host::run_process(host::ProcessRequest::new(
+        "rex",
+        &args,
+        Path::new("/"),
+        Duration::from_secs(15),
+        256 * 1024,
+    )?)
     .await;
     let inventory = match output {
-        HostResult::Process {
+        Ok(host::ProcessOutput {
             exit_code: 0,
             stdout,
             truncated: false,
             ..
-        } => serde_json::from_str::<Inventory>(&stdout).ok(),
+        }) => serde_json::from_str::<Inventory>(&stdout).ok(),
         _ => None,
     };
     let peer = inventory.as_ref().and_then(|inventory| {
