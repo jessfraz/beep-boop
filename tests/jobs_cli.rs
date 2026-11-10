@@ -17,6 +17,9 @@ use agent_cli::{
 use serde::{Deserialize, Serialize};
 
 const JOB_ID: &str = "Daily_Review.v2";
+// Package qualification can share a host with native compilers. Keep startup
+// bounded without treating a brief scheduling delay as coordinator failure.
+const COORDINATOR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -25,6 +28,7 @@ struct Fixture {
     jobs: PathBuf,
     bin: PathBuf,
     instructions: PathBuf,
+    runtime: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -70,6 +74,11 @@ impl Fixture {
             &bin.join("switchboard"),
             "#!/bin/sh\nprintf '%s\\n' unexpected >> \"$AGENT_TEST_EXTERNAL_CALLS\"\nexit 1\n",
         );
+        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
+            });
         Self {
             directory,
             config,
@@ -77,6 +86,7 @@ impl Fixture {
             jobs,
             bin,
             instructions,
+            runtime,
         }
     }
 
@@ -89,11 +99,6 @@ impl Fixture {
         let binary = std::env::var_os("AGENT_CLI_PATH")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
         let mut command = Command::new(binary);
-        let runtime = std::env::var_os("AGENT_RUNTIME_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
-            });
         let mut paths = vec![self.bin.clone()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         if json {
@@ -105,7 +110,7 @@ impl Fixture {
             .arg("--state-dir")
             .arg(&self.state)
             .arg("--runtime")
-            .arg(runtime)
+            .arg(&self.runtime)
             .arg("--instructions")
             .arg(&self.instructions)
             .args(args)
@@ -272,18 +277,18 @@ impl Fixture {
             .spawn()
             .unwrap();
         let mut server = Server(Some(child));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + COORDINATOR_READY_TIMEOUT;
         // The pathname can appear before listen(2) accepts connections.
         while UnixStream::connect(self.state.join("agent.sock")).is_err() {
             assert!(
                 server.0.as_mut().unwrap().try_wait().unwrap().is_none(),
                 "Fixture coordinator exited before binding: {}",
-                fs::read_to_string(&stderr).unwrap()
+                self.startup_diagnostics()
             );
             assert!(
                 Instant::now() < deadline,
                 "Fixture coordinator did not bind: {}",
-                fs::read_to_string(&stderr).unwrap_or_default()
+                self.startup_diagnostics()
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -292,11 +297,20 @@ impl Fixture {
         while self.status().triggers == 0 {
             assert!(
                 Instant::now() < deadline,
-                "Fixture coordinator did not initialize its background timers"
+                "Fixture coordinator did not initialize its background timers: {}",
+                self.startup_diagnostics()
             );
             thread::sleep(Duration::from_millis(10));
         }
         server
+    }
+
+    fn startup_diagnostics(&self) -> String {
+        let stderr =
+            fs::read_to_string(self.directory.path().join("server.stderr")).unwrap_or_default();
+        let startup = fs::read_to_string(self.state.join("diagnostics/startup.jsonl"))
+            .unwrap_or_else(|error| format!("Native startup diagnostics unavailable: {error}"));
+        format!("{stderr}\nNative startup stages:\n{startup}")
     }
 }
 
@@ -362,6 +376,34 @@ fn replay(run: &JobRunReceipt, schedule_id: Option<&str>) -> RuntimeCommand {
         schedule_id: schedule_id.map(|id| ScheduleId::try_from(id.to_owned()).unwrap()),
         request_id: run.request_id.clone(),
     }
+}
+
+#[test]
+fn fixture_waits_for_delayed_real_coordinator_startup() {
+    let mut fixture = Fixture::new();
+    let native = fixture.runtime.canonicalize().unwrap();
+    fixture.runtime = fixture.directory.path().join("delayed-runtime.mjs");
+    // Hold the actual native producer beyond the old fixture guard. No
+    // coordinator replies or timer state are synthesized by this wrapper.
+    fs::write(
+        &fixture.runtime,
+        format!(
+            "import {{setTimeout}} from 'node:timers/promises';\n\
+             import {{pathToFileURL}} from 'node:url';\n\
+             await setTimeout(12000);\n\
+             await import(pathToFileURL({}).href);\n",
+            serde_json::to_string(&native).unwrap(),
+        ),
+    )
+    .unwrap();
+    let mut server = fixture.start();
+    let status = fixture.status();
+    assert_eq!(status.jobs, 0);
+    assert_eq!(status.triggers, 4);
+    assert!(status.errors.is_empty(), "{:?}", status.errors);
+    server.stop();
+    assert!(!fixture.state.join("agent.sock").exists());
+    assert!(!fixture.directory.path().join("external-calls").exists());
 }
 
 #[test]
