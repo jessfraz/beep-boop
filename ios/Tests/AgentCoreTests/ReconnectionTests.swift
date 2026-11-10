@@ -367,12 +367,16 @@ private func pausedObserverWithoutPendingInputsStopsWorkingAndClearsThePauseOnRe
   async throws
 {
   try await withReconnectCoordinator(.paused) { model, fixture, _ in
-    try await waitForReconnectState { model.connection == .connected && model.error != nil }
+    try await waitForReconnectState(
+      "initial pause: connection=\(model.connection), busy=\(model.busy), error=\(String(describing: model.error))"
+    ) { model.connection == .connected && model.error != nil }
     #expect(!model.busy, "A parked main conversation is paused, not still working")
     #expect(model.rows.isEmpty, "The processing pause is connection state, not history")
     #expect(await fixture.observedIDs() == [[]])
     try await fixture.observerEvent(resume)
-    try await waitForReconnectState { model.busy && model.error == nil }
+    try await waitForReconnectState(
+      "resume: connection=\(model.connection), busy=\(model.busy), error=\(String(describing: model.error))"
+    ) { model.busy && model.error == nil }
     #expect(model.connection == .connected)
     #expect(await fixture.observedIDs().count == 1)
     #expect(await fixture.submitted().isEmpty)
@@ -393,10 +397,17 @@ private func actionFailureDoesNotStopTheObserversActiveWorkOrUndoAdmission() asy
   }
 }
 
-@MainActor private func waitForReconnectState(_ predicate: () -> Bool) async throws {
+private struct ReconnectStateWaitTimeout: Error {
+  let state: String
+}
+
+@MainActor private func waitForReconnectState(
+  _ state: @autoclosure () -> String = "reconnect state",
+  _ predicate: () -> Bool
+) async throws {
   let deadline = ContinuousClock.now + .seconds(8)
   while !predicate() {
-    guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
+    guard ContinuousClock.now < deadline else { throw ReconnectStateWaitTimeout(state: state()) }
     try await Task.sleep(for: .milliseconds(5))
   }
 }

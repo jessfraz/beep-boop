@@ -27,11 +27,20 @@ private func connectForToolDetails(_ session: CoordinatorSession) async throws {
   throw ConnectionError.closed
 }
 
+private struct ToolLookupWaitTimeout: Error {
+  let expected: Int
+  let received: Int
+}
+
 private func waitForToolLookups(_ fixture: FixtureCoordinator, count: Int) async throws {
   let deadline = ContinuousClock.now + .seconds(8)
-  while await fixture.toolLookups().count < count {
-    guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
+  var received = await fixture.toolLookups().count
+  while received < count {
+    guard ContinuousClock.now < deadline else {
+      throw ToolLookupWaitTimeout(expected: count, received: received)
+    }
     try await Task.sleep(for: .milliseconds(5))
+    received = await fixture.toolLookups().count
   }
 }
 

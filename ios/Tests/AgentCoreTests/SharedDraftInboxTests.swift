@@ -518,8 +518,8 @@ import UniformTypeIdentifiers
   }
 
   #if os(macOS)
-    // Process waits must not stall the main-actor client tests running beside
-    // this case. Only the image-provider setup needs its explicit actor hop.
+    // Process exit and pipe readiness must suspend so transport and store
+    // actors can progress while this real child owns the inbox.
     @Test func crossProcessConsumerCrashReleasesOwnershipWithoutLosingDurableAdoption()
       async throws
     {
@@ -561,33 +561,50 @@ import UniformTypeIdentifiers
         ].map {
           core.appending(path: $0).path
         } + [helper.path]
-      try compile.run()
-      compile.waitUntilExit()
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, any Error>) in
+        compile.terminationHandler = { _ in continuation.resume() }
+        do { try compile.run() } catch {
+          compile.terminationHandler = nil
+          continuation.resume(throwing: error)
+        }
+      }
       try #require(compile.terminationStatus == 0)
       let child = Process()
       child.executableURL = executable
       child.arguments = [root.path]
       let output = Pipe()
       child.standardOutput = output
-      try child.run()
+      let stopped = AsyncStream<Void>.makeStream()
+      child.terminationHandler = { _ in stopped.continuation.finish() }
       defer {
-        if child.isRunning { child.terminate() }
-        child.waitUntilExit()
+        try? output.fileHandleForReading.close()
+        try? output.fileHandleForWriting.close()
       }
-      let ready = try output.fileHandleForReading.read(upToCount: 6)
-      try #require(ready == Data("saved\n".utf8))
-      let saved = try Data(contentsOf: root.appending(path: "saved-id"))
-      #expect(saved == Data(id.uuidString.utf8))
+      try child.run()
       let store = AttachmentStore(directory: root.appending(path: "Adopted"))
-      await #expect(throws: SharedDraftError.self) {
-        try await inbox.consumeNext(into: store) { _ in
-          Issue.record("Concurrent consumer acquired ownership")
+      do {
+        // Only the child owns a writer now, so an early exit also delivers EOF.
+        try output.fileHandleForWriting.close()
+        var ready = Data()
+        for try await byte in output.fileHandleForReading.bytes.prefix(6) { ready.append(byte) }
+        try #require(ready == Data("saved\n".utf8))
+        let saved = try Data(contentsOf: root.appending(path: "saved-id"))
+        #expect(saved == Data(id.uuidString.utf8))
+        await #expect(throws: SharedDraftError.self) {
+          try await inbox.consumeNext(into: store) { _ in
+            Issue.record("Concurrent consumer acquired ownership")
+          }
         }
+        // A simultaneous producer must not erase this consumer's source files.
+        await #expect(throws: SharedDraftError.self) { try await inbox.enqueue(images: images) }
+      } catch {
+        if child.isRunning { child.terminate() }
+        for await _ in stopped.stream {}
+        throw error
       }
-      // A simultaneous producer must not erase this consumer's source files.
-      await #expect(throws: SharedDraftError.self) { try await inbox.enqueue(images: images) }
       child.terminate()
-      child.waitUntilExit()
+      for await _ in stopped.stream {}
       #expect(child.terminationReason == .uncaughtSignal)
       let consumed = try await SharedDraftInbox(containerURL: root).consumeNext(into: store) {
         batch in
