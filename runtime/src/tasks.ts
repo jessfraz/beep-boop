@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
@@ -350,16 +351,13 @@ export class TaskStore {
   /** Anchor publication to its actual input, including a queued or recovered run.
    * Stop at unknown legacy input rather than borrowing an earlier job's name. */
   async noticeOrigin(conversation: Conversation, at: EntryId): Promise<NoticeOrigin | undefined> {
-    let cursor: Cursor | undefined;
-    do {
-      const page = await conversation.entries({ order: "descending", maxEntryId: at }, 32, cursor, BACKGROUND_CONTEXT);
-      for (const entry of page.items) if (entry.kind === "agent.input" || entry.model?.some((message) => message.role === "user")) {
+    for await (const entries of this.historyPages(conversation, { order: "descending", maxEntryId: at }, 32)) {
+      for (const entry of entries) if (entry.kind === "agent.input" || entry.model?.some((message) => message.role === "user")) {
         if (entry.kind !== "agent.input") return undefined;
         const data = entry.data;
         return readNoticeOrigin(data !== null && typeof data === "object" && !Array.isArray(data) ? data.notice_origin : undefined);
       }
-      cursor = page.next;
-    } while (cursor !== undefined);
+    }
     return undefined;
   }
   async saved(id: string): Promise<ImportedConversation | undefined> { return this.histories?.byConversation(id); }
@@ -403,14 +401,11 @@ export class TaskStore {
         : { state: "failed", reason: failure } };
   }
   async origin(conversation: Conversation, callId: string): Promise<EntryRecord> {
-    let cursor: Cursor | undefined;
-    do {
-      const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
-      const entry = page.items.find((entry) => entry.model?.some((message) => message.role === "assistant" &&
+    for await (const entries of this.historyPages(conversation, { order: "descending" })) {
+      const entry = entries.find((entry) => entry.model?.some((message) => message.role === "assistant" &&
         message.content.some((part) => part.type === "toolCall" && part.id === callId)));
       if (entry !== undefined) return entry;
-      cursor = page.next;
-    } while (cursor !== undefined);
+    }
     throw new TaskError("Task outcome model provenance is unavailable");
   }
   async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; remove_sources?: SourceRef[]; reconciles_input?: string },
@@ -563,17 +558,26 @@ export class TaskStore {
     const conversation = await this.conversation(this.actor(await this.get(id), agentId).conversation_id);
     return this.readConversation(conversation.id.toString(), maxCharacters);
   }
+  /** Native SQLite reads can resolve entirely in microtasks. Give pipes and
+   * timers a turn before each bounded page, including across short histories. */
+  private async *historyPages(conversation: Conversation, query: Parameters<Conversation["entries"]>[0], limit = 100): AsyncGenerator<readonly EntryRecord[]> {
+    let cursor: Cursor | undefined;
+    do {
+      await setImmediate();
+      const page = await conversation.entries(query, limit, cursor, BACKGROUND_CONTEXT);
+      yield page.items;
+      cursor = page.next;
+    } while (cursor !== undefined);
+  }
   async readConversation(id: string, maxCharacters = 120_000): Promise<string> {
     const conversation = await this.conversation(id);
     const maximum = (await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]?.id;
-    let cursor: Cursor | undefined;
     const chunks: string[] = [];
     let length = 0;
     const revisions = new Map<string, RevisionView>();
     const warned = new Set<string>();
-    do {
-      const page = await conversation.entries({ order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) }, 100, cursor, BACKGROUND_CONTEXT);
-      for (const entry of page.items) {
+    for await (const entries of this.historyPages(conversation, { order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) })) {
+      for (const entry of entries) {
         const status = await this.revision(entry, revisions, false, maximum);
         if (status === "superseded" || status === "outside_snapshot") continue;
         const warning = status === "ambiguous" ? REVISION_AMBIGUOUS : status === "pending" ? REVISION_PENDING : "";
@@ -584,8 +588,7 @@ export class TaskStore {
         length += content.length;
         if (length >= maxCharacters) return chunks.reverse().join("\n").slice(-maxCharacters);
       }
-      cursor = page.next;
-    } while (cursor !== undefined);
+    }
     return chunks.reverse().join("\n");
   }
   async originals(conversationId: string, ids: readonly string[], offset = 0) {
@@ -606,19 +609,16 @@ export class TaskStore {
   private async historyScore(conversationId: string, tokens: readonly string[]): Promise<number> {
     const conversation = await this.conversation(conversationId);
     const matched = new Set<string>();
-    let cursor: Cursor | undefined;
     const revisions = new Map<string, RevisionView>();
-    do {
-      const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
-      for (const entry of page.items) {
+    for await (const entries of this.historyPages(conversation, { order: "descending" })) {
+      for (const entry of entries) {
         const status = await this.revision(entry, revisions);
         if (status === "superseded" || status === "outside_snapshot") continue;
         const content = key(text(entry));
         for (const token of tokens) if (content.includes(token)) matched.add(token);
       }
       if (matched.size === tokens.length) break;
-      cursor = page.next;
-    } while (cursor !== undefined);
+    }
     return matched.size;
   }
   async search(query: string, sources: readonly SourceRef[] = [], limit = 8): Promise<TaskRecord[]> {
@@ -701,11 +701,9 @@ export class TaskStore {
     const conversation = await this.conversation(conversationId);
     const refs = (task?.sources ?? []).map(sourceReference);
     if (imported !== undefined) refs.push(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
-    let cursor: Cursor | undefined;
     const revisions = new Map<string, RevisionView>();
-    do {
-      const page = await conversation.entries({ order: "ascending" }, 100, cursor, BACKGROUND_CONTEXT);
-      for (const entry of page.items) {
+    for await (const entries of this.historyPages(conversation, { order: "ascending" })) {
+      for (const entry of entries) {
         if (ImportedItemEntry.is(entry) && entry.data.item.role === "thinking") continue;
         const status = await this.revision(entry, revisions, true);
         if (status === "superseded" || status === "outside_snapshot") continue;
@@ -714,8 +712,7 @@ export class TaskStore {
         if (content.trim().length === 0 && gaps.length === 0) continue;
         yield { entry_id: entry.id.toString(), ordinal: entry.id, text: content, source_refs: refs, gaps };
       }
-      cursor = page.next;
-    } while (cursor !== undefined);
+    }
   }
   private async revision(entry: EntryRecord, views: Map<string, RevisionView>, prepare = false, maximum?: EntryId): Promise<ReturnType<typeof revisionStatus>> {
     if (!ImportedItemEntry.is(entry)) return "current";
@@ -1429,10 +1426,8 @@ export class TaskStore {
           if (actor.pending.length > 0) continue;
           if (answer.length === 0 && recoverPrevious) {
             recoverPrevious = false;
-            let cursor: Cursor | undefined;
-            do {
-              const page = await conversation.entries({ order: "descending" }, 100, cursor, BACKGROUND_CONTEXT);
-              const previous = page.items.find((entry) => AssistantEntry.is(entry));
+            for await (const entries of this.historyPages(conversation, { order: "descending" })) {
+              const previous = entries.find((entry) => AssistantEntry.is(entry));
               if (previous !== undefined) {
                 answer = text(previous); answerEntry = previous;
                 if (input.agent_id === undefined) {
@@ -1440,8 +1435,7 @@ export class TaskStore {
                 }
                 break;
               }
-              cursor = page.next;
-            } while (cursor !== undefined);
+            }
             if (answer.trim().length > 0 && actor.summary !== answer.slice(-4000)) {
               task = await this.update(task.id, (current) => {
                 this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-4000);

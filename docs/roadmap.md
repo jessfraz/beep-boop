@@ -40,6 +40,8 @@ recovery; [history](history.md) describes import and retrieval.
   resumable migration, bounded read/write regressions and real SQL-plan and
   growth benchmarks. Legacy records remain intact. Initialization has its own
   bounded budget and remains cancellable before listeners bind.
+  Retained-history scans yield between pages so concurrent clients stay
+  responsive during exhaustive reads.
 - [x] Use narrow process results and validate native execution bindings before
   host effects while retaining process limits and cleanup ownership.
 - [x] Share Rust/Swift tool-merge traces across live, restored and sparse updates,

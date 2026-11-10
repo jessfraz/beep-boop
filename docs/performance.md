@@ -115,6 +115,11 @@ search and checking original text, provenance and deletion.
 
 ## Durable task and source state
 
+Task-history traversal yields to transport and timers before each bounded page.
+Exhaustive searches and history reads retain their full results while unrelated
+requests can proceed. The bridge regression checks response ordering against
+real retained Pi history, without replacing storage or the runtime.
+
 Tasks and source events use keyed Pi documents. Small control records retain
 source cursors and triage ownership; indexed references locate task owners and
 related event versions without decoding unrelated retained bodies. Pi still
