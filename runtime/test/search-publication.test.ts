@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import type { EmbeddingSpace } from "../src/generated/EmbeddingSpace.js";
 import { SearchIndex, type Embed, type SearchRecord } from "../src/search.js";
+import { backfillCandidates } from "../src/search-candidates.js";
 
 const space: EmbeddingSpace = { id: "publication-lock", model_revision: "fixture", model_digest: "fixture",
   dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 };
@@ -128,6 +129,23 @@ test("closing a contended publication retains the complete prior view and reusab
     await publishing; await closing;
     writer.close(); await index.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ineligible candidate preparation does not compete with an unrelated publication lock", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-publication-noop-")), path = join(directory, "search.sqlite");
+  const index = new SearchIndex(path), writer = new DatabaseSync(path);
+  const candidate = new DatabaseSync(path, { allowExtension: true }), extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension);
+  candidate.loadExtension(extension); candidate.enableLoadExtension(false); candidate.exec("PRAGMA busy_timeout=0");
+  let locked = false;
+  try {
+    await index.upsert("service", "one", records("original"), embed); await index.close();
+    writer.exec("BEGIN IMMEDIATE"); locked = true;
+    assert.equal(backfillCandidates(candidate, () => false), false, "An unsupported embedding space has no candidate writes to serialize");
+    assert.deepEqual({ ...candidate.prepare("SELECT watermark,dirty FROM conversations WHERE id='service'").get() }, { watermark: "one", dirty: 0 });
+  } finally {
+    if (locked) writer.exec("ROLLBACK");
+    candidate.close(); writer.close(); await index.close(); await rm(directory, { recursive: true, force: true });
   }
 });
 

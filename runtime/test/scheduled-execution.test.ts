@@ -184,7 +184,7 @@ test("stop during asynchronous preflight fences the admitted input before infere
 });
 
 for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "continuation"]) {
-  test(`background owner startup rebinds a placed ${phase} after ${shutdown} without replaying its host tool`, { timeout: 15_000 }, async () => {
+  test(`background owner startup rebinds a placed ${phase} after ${shutdown} without replaying its host tool`, { timeout: 15_000 }, async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "agent-background-resume-"));
     const childProcess = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/scheduled-admission-child.js", import.meta.url)), directory, phase, shutdown],
       { stdio: ["pipe", "pipe", "pipe"] });
@@ -222,12 +222,17 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
       app.faux.setResponses([(context) => {
         assert.ok(context.messages.some((message) => message.role === "toolResult" && message.content.some((part) =>
           part.type === "text" && part.text.includes("owned host tool output"))));
-        return fauxAssistantMessage("Recovered the original placed work.");
+        // Exercise native timer-driven streaming beyond a one-line answer.
+        return fauxAssistantMessage("Recovered the original placed work. " + "The retained host result was checked without replaying the owned tool. ".repeat(20));
       }, fauxAssistantMessage("The parent retained its recovered child result.")]);
       await app.tasks.resumeBackground();
       const restored = app;
-      await pump(async () => !restored.tasks.isRunning(task.id) &&
-        (await restored.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT))?.status === "done");
+      // Native streaming uses timers. A count of immediate turns can expire
+      // before those timers; retain the test's existing total deadline instead.
+      while (restored.tasks.isRunning(task.id) ||
+        (await restored.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT))?.status !== "done") {
+        await setImmediate(undefined, { signal: t.signal });
+      }
       const current = await app.tasks.get(task.id);
       assert.equal(current.conversation_id, task.conversation_id);
       if (phase === "child") { assert.equal(current.agents[0]?.state.state, "done"); assert.equal(current.agents[0]?.conversation_id, actor.conversation_id); }

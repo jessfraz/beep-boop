@@ -29,20 +29,31 @@ export function candidateRanks(database: DatabaseSync, vector: Uint8Array, take:
     FROM json_each(?) c CROSS JOIN chunk_vectors v WHERE v.rowid=c.value ORDER BY value LIMIT ?`).all(vector, JSON.stringify(ids), take);
 }
 
+function backfillDimensions(database: DatabaseSync): number | undefined {
+  const dimensions = database.prepare("SELECT json_extract(value,'$.dimensions') AS dimensions FROM metadata WHERE key='space'").get()?.dimensions;
+  // Small projections already scan cheaply. Low-dimensional test/custom
+  // spaces also need not support binary quantization.
+  if (typeof dimensions !== "number" || dimensions < 256 || dimensions % 8 !== 0 ||
+      database.prepare("SELECT id FROM chunks LIMIT 1 OFFSET 32767").get() === undefined) return undefined;
+  return dimensions;
+}
+
 /** One bounded transaction, scheduled by the existing publisher between its messages. */
 export function backfillCandidates(database: DatabaseSync, canceled: () => boolean): boolean {
   const requireOpen = () => { if (canceled()) throw new Error("Search index is closed"); };
-  requireOpen(); database.exec("BEGIN IMMEDIATE");
+  requireOpen();
+  const pending = database.prepare("SELECT value FROM metadata WHERE key=?").get(STATE);
+  // No-op preparation must not take the publication writer's lock. Recheck
+  // eligibility inside the transaction when there is actual work to claim.
+  if (pending?.value === "ready" || (pending === undefined && backfillDimensions(database) === undefined)) return false;
+  database.exec("BEGIN IMMEDIATE");
   try {
     requireOpen();
     const saved = database.prepare("SELECT value FROM metadata WHERE key=?").get(STATE);
     if (saved?.value === "ready") { database.exec("ROLLBACK"); return false; }
     if (saved === undefined) {
-      const dimensions = database.prepare("SELECT json_extract(value,'$.dimensions') AS dimensions FROM metadata WHERE key='space'").get()?.dimensions;
-      // Small projections already scan cheaply. Low-dimensional test/custom
-      // spaces also need not support binary quantization.
-      if (typeof dimensions !== "number" || dimensions < 256 || dimensions % 8 !== 0 ||
-          database.prepare("SELECT id FROM chunks LIMIT 1 OFFSET 32767").get() === undefined) {
+      const dimensions = backfillDimensions(database);
+      if (dimensions === undefined) {
         database.exec("ROLLBACK"); return false;
       }
       database.exec(`CREATE VIRTUAL TABLE chunk_candidates USING vec0(embedding bit[${dimensions}])`);
