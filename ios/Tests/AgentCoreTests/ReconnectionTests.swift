@@ -6,7 +6,7 @@ import Testing
 @testable import AgentUI
 
 enum ReconnectBehavior: Sendable {
-  case recover, close, reject, malformed, turnFailure, acknowledged, paused, active
+  case recover, heldPlacement, close, reject, malformed, turnFailure, acknowledged, paused, active
 }
 
 private actor ReconnectCoordinator {
@@ -19,6 +19,8 @@ private actor ReconnectCoordinator {
   private var acceptedWork: InputWorkState?
   private var release: CheckedContinuation<Void, Never>?
   private var released = false
+  private var placementRelease: CheckedContinuation<Void, Never>?
+  private var placementReleased = false
   private var stopped = false
   private var failures: [String] = []
   private var nextObservationFailure: NativeEventFailure?
@@ -68,9 +70,15 @@ private actor ReconnectCoordinator {
     release?.resume()
     release = nil
   }
+  func releasePlacement() {
+    placementReleased = true
+    placementRelease?.resume()
+    placementRelease = nil
+  }
   func stop() {
     stopped = true
     releaseSnapshot()
+    releasePlacement()
     for socket in sockets.values { socket.cancel() }
   }
 
@@ -116,7 +124,9 @@ private actor ReconnectCoordinator {
         }
         try await emit(
           .ready(.init(conversationId: "fixture-root", model: "fixture/model")), to: socket)
-        if observations.count > 1 && behavior == .recover && !released {
+        if observations.count > 1 && (behavior == .recover || behavior == .heldPlacement)
+          && !released
+        {
           await withCheckedContinuation { release = $0 }
         }
         guard !stopped else { return }
@@ -128,6 +138,12 @@ private actor ReconnectCoordinator {
         }
         try await emit(
           .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
+        // Exercise the legacy history-first ordering with a real gap between
+        // page completion and the independent input-placement receipt.
+        if behavior == .heldPlacement && !saved.isEmpty && !placementReleased {
+          await withCheckedContinuation { placementRelease = $0 }
+        }
+        guard !stopped else { return }
         for input in saved {
           if behavior == .acknowledged {
             if let acceptedWork {
@@ -581,7 +597,7 @@ func permanentAdmissionFailurePreservesUncertainInputAndRequiresCorrection(_ cod
 func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping()
   async throws
 {
-  try await withReconnectCoordinator(.recover) { model, fixture, outbox in
+  try await withReconnectCoordinator(.heldPlacement) { model, fixture, outbox in
     try await waitForReconnectState { model.connection == .connected }
     model.draft = "The original submission"
     await model.send()
@@ -607,6 +623,21 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
       model.connection == .connected
         && model.rows.first?.row.entryID == "saved-\(submitted.inputId)"
         && model.rows.first?.row.delivery == .saved
+    }
+    // History can expose a saved user row before the independent receipt
+    // correlates it with this local input. Page readiness cannot retire outbox
+    // ownership or guess identity from identical text.
+    let awaitingPlacement = try #require(model.rows.first(where: { $0.id == originalID }))
+    #expect(awaitingPlacement.row.entryID == nil)
+    #expect(try savedInputs(at: outbox) == [submitted])
+    #expect(model.draft == "New typing survives reconnection")
+    await fixture.releasePlacement()
+    try await waitForReconnectState {
+      model.connection == .connected
+        && model.rows.contains {
+          $0.id == originalID && $0.row.entryID == "saved-\(submitted.inputId)"
+            && $0.row.delivery == .saved
+        }
     }
     #expect(model.error == nil)
     #expect(model.draft == "New typing survives reconnection")
