@@ -11,7 +11,7 @@
     "node": ">=26.12.1"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.4.0",
+    "@earendil-works/chord": "1.5.0",
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
     "@earendil-works/pi-mcp": "1.4.0",

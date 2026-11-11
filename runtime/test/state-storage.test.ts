@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { LegacySources, LegacyTasks, openStateStorage, seedLegacy } from "./fixtures/state-storage.js";
+import { LegacySources, LegacyTasks, SqlTrace, openStateStorage, seedLegacy } from "./fixtures/state-storage.js";
+import { openConversationDatabase } from "../src/conversation-database.js";
 import type { TaskOutcome } from "../src/generated/TaskOutcome.js";
 
 for (const kind of ["agent.task.directory", "agent.source.event.directory"]) {
@@ -119,4 +120,28 @@ test("cold point lookups and hot task admission materialize only their owned rec
     await app.session.close(BACKGROUND_CONTEXT); app = await openStateStorage(path);
     assert.equal((await app.tasks.get(first.id)).pending[0]?.id, "hot-input");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("SQL tracing preserves counted writes and transaction rollback", async t => {
+  const native = await openConversationDatabase(":memory:"), trace = new SqlTrace(), database = trace.database(native);
+  const update = "UPDATE trace_counts SET value = ? WHERE id = ?";
+  try {
+    await database.exec("CREATE TABLE trace_counts (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    await database.run("INSERT INTO trace_counts (id, value) VALUES (?, ?)", 1, "initial");
+    const before = await native.all<{ detail: string }>("EXPLAIN QUERY PLAN " + update, "direct", 1);
+    trace.enabled = true;
+    assert.equal(await database.runCounted(update, "direct", 1), 1);
+    assert.equal(await database.runCounted(update, "missing", 2), 0);
+    await database.transaction(async tx => { assert.equal(await tx.runCounted(update, "committed", 1), 1); });
+    await assert.rejects(database.transaction(async tx => {
+      assert.equal(await tx.runCounted(update, "rolled back", 1), 1);
+      throw new Error("rollback counted write");
+    }), /rollback counted write/);
+    assert.equal((await database.get<{ value: string }>("SELECT value FROM trace_counts WHERE id = ?", 1))?.value, "committed");
+    assert.equal(trace.samples.get(update)?.calls, 4);
+    const plans = await trace.report(native), after = plans.find(plan => plan.sql === update);
+    assert.ok(after);
+    assert.deepEqual(after.plan, before.map(row => row.detail));
+    t.diagnostic(JSON.stringify({ counted_write_before: before, counted_write_after: after, plans }));
+  } finally { await database.close(); }
 });
