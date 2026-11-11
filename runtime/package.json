@@ -21,7 +21,7 @@
     "ajv": "^8.17.1",
     "openid-client": "^6.8.9",
     "playwright-core": "1.64.1",
-    "typebox": "1.4.3"
+    "typebox": "1.4.5"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
