@@ -38,6 +38,19 @@ ChatGPT is the default provider. A signed-out chat reports
 their supported environment or ambient credentials. Beep Boop does not provide
 an interactive login flow for every provider.
 
+When model usage or credits run out, pending responses stay saved. Conversations
+sharing the account pause together, and one retained request checks capacity
+after a cooldown. Checks start about five minutes apart and back off to about
+an hour, honoring a longer reset time supplied by the provider. Source polling
+continues while model work waits. Capacity returning resumes the same responses
+and preserves completed tool results, including across service restarts. The
+main chat gets one notice when the account pauses and one when it recovers.
+
+Scheduled inputs that failed with quota exhaustion before this behavior was
+installed receive one continuation in their existing task. That continuation
+checks prior effects and reconciles the original input before the schedule
+advances. Other terminal failures keep their existing recovery requirements.
+
 ## Worker or CLI client
 
 On another execution machine:

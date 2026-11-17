@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Harness } from "@earendil-works/pi-durable";
+import type { ConversationId, Harness } from "@earendil-works/pi-durable";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { ScheduledJob } from "./generated/ScheduledJob.js";
 import { SourceJournal } from "./sources.js";
 import { TaskError, TaskStore } from "./tasks.js";
+import { isQuotaExhaustion } from "./quota.js";
 
 /** A stable UUID keeps the ordinary task API authoritative across replay. */
 export function scheduledTaskId(occurrence: string): string {
@@ -29,12 +30,42 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore): Promise
     source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id))?.id;
 }
 
+async function reconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
+  conversation: ConversationId, requestId: string): Promise<boolean> {
+  return session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation) &&
+    (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation, requestId)), BACKGROUND_CONTEXT);
+}
+
 async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {
   const conversation = await tasks.conversation((await tasks.get(id)).conversation_id);
-  if (!await session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation.id) &&
-      (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation.id, requestId)), BACKGROUND_CONTEXT)) {
+  if (!await reconciledTask(session, tasks, sources, id, conversation.id, requestId)) {
     throw new TaskError("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
   }
+}
+
+/** Older versions settled quota failures permanently. Admit one continuation in
+ * the same actor, retaining its original input and completed effects as evidence. */
+async function recoverQuotaTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
+  requestId: string, signal: AbortSignal): Promise<void> {
+  const task = await tasks.get(id), conversation = await tasks.conversation(task.conversation_id);
+  if (await reconciledTask(session, tasks, sources, id, conversation.id, requestId)) return;
+  const original = await session.commit(tx => tx.submissionByRequest(conversation.id, requestId), BACKGROUND_CONTEXT);
+  if (original?.type === "input" && original.status === "unanswered" && original.reason === "model_error" &&
+      typeof original.detail === "string" && isQuotaExhaustion(original.detail)) {
+    if (signal.aborted) throw new TaskError("Scheduled work stopped with the coordinator; its admission is retained");
+    const recoveryId = "quota-recovery:" + original.id;
+    const recovery = await session.commit(tx => tx.submissionByRequest(conversation.id, recoveryId), BACKGROUND_CONTEXT);
+    if (recovery === undefined) {
+      await tasks.enqueue(id, `Continue the unanswered scheduled input ${JSON.stringify(requestId)} after quota exhaustion. ` +
+        "Its original input and completed tool results remain in this conversation. Verify prior effects and continue only unfinished work; do not repeat completed actions. " +
+        "Preserve existing authorization and waiting decisions. Before finishing, use record_task with " +
+        `reconciles_input=${JSON.stringify(requestId)}, a verified summary, and the actual current task state.`, recoveryId, undefined, "follow_up");
+    }
+    // A terminal recovery is evidence to inspect, never permission for another
+    // automatic attempt after an abort, unrelated error or missing reconciliation.
+    if (recovery === undefined || recovery.status === "queued" || recovery.status === "placed") await tasks.runBackground(id, signal);
+  }
+  await requireReconciledTask(session, tasks, sources, id, requestId);
 }
 
 /** Run the existing task actor in the coordinator, then settle its exact Pi input. */
@@ -48,7 +79,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const conversation = await tasks.conversation(task.conversation_id);
   let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
   if (submission?.status === "done") return;
-  if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, sources, id, occurrence.id); return; }
+  if (submission?.status === "unanswered") { await recoverQuotaTask(session, tasks, sources, id, occurrence.id, signal); return; }
   if (submission === undefined && !task.pending.some((input) => input.id === occurrence.id)) {
     await tasks.enqueueScheduled(id, occurrencePrompt(occurrence), occurrence);
   }

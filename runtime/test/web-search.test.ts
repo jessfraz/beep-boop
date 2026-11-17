@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { ConversationModels, DEFAULT_MODEL, modelFailureMessage } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { history } from "../src/transcript.js";
+import { pump } from "./fixtures/background-runtime.js";
 import type { ModelSelection } from "../src/generated/ModelSelection.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
@@ -246,7 +247,7 @@ test("provider capability rejection stays visible and does not silently retry wi
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("subscription-sharing limits explain credit permission while retaining the original worker task", { timeout: 20_000 }, async (t) => {
+test("subscription-sharing limits pause the original worker and share its cooldown with main chat", { timeout: 20_000 }, async (t) => {
   for (const transport of ["http", "stream"]) await t.test(transport, async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-model-limit-"));
     const wire = await server((response) => {
@@ -259,27 +260,29 @@ test("subscription-sharing limits explain credit permission while retaining the 
       }
     });
     let app = await open(directory, wire.url);
-    const expected = 'ChatGPT plan usage reached a limit for this app. In Settings → Usage → App limits (https://chatgpt.com/settings/usage), review the app limit and enable "Allow other apps to use credits after reaching your usage limit" to use available credits. Its conversation is retained.';
+    let running: ReturnType<typeof app.tasks.run> | undefined;
     try {
       const task = await app.tasks.create({ title: "Retained review", outcome: "Finish the requested review", model: app.selection });
       await app.tasks.enqueue(task.id, "Continue this original request.");
       await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
       const worker = (await app.tasks.get(task.id)).worker; assert.equal(worker.state, "bound"); if (worker.state !== "bound") throw new Error("No worker binding");
-      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "", cwd: host.cwd, model: app.selection },
-        () => () => {}), { message: expected });
+      running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "", cwd: host.cwd, model: app.selection },
+        () => () => {});
+      void running.catch(() => {});
+      await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(item => item.state.kind === "sleeping"));
       assert.equal(wire.requests.length, 1, "A limit must not start another billable request");
-      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url);
+      await app.session.close(BACKGROUND_CONTEXT); await running.catch(() => {}); running = undefined;
+      app = await open(directory, wire.url);
       const retained = await app.tasks.get(task.id);
       assert.equal(retained.conversation_id, task.conversation_id); assert.equal(retained.state.state, "open");
       assert.deepEqual((await app.tasks.list()).map((item) => item.id), [task.id]);
       const conversation = await app.tasks.conversation(retained.conversation_id);
-      assert.equal(await modelFailureMessage(conversation, "Generic failure"), expected);
       assert.ok((await history(conversation, null, app.session)).some((frame) => frame.messages.some((message) => message.role === "user" && message.text === "Continue this original request.")));
       const input = await app.root.submit({ type: "input", content: "Continue the main conversation." }, BACKGROUND_CONTEXT);
-      assert.equal((await input.wait(BACKGROUND_CONTEXT)).status, "unanswered");
-      assert.equal(await modelFailureMessage(app.root, "Generic main failure"), expected);
-      assert.equal(wire.requests.length, 2);
-    } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+      await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.filter(item => item.state.kind === "sleeping").length === 2);
+      assert.equal((await input.status(BACKGROUND_CONTEXT)).status, "placed");
+      assert.equal(wire.requests.length, 1, "A second conversation must share the exhausted account's cooldown");
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await running?.catch(() => {}); await wire.close(); await rm(directory, { recursive: true, force: true }); }
   });
 });
 

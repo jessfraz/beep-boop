@@ -95,6 +95,94 @@ for (const scenario of ["absent", "unknown", "wrong", "failed", "foreign"]) {
   });
 }
 
+test("legacy quota failure recovers its exact occurrence after restart without repeating completed effects", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-legacy-quota-")), effectPath = join(directory, "effect.txt");
+  let app = await openScheduled(directory);
+  const controller = new AbortController();
+  try {
+    // Produce the old terminal receipt through Pi, before the quota adapter is installed.
+    app.tasks.inference.models.setProvider(app.faux.provider);
+    app.configureBackground(async (request) => {
+      if (request.type === "on_node" && request.command.type === "exec" && request.command.program === "perform-effect") {
+        await appendFile(effectPath, "performed once\n");
+        return { type: "process", exit_code: 0, stdout: "The effect completed.", stderr: "", truncated: false };
+      }
+      return app.call(request);
+    });
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("exec", { program: "perform-effect", args: [] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "subscription_sharing_usage_limit_exceeded" }),
+    ]);
+    await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app), /scheduled turn/);
+    const task = (await app.tasks.list())[0]; assert.ok(task);
+    await pump(() => !app.tasks.isRunning(task.id));
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const original = await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
+    assert.ok(original); assert.equal(original.status, "unanswered");
+    assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
+    await app.close(); app = await openScheduled(directory, "restored");
+    app.environment.setConnected([]);
+    await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app, task.id), /offline/);
+    assert.equal((await app.tasks.get(task.id)).pending.filter(input => input.id === "quota-recovery:" + original.id).length, 1);
+    assert.equal(await app.session.commit(tx => tx.submissionByRequest(conversation.id, "quota-recovery:" + original.id), BACKGROUND_CONTEXT), undefined);
+    await app.close(); app = await openScheduled(directory, "reopened-before-admission");
+    app.configureBackground(async (request) => {
+      if (request.type === "on_node" && request.command.type === "exec" && request.command.program === "verify-effect") {
+        return { type: "process", exit_code: 0, stdout: await readFile(effectPath, "utf8"), stderr: "", truncated: false };
+      }
+      return app.call(request);
+    });
+    app.faux.setResponses([
+      (context) => {
+        assert.ok(context.messages.some(message => message.role === "toolResult" && message.toolName === "exec"));
+        const user = context.messages.findLast(message => message.role === "user");
+        assert.ok(user); assert.match(JSON.stringify(user.content), /example-occurrence/);
+        return fauxAssistantMessage(fauxToolCall("exec", { program: "verify-effect", args: [] }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the existing effect without repeating it.",
+        reconciles_input: scheduledOccurrence.id, state: { state: "waiting", actor: "The next scheduled occurrence", next_check: null } }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("The retained occurrence is reconciled."),
+    ]);
+    await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
+    const recovery = await app.session.commit(tx => tx.submissionByRequest(conversation.id, "quota-recovery:" + original.id), BACKGROUND_CONTEXT);
+    assert.equal(recovery?.status, "done");
+    const retained = await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
+    assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
+    assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
+    assert.equal((await app.tasks.list()).length, 1);
+    const receipt = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id, limit: 10 }))
+      .find(event => event.outcome?.reconciliation !== undefined)?.outcome?.reconciliation;
+    assert.equal(receipt?.original.submission_id, original.id.toString());
+    assert.deepEqual(receipt?.recovery_inputs.map(input => input.request_id), ["quota-recovery:" + original.id]);
+    await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
+    assert.equal(app.faux.state.callCount, 3, "An already reconciled occurrence must not admit another recovery");
+    await app.close(); app = await openScheduled(directory, "reopened-again");
+    await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const outcome of ["missing-reconciliation", "nonquota-error", "aborted"]) {
+  test(`legacy quota recovery with ${outcome} is not replayed`, { timeout: 10_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-legacy-quota-held-")), app = await openScheduled(directory);
+    const controller = new AbortController();
+    try {
+      app.tasks.inference.models.setProvider(app.faux.provider);
+      app.faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" })]);
+      await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app), /scheduled turn/);
+      const task = (await app.tasks.list())[0]; assert.ok(task);
+      await pump(() => !app.tasks.isRunning(task.id));
+      app.faux.setResponses([outcome === "missing-reconciliation" ? fauxAssistantMessage("Reviewed, with no exact reconciliation receipt.")
+        : fauxAssistantMessage("", { stopReason: outcome === "aborted" ? "aborted" : "error", errorMessage: "The model configuration is invalid" })]);
+      await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app, task.id), /scheduled turn|did not complete/);
+      await pump(() => !app.tasks.isRunning(task.id));
+      assert.equal(app.faux.state.callCount, 2);
+      await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app, task.id), /scheduled turn/);
+      assert.equal(app.faux.state.callCount, 2, "A failed or unverified recovery must retain its original request identity");
+    } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
 for (const recoveredState of ["waiting", "resolved"]) {
   test(`explicit ${recoveredState} recovery settles the same occurrence after reopen without replaying its effect`, { timeout: 15_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-reconcile-")), clock = new FakeClock();

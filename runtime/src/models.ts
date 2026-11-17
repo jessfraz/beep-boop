@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -11,6 +12,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
 import { withWebSearch } from "./web-search.js";
+import { QuotaRecovery } from "./quota.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
@@ -118,6 +120,18 @@ export class ConversationModels {
         }),
       });
     }
+    const quota = new QuotaRecovery(models, this.session, async (model, options) => {
+      let identity = options?.apiKey ?? "ambient";
+      if (model.provider === "openai" && auth !== undefined) {
+        const status = await auth.status();
+        if (status.state === "connected") identity = `${status.account.issuer}:${status.account.subject}`;
+      }
+      // Access-token refreshes keep the account's cooldown; credentials never
+      // enter durable request state or notices.
+      return createHash("sha256").update(JSON.stringify([model.provider, model.baseUrl, identity])).digest("hex");
+    });
+    for (const provider of models.getProviders()) models.setProvider(quota.wrapProvider(provider));
+    quota.wrapComplete();
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
   validate(selection: ModelSelection): void {
