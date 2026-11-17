@@ -26,7 +26,10 @@ export type QuotaClock = { now?: () => number; random?: () => number; setTimer?:
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 export function isQuotaExhaustion(message: string | undefined): boolean {
-  return /\b(?:subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|insufficient_quota)\b/u.test(message ?? "");
+  const error = message ?? "";
+  return /\b(?:subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|insufficient_quota)\b/u.test(error)
+    || /\bThe ChatGPT user has reached their Subscription Sharing usage limit\.(?:\s|$)/iu.test(error)
+    || /\bYou have no credits remaining\.\s+Add credits to continue using the API at(?:\s|$)/iu.test(error);
 }
 function sum(left: Usage, right: Usage): Usage {
   return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead,

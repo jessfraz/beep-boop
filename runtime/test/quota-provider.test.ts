@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Model, type Api, type ProviderRequestOptions } from "@earendil-works/pi-ai";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
@@ -135,3 +136,41 @@ test("a slow quota check retains exclusive admission past its crash-recovery lea
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("native OpenAI HTTP message-only quota limits pause while transient rate limits remain errors", { timeout: 10_000 }, async (t) => {
+  for (const scenario of [
+    { name: "ChatGPT subscription", code: "subscription_sharing_usage_limit_exceeded",
+      message: "The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.", paused: true },
+    { name: "API credits", code: "insufficient_quota",
+      message: "You have no credits remaining. Add credits to continue using the API at https://example.com/credits", paused: true },
+    { name: "transient request rate", code: "rate_limit_exceeded",
+      message: "Rate limit reached for requests. Please try again later.", paused: false },
+  ]) await t.test(scenario.name, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-quota-http-")), clock = new FakeClock(), models = builtinModels();
+    const provider = models.getProvider("openai"); assert.ok(provider);
+    const model = models.getModel("openai", "gpt-6.1-sol"); assert.ok(model);
+    models.setProvider({ ...provider, auth: { apiKey: { name: "Synthetic API authentication", resolve: async () => ({ auth: { apiKey: "sk-synthetic-http-fixture" } }) } } });
+    let requests = 0;
+    const options = { transport: "sse", maxRetries: 0, fetch: async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ error: { code: null, type: "rate_limit_error", message: scenario.message } }),
+        { status: 429, headers: { "content-type": "application/json" } });
+    } } satisfies Parameters<typeof models.streamSimple>[2];
+    const context = { messages: [{ role: "user", content: "Continue the retained request.", timestamp: START }] } satisfies Parameters<typeof models.streamSimple>[1];
+    const native = await models.streamSimple(model, context, options).result();
+    assert.equal(native.stopReason, "error"); assert.ok(native.errorMessage); assert.ok(native.errorMessage.includes(scenario.message));
+    assert.equal(native.errorMessage.includes(scenario.code), false, "The real provider response has no usable quota code");
+    const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+      { models, registry: createRegistry(), now: clock.now, setTimer: clock.setTimer, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+    try {
+      const quota = new QuotaRecovery(models, Promise.resolve(session), async () => "synthetic-http-account", { now: clock.now, random: () => 0 });
+      const authenticated = models.getProvider("openai"); assert.ok(authenticated);
+      models.setProvider(quota.wrapProvider(authenticated));
+      const recovered = await models.streamSimple(model, context, options).result();
+      assert.equal(recovered.stopReason, scenario.paused ? "deferred" : "error");
+      assert.equal(requests, 2);
+      const next = await models.streamSimple(model, context, options).result();
+      assert.equal(next.stopReason, scenario.paused ? "deferred" : "error");
+      assert.equal(requests, scenario.paused ? 2 : 3, "Quota waits suppress requests while transient rate errors keep their existing retry behavior");
+    } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+});
