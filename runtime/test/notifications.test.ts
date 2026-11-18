@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test, type TestContext } from "node:test";
+import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type { ApnsConfig } from "../src/generated/ApnsConfig.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
@@ -424,7 +425,10 @@ syncBuiltinESMExports();
       child.stdin.write(JSON.stringify({ version: 1, id: 2, command: { type: "run_background", settings: {
         poll_interval_seconds: 60, sources: false, jobs: null } } } satisfies RuntimeRequest) + "\n");
       let current = await status(4);
-      for (let id = 5; current.pending > 0 && id < 1000; id += 1) current = await status(id);
+      for (let id = 5; current.pending > 0; id += 1) {
+        await setTimeout(10, undefined, { signal: t.signal });
+        current = await status(id);
+      }
       assert.equal(current.pending, 0); assert.deepEqual(current.errors, []);
       assert.equal(embeddings.filter(text => text.includes("Retained source evidence")).length, 1,
         "The original history task must index its retained evidence once after binding");

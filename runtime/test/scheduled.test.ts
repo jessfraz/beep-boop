@@ -10,7 +10,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { BackgroundScheduler } from "../src/background.js";
-import { openJobActor, runScheduled } from "../src/scheduled.js";
+import { occurrencePrompt, openJobActor, runScheduled } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import { createAppTools } from "../src/tools.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
@@ -182,6 +182,88 @@ for (const outcome of ["missing-reconciliation", "nonquota-error", "aborted"]) {
     } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
   });
 }
+
+test("a successful exact recovery settles while subsequent work remains active", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-recovered-active-")), app = await openScheduled(directory);
+  const controller = new AbortController(); let release = () => {}, running: Promise<void> | undefined;
+  try {
+    app.faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "The original request failed" })]);
+    await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app), /scheduled turn/);
+    const task = (await app.tasks.list())[0]; assert.ok(task);
+    await pump(() => !app.tasks.isRunning(task.id));
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the original request had no completed effects.",
+        reconciles_input: scheduledOccurrence.id, state: { state: "waiting", actor: "Upstream check", next_check: null } }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("The original request is reconciled."),
+    ]);
+    await app.tasks.enqueue(task.id, "Verify the original request.", "exact-recovery", undefined, "follow_up");
+    await app.tasks.runBackground(task.id);
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    assert.equal(await app.session.commit(tx => app.sources.reconcilesIn(tx, task.id, conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT), true);
+
+    let started = () => {}; const active = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    app.faux.setResponses([async () => { started(); await gate; return fauxAssistantMessage("The later request completed."); }]);
+    await app.tasks.enqueue(task.id, "Continue a separate authorized request.", "later-request", undefined, "follow_up");
+    running = app.tasks.runBackground(task.id); await active;
+    assert.equal(app.tasks.isRunning(task.id), true);
+    await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
+    assert.equal(app.tasks.isRunning(task.id), true, "Settling the old occurrence must not stop subsequent work");
+    const later = await app.session.commit(tx => tx.submissionByRequest(conversation.id, "later-request"), BACKGROUND_CONTEXT);
+    assert.equal(later?.status, "placed");
+    release(); await running; running = undefined;
+    assert.equal((await app.tasks.list()).length, 1);
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a retained terminal outbox item cannot abort a fresh explicit recovery after restart", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-terminal-outbox-")), effectPath = join(directory, "effect.txt");
+  let app = await openScheduled(directory);
+  const controller = new AbortController();
+  try {
+    app.configureBackground(async request => {
+      if (request.type === "on_node" && request.command.type === "exec" && request.command.program === "perform-effect") {
+        await appendFile(effectPath, "performed once\n");
+        return { type: "process", exit_code: 0, stdout: "The effect completed.", stderr: "", truncated: false };
+      }
+      return app.call(request);
+    });
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("exec", { program: "perform-effect", args: [] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("", { stopReason: "aborted" }),
+    ]);
+    await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app), /scheduled turn/);
+    const task = (await app.tasks.list())[0]; assert.ok(task);
+    await pump(() => !app.tasks.isRunning(task.id));
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const original = await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
+    assert.ok(original); assert.equal(original.status, "unanswered");
+    // Re-admission of a stable request can retain app outbox state after its native receipt is terminal.
+    await app.tasks.enqueue(task.id, occurrencePrompt(scheduledOccurrence), scheduledOccurrence.id, undefined, "follow_up");
+    await app.close(); app = await openScheduled(directory);
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("read_file", { path: effectPath }), { stopReason: "toolUse" }),
+      context => {
+        assert.ok(context.messages.some(message => message.role === "toolResult" && message.content.some(part => part.type === "text" && part.text.includes("performed once"))));
+        return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the completed effect; no replay is needed.",
+          reconciles_input: scheduledOccurrence.id, state: { state: "waiting", actor: "Upstream check", next_check: null } }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("The interrupted input is reconciled."),
+    ]);
+    await app.views.input({ type: "conversation_input", conversation_id: task.conversation_id, input_id: "explicit-recovery",
+      input: "Verify prior effects and reconcile the exact interrupted scheduled input.", mode: "follow_up" }, app.call, () => {});
+    await app.tasks.runBackground(task.id);
+    const recovered = await app.session.commit(tx => tx.submissionByRequest(conversation.id, "explicit-recovery"), BACKGROUND_CONTEXT);
+    assert.equal(recovered?.status, "done", "A historical abort must not abort the newly admitted continuation");
+    assert.equal(app.faux.state.callCount, 3);
+    assert.equal((await app.tasks.get(task.id)).pending.length, 0);
+    const retained = await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
+    assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
+    await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
+    assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
+    assert.equal((await app.tasks.list()).length, 1);
+  } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 for (const recoveredState of ["waiting", "resolved"]) {
   test(`explicit ${recoveredState} recovery settles the same occurrence after reopen without replaying its effect`, { timeout: 15_000 }, async () => {

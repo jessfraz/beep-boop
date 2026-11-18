@@ -32,8 +32,10 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore): Promise
 
 async function reconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
   conversation: ConversationId, requestId: string): Promise<boolean> {
-  return session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation) &&
-    (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation, requestId)), BACKGROUND_CONTEXT);
+  // A successful exact recovery settles that input while the actor can continue
+  // other work. Resolving the whole task still requires quiescence.
+  return session.commit(async (tx) => await sources.reconcilesIn(tx, id, conversation, requestId) ||
+    (await tasks.canSettleScheduledIn(tx, id, conversation) && await tasks.canReleaseIn(tx, id)), BACKGROUND_CONTEXT);
 }
 
 async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {

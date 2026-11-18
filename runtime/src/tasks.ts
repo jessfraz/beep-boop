@@ -1423,14 +1423,31 @@ export class TaskStore {
         actor = this.actor(task, input.agent_id);
         // Pi can place a steer before an older follow-up. Preserve that native
         // order on recovery so an older shared answer cannot replace a newer one.
-        const next = await this.session.commit(async (tx) => {
-          let selected = actor.pending[0], placed = Number.POSITIVE_INFINITY;
-          for (const candidate of actor.pending) {
+        const queued = await this.session.commit(async (tx) => {
+          let selected = actor.pending[0];
+          let receipt = selected === undefined ? undefined : await tx.submissionByRequest(conversation.id, selected.id);
+          let placed = receipt?.entry ?? Number.POSITIVE_INFINITY;
+          for (const candidate of actor.pending.slice(1)) {
             const native = await tx.submissionByRequest(conversation.id, candidate.id);
-            if (native?.entry !== undefined && native.entry < placed) { selected = candidate; placed = native.entry; }
+            if (native?.entry !== undefined && native.entry < placed) { selected = candidate; receipt = native; placed = native.entry; }
           }
-          return selected;
+          return selected === undefined ? undefined : { input: selected, receipt };
         }, BACKGROUND_CONTEXT);
+        const next = queued?.input;
+        // A retained outbox item can already have an unanswered native receipt.
+        // Drain it before admitting fresh input; its old failure owns no new run
+        // and must not abort the continuation admitted behind it.
+        if (next !== undefined && queued?.receipt?.status === "unanswered") {
+          await this.update(task.id, current => {
+            const actor = this.actor(current, input.agent_id);
+            actor.pending = actor.pending.filter(item => item.id !== next.id);
+          });
+          if (queued.receipt.reason === "aborted" && queued.receipt.entry === undefined && next.mode !== undefined &&
+              (input.interactive === true || input.type === "background")) {
+            observer?.rejected?.(next.id, "The stopped turn withdrew this input; submit it again to continue.");
+          }
+          continue;
+        }
         if (next === undefined) {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           if (active.revision !== revision) continue;
