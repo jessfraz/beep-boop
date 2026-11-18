@@ -252,8 +252,24 @@ export class SourceJournal {
     await this.prepare();
     const query = options.query?.toLocaleLowerCase();
     const selected: StoredEvent[] = [], limit = Math.min(100, Math.max(1, options.limit ?? 20));
-    const read = options.keys === undefined ? this.records.values(this.session, true)
-      : await this.records.selected(this.session, options.keys);
+    let keys = options.keys;
+    if (keys === undefined && options.provider !== undefined && options.provider !== OUTCOMES.provider &&
+        options.account !== undefined && options.thread_id !== undefined) {
+      keys = (await this.session.snapshot(Related, "source:" + sourceReference({ provider: options.provider,
+        account: options.account, thread_id: options.thread_id }), BACKGROUND_CONTEXT))?.keys ?? [];
+    }
+    const indexed = async function* (journal: SourceJournal, keys: readonly string[]) {
+      // Related keys retain admission order. Read only the next bounded page;
+      // filters may need another page, but unrelated records are never hydrated.
+      const ordered = [...new Set(keys)].reverse();
+      for (let offset = 0; offset < ordered.length; offset += limit) {
+        const page = ordered.slice(offset, offset + limit), records = await journal.records.selected(journal.session, page);
+        if (records.length !== page.length) throw new TaskError("Source event index is incomplete");
+        yield* records;
+      }
+    };
+    const read = options.keys !== undefined ? await this.records.selected(this.session, options.keys)
+      : keys === undefined ? this.records.values(this.session, true) : indexed(this, keys);
     for await (const record of read) if (
       (options.provider === undefined || record.event.source.provider === options.provider) &&
       (options.account === undefined || record.event.source.account === options.account) &&
@@ -417,7 +433,7 @@ export class SourceJournal {
       Number.isFinite(Date.parse(task.state.next_check)) && Date.parse(task.state.next_check) <= Date.now()
       ? [{ id: task.id, next_check: task.state.next_check }] : []);
   }
-  private async claim(): Promise<{ work: TriageWork; conversation: string } | null> {
+  private async claim(selection: ModelSelection): Promise<{ work: TriageWork; conversation: string } | null> {
     await this.settlePublished();
     const due = await this.due();
     await this.session.commit(async (tx) => {
@@ -441,30 +457,53 @@ export class SourceJournal {
       const start = after < 0 ? 0 : after;
       const events: string[] = [];
       const next: Record<string, "oldest" | "newest"> = { ...journal.next_event };
-      // Stable account order and a persisted boundary keep small streams and
-      // accounts beyond this batch reachable, including when its last account drains.
-      // Alternate within each account so new arrivals and old pending work both
-      // advance, even when an account gets only one slot in a batch.
-      while (events.length < 20) {
-        const before = events.length;
-        for (let index = 0; index < order.length && events.length < 20; index += 1) {
-          const id = order[(start + index) % order.length]!;
-          const stream = streams.get(id);
-          if (stream === undefined || stream.oldest > stream.newest) continue;
-          const newest = next[id] === "newest";
-          const selected = stream.keys[newest ? stream.newest-- : stream.oldest++];
-          if (selected === undefined) continue;
-          next[id] = newest ? "oldest" : "newest";
-          events.push(selected.key); journal.last_claimed_source = stream.source;
+      const model = this.tasks.inference.models.getModel(selection.provider, selection.model_id);
+      const maximumBytes = Math.min(128 * 1024, Math.floor((model?.contextWindow ?? 256 * 1024) / 2));
+      let bytes = 0, attempts = 0, deferred: string | undefined;
+      const blocked = new Set<string>();
+      const take = async (id: string): Promise<void> => {
+        const stream = streams.get(id);
+        if (stream === undefined || stream.oldest > stream.newest || blocked.has(id)) return;
+        const newest = next[id] === "newest", selected = stream.keys[newest ? stream.newest : stream.oldest];
+        if (selected === undefined) return;
+        attempts += 1;
+        const record = await this.records.valueIn(tx, selected.key);
+        if (record === undefined) throw new TaskError("Source event index is incomplete");
+        const size = Buffer.byteLength(JSON.stringify({ key: record.key, event: record.event }));
+        if (events.length > 0 && bytes + size > maximumBytes) {
+          blocked.add(id); deferred ??= id; return;
         }
-        if (events.length === before) break;
+        // A single large original owns its own batch. Never truncate it or
+        // advance an end pointer/parity for an event deferred by the budget.
+        if (newest) stream.newest -= 1; else stream.oldest += 1;
+        next[id] = newest ? "oldest" : "newest";
+        events.push(selected.key); bytes += size;
+      };
+      // Reserve a fair first pass, then give spare capacity to backlog pressure.
+      // Keep that pass's rotation independent of the busy stream's spare slots.
+      for (let index = 0; index < order.length; index += 1) {
+        const id = order[(start + index) % order.length]!;
+        if (attempts >= 100 || bytes >= maximumBytes) { deferred ??= id; break; }
+        await take(id);
       }
+      while (attempts < 100 && events.length < 100 && bytes < maximumBytes) {
+        const id = order.filter(id => !blocked.has(id)).reduce<string | undefined>((best, id) => {
+          const stream = streams.get(id), prior = best === undefined ? undefined : streams.get(best);
+          const remaining = stream === undefined ? 0 : stream.newest - stream.oldest + 1;
+          return remaining > 0 && remaining > (prior === undefined ? 0 : prior.newest - prior.oldest + 1) ? id : best;
+        }, undefined);
+        if (id === undefined) break;
+        await take(id);
+      }
+      const boundary = deferred === undefined ? order[start] : order[(order.indexOf(deferred) + order.length - 1) % order.length];
+      const boundarySource = boundary === undefined ? undefined : streams.get(boundary)?.source;
+      if (boundarySource !== undefined) journal.last_claimed_source = boundarySource;
       if (events.length === 0 && due.length === 0) return;
       journal.next_event = next;
-      if (journal.conversation_id === null) {
-        const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
-        journal.conversation_id = conversation.id.toString();
-      }
+      // Completed routing history is retained in Pi, not carried into the next
+      // batch. An active claim returns above and keeps its exact conversation.
+      const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+      journal.conversation_id = conversation.id.toString();
       journal.active = { id: randomUUID(), events, due: due.slice(0, 20), attempt: 0, content: null };
     }, BACKGROUND_CONTEXT);
     const journal = await this.session.snapshot(Control, BACKGROUND_CONTEXT);
@@ -483,7 +522,7 @@ export class SourceJournal {
     const abort = () => { if (admitted && owned !== undefined) { stopping ??= owned.abort(BACKGROUND_CONTEXT); void stopping.catch(() => {}); } };
     signal?.addEventListener("abort", abort, { once: true });
     try {
-      const claimed = await this.claim();
+      const claimed = await this.claim(command.model);
       if (claimed === null) return;
       admittedWork = claimed.work;
       const conversation = await this.tasks.conversation(claimed.conversation);
@@ -507,6 +546,7 @@ export class SourceJournal {
           "Before dismissing a signal, check relevant configured standing workflows with list_jobs/read_job when needed; absence of a direct user request does not make authorized work inapplicable. " +
           "Reuse or steer the owning worker now when evidence enables a next step; linking evidence or saving notes is not execution. Do not defer useful work to the next scheduled pass. " +
           "Dispatch without waiting for workers; their durable outcomes return as source events. Link or dismiss every event and keep unfinished work in its owning task, not aggregate bookkeeping tasks. " +
+          "Review the batch together and group related decisions. Use exact-thread source lookups and read_task with include_history:false for routing/status; read original entries when an action depends on their evidence. " +
           "Current instructions and preferences govern existing tasks too; stale task notes do not revoke authorization or establish relevance. " +
           "Delegate only the new facts and next step; preserve workflow authorization instead of inventing restrictions. " +
           "Use notify for useful outcomes, requested completion updates or needed decisions. Otherwise save state silently; skip receipts and recaps. " +
@@ -523,7 +563,10 @@ export class SourceJournal {
           this.executions?.search(conversation.id.toString()));
         const prepared = "Continue this admitted source work; do not repeat completed actions.\n" + JSON.stringify({
           observed_at: new Date().toISOString(), events: records.map((record) => ({ key: record.key, event: record.event })),
-          due_followups: due, related_tasks: related.matches, retrieval_gaps: related.gaps,
+          due_followups: due.map(task => ({ id: task.id, title: task.title, state: task.state, sources: task.sources,
+            summary_preview: task.summary.slice(0, 1200), summary_truncated: task.summary.length > 1200 })),
+          related_tasks: related.matches.map(match => ({ ...match, excerpt: match.excerpt.slice(0, 1200),
+            excerpt_truncated: match.excerpt.length > 1200 })), retrieval_gaps: related.gaps,
         });
         await this.session.commit(async (tx) => {
           const journal = await tx.doc(Control);

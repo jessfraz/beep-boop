@@ -58,11 +58,11 @@ test("current provider messages stay beside old work when historical catchup arr
       events: Array.from({ length: 3 }, (_, index) => event(`other-${index}`, "beta", current)),
       coverage: { status: "complete" }, checkpoint: null }, null);
     const selected = await claim(app);
-    assert.equal(selected.length, 20);
-    assert.equal(new Set(selected.map((item) => item.key)).size, 20);
+    assert.equal(selected.length, 100);
+    assert.equal(new Set(selected.map((item) => item.key)).size, 100);
     assert.equal(selected.filter((item) => item.event.id.startsWith("current-")).length, 3,
       "Current mail must not wait behind later-admitted historical pages");
-    assert.equal(selected.filter((item) => item.event.source.account === "beta").length, 3);
+    assert.equal(selected.filter((item) => item.event.source.account === "beta").length, 1);
     assert.ok(selected.some((item) => item.event.id === "historical-0"), "Old work still advances");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

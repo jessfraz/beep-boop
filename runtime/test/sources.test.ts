@@ -239,6 +239,60 @@ async function claimedRecords(app: Awaited<ReturnType<typeof open>>, keys: strin
   return keys.map((key) => { const record = records.get(key); assert.ok(record); return record; });
 }
 
+test("completed source batches retain originals in separate native conversations", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-fresh-context-")), app = await open(directory);
+  const conversations: string[] = [], requests: TranscriptContext[] = [];
+  const run = () => app.sources.triage(command, conversation => {
+    conversations.push(conversation.id.toString());
+    return app.executions.bind(conversation.id.toString(), { cwd: command.cwd, hosts: [], role: "triage", call: async () => ({ type: "written" }) });
+  }, [app.tools.host, app.tools.main, app.sourceTools.main]);
+  try {
+    const first = { ...event("first-context"), text: "First batch original evidence must remain available." };
+    await app.sources.admit(batch([first], "first"), null);
+    const keys = (await app.sources.events({ pending: true })).map(record => record.key);
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys, reason: "First original reviewed" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(""),
+    ]);
+    await run();
+    await app.sources.admit(batch([event("second-context")], "second"), { value: "first" });
+    app.faux.setResponses([
+      input => {
+        requests.push(input);
+        return fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys: selectedKeys(input), reason: "Second original reviewed" }), { stopReason: "toolUse" });
+      }, fauxAssistantMessage(""),
+    ]);
+    await run();
+    const second = requests[0]; assert.ok(second);
+    assert.ok(!JSON.stringify(second.messages).includes(first.text), "Completed routing history must not enter another batch's model request");
+    assert.equal(conversations.length, 2); assert.notEqual(conversations[0], conversations[1]);
+    const original = (await app.sources.events({ keys }))[0]; assert.ok(original);
+    assert.deepEqual(original.event, first); assert.equal(original.decision?.type, "dismissed");
+    const id = conversations[0]; assert.ok(id);
+    assert.ok(JSON.stringify((await (await app.tasks.conversation(id)).context(BACKGROUND_CONTEXT)).messages).includes(first.text));
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("large originals retain their full payload and get a turn beside continuous competing arrivals", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-byte-fairness-")), app = await open(directory);
+  try {
+    await app.sources.admit(stream("chat", "a", 200), null);
+    const large = { ...event("large", "b"), source: { provider: "chat", account: "b", thread_id: "large" }, text: "完整 evidence ".repeat(20_000) };
+    await app.sources.admit({ source: { provider: "chat", account: "b" }, events: [large], checkpoint: null, coverage: { status: "complete" } }, null);
+    await app.sources.admit(stream("chat", "z", 2000), null);
+    const first = await claimedRecords(app, await accountForBatch(app));
+    assert.ok(first.length > 20 && first.length <= 100, "Small originals should use the bounded spare capacity");
+    assert.ok(first.every(record => record.event.source.account !== "b"), "A large original cannot overflow a nonempty batch");
+    await app.sources.admit({ ...stream("chat", "a", 1), events: [{ ...event("new", "a"), source: { provider: "chat", account: "a", thread_id: "new" } }] }, { value: "one" });
+    const second = await claimedRecords(app, await accountForBatch(app));
+    assert.equal(second.length, 1); assert.deepEqual(second[0]?.event, large, "Deferred original must receive an untruncated batch of its own");
+    const third = await claimedRecords(app, await accountForBatch(app));
+    assert.ok(third.some(record => record.event.source.account === "a"));
+    assert.ok(third.some(record => record.event.source.account === "z"));
+    assert.ok(Buffer.byteLength(JSON.stringify(third.map(record => ({ key: record.key, event: record.event })))) <= 128 * 1024);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("new mail is reviewed beside an existing account backlog without dropping old work across reopen", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-current-mail-")); let app = await open(directory);
   try {
@@ -247,12 +301,12 @@ test("new mail is reviewed beside an existing account backlog without dropping o
     const first = await claimedRecords(app, await accountForBatch(app));
     assert.ok(first.some((record) => record.event.id === "current"), "Current mail must not wait for all 1,000 earlier messages");
     assert.ok(first.some((record) => record.event.id === "0"), "Fresh mail must not starve the oldest pending work");
-    assert.equal(new Set(first.map((record) => record.key)).size, 20);
+    assert.equal(new Set(first.map((record) => record.key)).size, 100);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     await app.sources.admit(batch([event("next-current")], "three"), { value: "two" });
     const second = await claimedRecords(app, await accountForBatch(app));
     assert.ok(second.some((record) => record.event.id === "next-current"));
-    assert.ok(second.some((record) => record.event.id === "10"), "Old work continues from the previous batch rather than restarting");
+    assert.ok(second.some((record) => record.event.id === "50"), "Old work continues from the previous batch rather than restarting");
     assert.ok(second.every((record) => !first.some((prior) => prior.key === record.key)));
     assert.equal((await app.sources.events({ keys: [first[0]!.key] }))[0]?.decision?.type, "dismissed");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -261,19 +315,19 @@ test("new mail is reviewed beside an existing account backlog without dropping o
 test("accounts with one slot per batch alternate new arrivals and old work across reopen", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-one-slot-")); let app = await open(directory);
   try {
-    const accounts = Array.from({ length: 40 }, (_, index) => `account${String(index).padStart(2, "0")}`);
+    const accounts = Array.from({ length: 200 }, (_, index) => `account${String(index).padStart(3, "0")}`);
     for (const account of accounts) await app.sources.admit(stream("mail", account, 3), null);
     assert.ok((await claimedRecords(app, await accountForBatch(app))).every((record) => record.event.id === "0"));
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    for (const account of accounts.slice(0, 20)) await app.sources.admit(batch([event("current", account)], "two", account), { value: "one" });
+    for (const account of accounts.slice(0, 100)) await app.sources.admit(batch([event("current", account)], "two", account), { value: "one" });
     await accountForBatch(app);
     const current = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(current.length, 20);
+    assert.equal(current.length, 100);
     assert.ok(current.every((record) => record.event.id === "current"));
-    for (const account of accounts.slice(0, 20)) await app.sources.admit(batch([event("newer", account)], "three", account), { value: "two" });
+    for (const account of accounts.slice(0, 100)) await app.sources.admit(batch([event("newer", account)], "three", account), { value: "two" });
     await accountForBatch(app);
     const older = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(older.length, 20);
+    assert.equal(older.length, 100);
     assert.ok(older.every((record) => record.event.id === "1"), "Continuous arrivals must not starve an account's older work");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -286,7 +340,7 @@ test("source batches fairly interleave accounts while advancing both ends of a n
       assert.ok(provider && account); await app.sources.admit(stream(provider, account, 3), null);
     }
     const selected = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(selected.length, 20);
+    assert.equal(selected.length, 100);
     assert.deepEqual(selected.slice(0, 4).map((record) => [record.event.source.provider, record.event.source.account]),
       [["calendar", "alpha"], ["chat", "alpha"], ["mail", "alpha"], ["mail", "beta"]]);
     const seen = new Map<string, number[]>();
@@ -299,9 +353,12 @@ test("source batches fairly interleave accounts while advancing both ends of a n
     assert.ok(noisy.includes(0) && noisy.includes(2047), "Both old and recently admitted chat work advance");
     assert.equal(new Set(noisy).size, noisy.length);
     for (const [source, ids] of seen) {
-      if (source !== JSON.stringify(["chat", "alpha"])) assert.deepEqual(ids.toSorted((left, right) => left - right), [0, 1, 2]);
+      if (source !== JSON.stringify(["chat", "alpha"])) assert.deepEqual(ids, [0]);
     }
-    assert.equal(selected.filter((record) => record.event.source.provider === "mail").length, 6,
+    assert.equal(noisy.length, 97, "The dominant backlog receives spare capacity after every account gets a turn");
+    const following = [...await claimedRecords(app, await accountForBatch(app)), ...await claimedRecords(app, await accountForBatch(app))];
+    for (const account of ["alpha", "beta"]) assert.equal([...selected, ...following].filter(record =>
+      record.event.source.provider === "mail" && record.event.source.account === account).length, 3,
       "A busy chat account must not hide either mail account behind thousands of older events");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -309,22 +366,22 @@ test("source batches fairly interleave accounts while advancing both ends of a n
 test("rotation survives legacy-journal reopen and serves more accounts than one batch even when the cursor account drains", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-rotation-")); let app = await open(directory);
   try {
-    for (let index = 0; index < 41; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(2, "0")}`, index === 19 ? 1 : 2), null);
+    for (let index = 0; index < 201; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(3, "0")}`, index === 99 ? 1 : 2), null);
     // Admission uses the unchanged version-one journal with no rotation field.
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    assert.equal((await app.sources.states()).length, 42);
+    assert.equal((await app.sources.states()).length, 202);
     const first = await claimedRecords(app, await accountForBatch(app));
-    assert.deepEqual(first.map((record) => record.event.source.account), Array.from({ length: 20 }, (_, index) => `account${String(index).padStart(2, "0")}`));
+    assert.deepEqual(first.map((record) => record.event.source.account), Array.from({ length: 100 }, (_, index) => `account${String(index).padStart(3, "0")}`));
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const second = await claimedRecords(app, await accountForBatch(app));
-    assert.deepEqual(second.map((record) => record.event.source.account), Array.from({ length: 20 }, (_, index) => `account${String(index + 20).padStart(2, "0")}`),
+    assert.deepEqual(second.map((record) => record.event.source.account), Array.from({ length: 100 }, (_, index) => `account${String(index + 100).padStart(3, "0")}`),
       "Continue past the persisted boundary instead of restarting at still-busy earlier accounts");
     const third = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(third[0]?.event.source.account, "account40");
+    assert.equal(third[0]?.event.source.account, "account200");
     const all = [...first, ...second, ...third];
-    assert.equal(new Set(all.map((record) => record.event.source.account)).size, 41);
-    for (let index = 0; index < 41; index += 1) {
-      const records = all.filter((record) => record.event.source.account === `account${String(index).padStart(2, "0")}`);
+    assert.equal(new Set(all.map((record) => record.event.source.account)).size, 201);
+    for (let index = 0; index < 201; index += 1) {
+      const records = all.filter((record) => record.event.source.account === `account${String(index).padStart(3, "0")}`);
       assert.deepEqual(records.map((record) => Number(record.event.id)), Array.from({ length: records.length }, (_, order) => order));
     }
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -333,7 +390,7 @@ test("rotation survives legacy-journal reopen and serves more accounts than one 
 test("a failed claimed batch retains exact events across new arrivals and reopen without advancing rotation again", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-fair-retry-")); let app = await open(directory);
   try {
-    for (let index = 0; index < 25; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(2, "0")}`, 2), null);
+    for (let index = 0; index < 125; index += 1) await app.sources.admit(stream("mail", `account${String(index).padStart(3, "0")}`, 2), null);
     let first: string[] = [];
     app.faux.setResponses([(input) => { first = selectedKeys(input); return fauxAssistantMessage("No source decision was committed"); }]);
     await assert.rejects(app.triage(), /unaccounted/);
@@ -341,7 +398,7 @@ test("a failed claimed batch retains exact events across new arrivals and reopen
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     assert.deepEqual(await accountForBatch(app), first, "A retry must not replace the admitted batch with later arrivals or a fresh rotation");
     const next = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(next[0]?.event.source.account, "account20", "Only a new claim advances the persistent account boundary");
+    assert.equal(next[0]?.event.source.account, "account100", "Only a new claim advances the persistent account boundary");
     assert.ok(next.some((record) => record.event.source.provider === "calendar"));
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -351,7 +408,7 @@ test("concurrent triage calls retain one owned batch while new accounts wait for
   let release = () => {}, entered = () => {};
   const held = new Promise<void>((resolve) => { release = resolve; }), started = new Promise<void>((resolve) => { entered = resolve; });
   try {
-    for (const account of ["alpha", "beta", "gamma"]) await app.sources.admit(stream("mail", account, 10), null);
+    for (const account of ["alpha", "beta", "gamma"]) await app.sources.admit(stream("mail", account, 50), null);
     let first: string[] = [];
     app.faux.setResponses([
       async (input) => { first = selectedKeys(input); entered(); await held; return fauxAssistantMessage(fauxToolCall("dismiss_source_events", {
@@ -370,7 +427,7 @@ test("concurrent triage calls retain one owned batch while new accounts wait for
     release(); await Promise.all([running, concurrent]);
     assert.equal(app.faux.state.callCount, 2);
     const next = await claimedRecords(app, await accountForBatch(app));
-    assert.equal(next[0]?.event.source.account, "gamma");
+    assert.ok(next.every(record => !first.includes(record.key)), "A new batch must not repeat completed work");
     assert.ok(next.some((record) => record.event.source.provider === "calendar"));
     assert.equal(await app.sources.hasWork(), false);
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

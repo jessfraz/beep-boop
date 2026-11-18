@@ -474,6 +474,12 @@ service's PATH. `beep-boop sources` shows each account's coverage, last check in
 local time and safe diagnostic. `--json` also retains opaque checkpoints for
 scripts. An access failure is not an empty inbox.
 
+Source review admits up to 100 events within a model-sized byte budget. Each
+account gets a turn, and larger backlogs receive spare capacity. New batches use
+fresh Pi conversations; interrupted batches retain their exact admission and
+conversation. Original events, prior decisions and completed conversations stay
+available, and exact-thread reads use the retained source index.
+
 Messages reads run headlessly through the local Rex Server, using its macOS Full
 Disk Access grant. Enable access for Rex Server once in System Settings;
 beep-boop binaries do not need their own grant. No sessions or terminals are
