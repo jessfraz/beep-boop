@@ -52,6 +52,7 @@ test("native compaction reduces oversized inputs, arguments and results without 
       const source = text(context); requests.push(source);
       if (Buffer.byteLength(source) + (options?.maxTokens ?? 0) > WINDOW) return fauxAssistantMessage("", { stopReason: "error", errorMessage: "Your input exceeds the context window of this model." });
       assert.equal(context.messages.length, 2); assert.notEqual(options?.reasoning, "xhigh");
+      assert.equal(options?.toolChoice, "none", "Checkpoint requests cannot select provider-hosted tools either");
       assert.ok(context.messages.every((message) => message.role !== "system" || message.toolsAdded === undefined));
       assert.equal(source.includes("�"), false);
       return fauxAssistantMessage("Preserve FIRST_MARKER LAST_MARKER EFFECT_ONCE RESULT_MARKER; completed effect stays complete.");

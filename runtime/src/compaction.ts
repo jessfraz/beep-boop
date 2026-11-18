@@ -96,13 +96,13 @@ export function createCompaction(session: Promise<Harness>): Extension {
         const parts = chunks(source, limit), summaries: string[] = [];
         for (const part of parts) {
           context.abortSignal?.throwIfAborted();
-          const key = createHash("sha256").update(JSON.stringify([1, api.conversationId, model.provider, model.id, model.baseUrl, output, system, part])).digest("hex");
+          const key = createHash("sha256").update(JSON.stringify([2, api.conversationId, model.provider, model.id, model.baseUrl, output, system, part])).digest("hex");
           const saved = (await api.snapshot(Parts, key, context))?.text;
           if (saved !== undefined && saved !== null) { summaries.push(saved); continue; }
           const message = await api.models.completeSimple(model, { messages: [
             { role: "system", content: system, timestamp: 0 },
             { role: "user", content: part, timestamp: 0 },
-          ] }, { maxTokens: output, cacheRetention: "none", telemetry: context.telemetry,
+          ] }, { maxTokens: output, toolChoice: "none", cacheRetention: "none", telemetry: context.telemetry,
             ...(getSupportedThinkingLevels(model).includes("low") ? { reasoning: "low" } : {}),
             ...(provider === undefined ? {} : { sessionId: provider.sessionId }),
             ...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }) });
