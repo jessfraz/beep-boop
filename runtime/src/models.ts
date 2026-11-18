@@ -3,7 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
-import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Registry, type Tx } from "@earendil-works/pi-durable";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -13,6 +13,7 @@ import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
 import { withWebSearch } from "./web-search.js";
 import { QuotaRecovery } from "./quota.js";
+import { createCompaction, guardCompactionRequests } from "./compaction.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
@@ -81,7 +82,9 @@ export class ConversationModels {
   private readonly catalogRefreshes = new Map<ModelProvider, Promise<void>>();
   private bindSession: ((session: Harness) => void) | undefined;
   private readonly session = new Promise<Harness>((resolve) => { this.bindSession = resolve; });
-  constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth) {
+  private readonly compaction = createCompaction(this.session);
+  constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth, registry?: Registry) {
+    registry?.install(this.compaction);
     for (const id of ["openai", "openai-codex"]) {
       const provider = models.getProvider(id);
       if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple)) });
@@ -132,6 +135,7 @@ export class ConversationModels {
     });
     for (const provider of models.getProviders()) models.setProvider(quota.wrapProvider(provider));
     quota.wrapComplete();
+    if (registry !== undefined) guardCompactionRequests(models);
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
   validate(selection: ModelSelection): void {
@@ -181,6 +185,11 @@ export class ConversationModels {
     policies.sessions[native.sessionId] = { ...selection };
     await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },
       thinkingLevel: selection.reasoning });
+    // Keep explicit tool/extension selections while adding the internal policy.
+    const agent = await tx.doc(AgentDoc, conversation.id), extensions = agent.extensions;
+    if (Array.isArray(extensions)) {
+      if (!extensions.includes(this.compaction.name)) extensions.push(this.compaction.name);
+    } else agent.extensions = { ...extensions, add: [...new Set([...(extensions?.add ?? []), this.compaction.name])] };
   }
   private async currentIn(tx: Tx, conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
     const native = await tx.doc(AgentDoc, conversation.id);

@@ -114,6 +114,12 @@ On a Mac, use Fn+Up/Fn+Down. Up/Down recalls sent prompts when the editor is
 empty; slash commands offer completion. Use `beep-boop --no-tui chat` for plain
 output or `beep-boop --json chat` for protocol events.
 
+Oversized checkpoints are summarized in bounded fragments, including large
+individual inputs and tool results. Completed fragments and their usage are
+saved together, so interruption can resume without repeating those requests.
+Pi retains the original entries and owns final checkpoint placement. An
+incomplete summary keeps the source available for a later retry.
+
 Reopen the CLI after updating it to load presentation changes. Detaching an
 older client preserves server-owned work and saved history.
 

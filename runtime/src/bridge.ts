@@ -105,7 +105,8 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
   (id, call_id) => emit(id, { type: "host_cancel", call_id }));
-const inference = new ConversationModels(undefined, auth);
+const registry = createRegistry();
+const inference = new ConversationModels(undefined, auth, registry);
 const models = inference.models;
 let backgroundOwner: number | undefined;
 let backgroundSources = false;
@@ -139,7 +140,6 @@ async function openApplication(): Promise<Application> {
     const database = await openConversationDatabase(join(state, "session.sqlite"));
     return SqliteStorage.open(database);
   });
-  const registry = createRegistry();
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
   try {
