@@ -3,6 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
+import { copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
@@ -646,7 +647,11 @@ export class TaskStore {
           seen.add(value.id);
           const task = await this.recordsStore.valueIn(tx, value.id);
           if (task === undefined || !task.sources.some(saved => related(saved, source))) throw new TaskError("Source ownership index is missing its task link");
-          result.push(this.savedTask(task));
+          // Nested draft fields belong to this transaction. Copy the typed
+          // record while it is live before returning owned lookup results.
+          const snapshot: { task: TaskRecord } = { task: this.savedTask(task) };
+          Object.assign(snapshot, copyJson(snapshot));
+          result.push(snapshot.task);
           if (result.length === limit) return result;
         }
       }

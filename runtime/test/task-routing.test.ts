@@ -13,6 +13,7 @@ import { CoordinatorEnvironment } from "../src/environment.js";
 import { InferenceCapacity } from "../src/inference-capacity.js";
 import { ConversationModels } from "../src/models.js";
 import { PartitionedRecords } from "../src/partitioned-records.js";
+import { openJobActor, scheduledTaskId } from "../src/scheduled.js";
 import { TaskStore } from "../src/tasks.js";
 import type { SourceRef } from "../src/generated/SourceRef.js";
 import type { InferenceClass } from "../src/generated/InferenceClass.js";
@@ -21,6 +22,7 @@ import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import { fixtureModel } from "./model.js";
+import { exampleJob } from "./fixtures/background-runtime.js";
 
 const NOW = Date.UTC(2035, 0, 1);
 const source: SourceRef = { provider: "slack", account: "workspace-one", thread_id: "thread-one" };
@@ -220,6 +222,46 @@ test("cold source and due lookups hydrate bounded candidates beside unrelated re
     assert.equal((await app.tasks.findBySources([source], 1))[0]?.id, "task-0001");
     assert.equal((await app.tasks.findBySources([other], 1))[0]?.id, "task-0000");
     assert.equal(new Set((await app.tasks.findBySources([source, other], 8)).map(task => task.id)).size, 8);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("bounded source ownership results remain serializable and mutation-inert after their transaction and reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-owned-snapshot-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    const task = await app.tasks.create({ title: "Existing source owner", outcome: "Retain the owned task", model: fixtureModel, sources: [source] });
+    await app.tasks.enqueue(task.id, "The exact parent input", "parent-input");
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    await app.tasks.createAgent(task.id, { id: "child", title: "Owned child", outcome: "Keep the child assignment",
+      input: "The exact child input", inputId: "child-input" });
+    await app.tasks.update(task.id, current => { current.state = { state: "waiting", actor: "example-provider", next_check: null }; });
+    const durable = await app.tasks.get(task.id), results = await app.tasks.findBySources([source], 1);
+    assert.equal(results.length, 1); assert.deepEqual(JSON.parse(JSON.stringify(results)), [durable]);
+    const selected = results[0]; assert.ok(selected?.state.state === "waiting" && selected.worker.state === "bound");
+    selected.state.actor = "Caller mutation"; selected.sources[0]!.thread_id = "caller-thread";
+    selected.pending[0]!.content = "Caller parent mutation"; selected.agents[0]!.pending[0]!.content = "Caller child mutation";
+    selected.worker.host.cwd = "/caller-mutation";
+    assert.deepEqual(await app.tasks.get(task.id), durable);
+    assert.deepEqual(await app.tasks.findBySources([source], 1), [durable]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    assert.deepEqual(await app.tasks.findBySources([source], 1), [durable]);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("scheduled actor discovery and bounded due/source-link results retain committed ownership outside their transactions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-owned-snapshot-")), app = await open(join(directory, "session.sqlite"));
+  try {
+    const job = exampleJob(), source = { provider: "scheduled_jobs", account: "local", thread_id: job.id };
+    const task = await app.tasks.create({ id: scheduledTaskId("job:" + job.id), title: job.title, outcome: job.prompt, model: fixtureModel, sources: [source] });
+    await app.tasks.update(task.id, current => { current.state = { state: "waiting", actor: "example-provider", next_check: new Date(NOW).toISOString() }; });
+    assert.equal(await openJobActor(job, app.tasks), task.id);
+    const owned = await app.tasks.findBySources([source], 1); assert.equal(owned[0]?.sources[0]?.thread_id, job.id);
+    const due = await app.tasks.dueChecks(NOW, 1), links = await app.session.commit(tx => app.tasks.sourceLinksIn(tx, [source], 1), BACKGROUND_CONTEXT);
+    assert.deepEqual(JSON.parse(JSON.stringify(due)), [{ id: task.id, next_check: new Date(NOW).toISOString() }]);
+    assert.deepEqual(JSON.parse(JSON.stringify(links)), [{ task_id: task.id, source }]);
+    due[0]!.next_check = "Caller mutation"; links[0]!.source.thread_id = "caller-job";
+    assert.deepEqual(await app.tasks.dueChecks(NOW, 1), [{ id: task.id, next_check: new Date(NOW).toISOString() }]);
+    assert.deepEqual((await app.tasks.get(task.id)).sources, [source]); assert.equal(await openJobActor(job, app.tasks), task.id);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

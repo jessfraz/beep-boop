@@ -172,6 +172,35 @@ test("new undated provider evidence reaches the fresh reviewer without inventing
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("reviewing new evidence for an existing source owner prepares serializable context and completes its durable decision", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-existing-source-owner-")), path = join(directory, "session.sqlite");
+  let app = await open(path, { workers: 2 }); const controller = new AbortController();
+  try {
+    const original = event("new-owner-evidence", "existing-owned-thread");
+    const owner = await app.tasks.create({ title: "Existing source owner", outcome: "Continue the authorized work", model: fixtureModel, sources: [original.source] });
+    await app.tasks.update(owner.id, task => { task.summary = "Existing verified task progress"; });
+    await admit(app.sources, [original]);
+    const pending = (await app.sources.events({ pending: true }))[0]; assert.ok(pending);
+    app.faux.setResponses([
+      input => {
+        const prepared: unknown = JSON.parse(userText(input)); assert.ok(object(prepared) && Array.isArray(prepared.related_tasks));
+        assert.deepEqual(prepared.related_tasks, [{ id: owner.id, title: owner.title, state: { state: "open" },
+          sources: [original.source], summary: "Existing verified task progress" }]);
+        return answer(dismissed(groups(input), "The owning task already accounted for this exact evidence"));
+      },
+      input => { toolResult(input); return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.equal(app.faux.state.callCount, 2);
+    const metrics = (await app.reviews.diagnostics()).metrics;
+    assert.ok(metrics.input_bytes > 0); assert.equal(metrics.completed_reviews, 1); assert.equal(metrics.failed_reviews, 0);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 2 });
+    assert.deepEqual((await app.sources.originals([pending.key]))[0]?.decision,
+      { type: "dismissed", reason: "The owning task already accounted for this exact evidence" });
+    assert.deepEqual((await app.tasks.get(owner.id)).sources, [original.source]);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a manual judgment fences the stale entity claim before it can enqueue task work", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-stale-source-review-")), app = await open(join(directory, "session.sqlite"));
   const hold = gate(), started = gate(), controller = new AbortController(); let running: Promise<boolean> | undefined;
