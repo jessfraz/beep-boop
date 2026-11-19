@@ -6,7 +6,7 @@ import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { createRegistry, defineDoc, Harness, ProviderDoc, type Tx } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, defineDocFamily, Harness, ProviderDoc, type Tx } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
@@ -32,6 +32,8 @@ const RoutingMigration = defineDoc<{ migrated: number; complete: boolean }>({ ki
   scope: "session", version: 1, initial: () => ({ migrated: 0, complete: false }), checkpointWhen: () => true });
 const MembershipMigration = defineDoc<{ migrated: number; complete: boolean }>({ kind: "agent.task.members.migration",
   scope: "session", version: 1, initial: () => ({ migrated: 0, complete: false }), checkpointWhen: () => true });
+const ModelPolicy = defineDocFamily<{ policy: { work_class?: InferenceClass } | null }, null>({ kind: "agent.model_policy", scope: "session",
+  family: true, version: 1, initial: () => ({ policy: null }), checkpointWhen: () => true });
 
 async function pump(predicate: () => boolean | Promise<boolean>): Promise<void> {
   for (let attempt = 0; attempt < 1000; attempt += 1) {
@@ -50,6 +52,105 @@ async function open(path: string) {
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   return { storage, session, models, faux, inference, tasks: new TaskStore(session, inference) };
 }
+
+async function workClass(app: Awaited<ReturnType<typeof open>>, id: string): Promise<InferenceClass | undefined> {
+  const conversation = await app.tasks.conversation(id), native = await app.session.snapshot(ProviderDoc, conversation.id, BACKGROUND_CONTEXT);
+  assert.ok(native);
+  return (await app.session.snapshot(ModelPolicy, native.sessionId, BACKGROUND_CONTEXT))?.policy?.work_class;
+}
+
+test("trusted user task input retains foreground capacity across later source admissions and reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-user-capacity-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    const sender = await app.session.root(BACKGROUND_CONTEXT), classes: InferenceClass[] = ["backfill", "cron"];
+    const conversations: string[] = [];
+    for (const background of classes) {
+      const task = await app.tasks.create({ id: "user-" + background, title: "Existing background task", outcome: "Keep its original work", execution: "coordinator",
+        sources: background === "cron" ? [{ provider: "scheduled_jobs", account: "local", thread_id: "example-job" }] : [source] });
+      conversations.push(task.conversation_id);
+      const review = { task_id: task.id, input_id: "source-review:original-" + background, content: "Retained background evidence",
+        sender_conversation_id: sender.id.toString(), work_class: background };
+      await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, review), BACKGROUND_CONTEXT);
+      assert.equal(await workClass(app, task.conversation_id), background);
+      await app.tasks.enqueue(task.id, "Automatic context without direct-input provenance", "unknown-origin-" + background);
+      assert.equal(await workClass(app, task.conversation_id), background, "Omitted direct-input origin is not proof of user ownership");
+      await app.tasks.enqueue(task.id, "Explicit human steering", "user-steer-" + background, undefined, "steer", undefined, "ios");
+      assert.equal(await workClass(app, task.conversation_id), "foreground");
+      await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { ...review, input_id: "source-review:later-" + background }), BACKGROUND_CONTEXT);
+      assert.equal(await workClass(app, task.conversation_id), "foreground", "Background admission cannot reclaim a conversation taken over by the user");
+      await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, review), BACKGROUND_CONTEXT);
+      await assert.rejects(app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { ...review, work_class: "foreground" }), BACKGROUND_CONTEXT), /cannot be reused/u);
+    }
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    for (const id of conversations) assert.equal(await workClass(app, id), "foreground");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a later interactive worker run promotes the exact retained task before its real provider request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-interactive-capacity-")), app = await open(join(directory, "session.sqlite"));
+  try {
+    const task = await app.tasks.create({ title: "Existing source work", outcome: "Retain its input", model: fixtureModel });
+    const sender = await app.session.root(BACKGROUND_CONTEXT);
+    await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { task_id: task.id, input_id: "source-review:before-interaction",
+      content: "The exact pending source input", sender_conversation_id: sender.id.toString(), work_class: "backfill" }), BACKGROUND_CONTEXT);
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const saved = await app.tasks.get(task.id); assert.ok(saved.worker.state === "bound"); let observed: InferenceClass | undefined;
+    await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: "unconfirmed-allocation", binding,
+      instructions: "Unconfirmed interaction", model: fixtureModel, cwd: host.cwd, interactive: true }, () => () => {}), /binding is not confirmed/u);
+    assert.equal(await workClass(app, task.conversation_id), "backfill");
+    app.faux.setResponses([async () => { observed = await workClass(app, saved.conversation_id); return fauxAssistantMessage("The retained input completed"); }]);
+    await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding,
+      instructions: "An explicit interactive session", model: fixtureModel, cwd: host.cwd, interactive: true }, () => () => {});
+    assert.equal(observed, "foreground"); assert.equal(await workClass(app, task.conversation_id), "foreground");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("child agents inherit durable background policy and trusted child input can override it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-child-inference-class-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    const sender = await app.session.root(BACKGROUND_CONTEXT), classes: InferenceClass[] = ["backfill", "cron", "fresh"];
+    const children: string[] = [];
+    for (const background of classes) {
+      const task = await app.tasks.create({ id: "parent-" + background, title: "Parent background work", outcome: "Keep the same budget", execution: "coordinator", model: fixtureModel });
+      await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { task_id: task.id, input_id: "source-review:parent-" + background,
+        content: "Bounded source work", sender_conversation_id: sender.id.toString(), work_class: background }), BACKGROUND_CONTEXT);
+      const child = await app.tasks.createAgent(task.id, { id: "child", title: "Bounded child", outcome: "Review only its owned evidence",
+        input: "Inspect the retained source evidence", inputId: "child-original" }); children.push(child.conversation_id);
+      assert.equal(await workClass(app, child.conversation_id), background);
+      await app.inference.configure(await app.tasks.conversation(child.conversation_id), fixtureModel, {});
+      assert.equal(await workClass(app, child.conversation_id), background);
+      const inherited = background === "cron" ? "backfill" : "cron";
+      await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { task_id: task.id, input_id: "source-review:reclassified-" + background,
+        content: "Later bounded work", sender_conversation_id: sender.id.toString(), work_class: inherited }), BACKGROUND_CONTEXT);
+      await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Continue under the parent's current budget", "parent-reclassification", async () => ({ type: "written" })), /background execution is unavailable/u);
+      assert.equal(await workClass(app, child.conversation_id), inherited);
+      await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Trusted human correction", "human-child", async () => ({ type: "written" }),
+        "steer", undefined, undefined, "cli"), /background execution is unavailable/u);
+      assert.equal(await workClass(app, child.conversation_id), "foreground");
+      await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Later parent context", "parent-context", async () => ({ type: "written" })), /background execution is unavailable/u);
+      assert.equal(await workClass(app, child.conversation_id), "foreground");
+    }
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    for (const id of children) assert.equal(await workClass(app, id), "foreground");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an inherited default foreground class does not claim user ownership when the parent becomes background work", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-inherited-foreground-")), app = await open(join(directory, "session.sqlite"));
+  try {
+    const task = await app.tasks.create({ title: "Initially unclassified parent", outcome: "Follow its current work budget", execution: "coordinator", model: fixtureModel });
+    const child = await app.tasks.createAgent(task.id, { id: "existing-child", title: "Existing child", outcome: "Continue the parent's work",
+      input: "The original child assignment", inputId: "initial-child" });
+    await app.inference.configure(await app.tasks.conversation(child.conversation_id), fixtureModel, {});
+    const sender = await app.session.root(BACKGROUND_CONTEXT);
+    await app.session.commit(tx => app.tasks.enqueueReviewIn(tx, { task_id: task.id, input_id: "source-review:now-background",
+      content: "Later retained background evidence", sender_conversation_id: sender.id.toString(), work_class: "backfill" }), BACKGROUND_CONTEXT);
+    await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Continue under the actual parent budget", "inherited-background", async () => ({ type: "written" })), /background execution is unavailable/u);
+    assert.equal(await workClass(app, task.conversation_id), "backfill"); assert.equal(await workClass(app, child.conversation_id), "backfill");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("due task projection orders inclusive deadlines and atomically follows state and pending inputs across reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-task-due-")), path = join(directory, "session.sqlite");

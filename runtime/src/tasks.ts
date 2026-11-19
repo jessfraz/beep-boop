@@ -997,9 +997,8 @@ export class TaskStore {
     }
     if (previous === undefined) task.pending.push({ id: input.input_id, content: input.content, mode: "follow_up", sender });
     task.state = { state: "open" }; task.updated_at = Date.now();
-    const active = this.running.get(task.id);
     const workClass = task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local") ? "cron"
-      : active?.input.type === "run_task" && active.input.interactive === true ? "foreground" : input.work_class;
+      : input.work_class;
     await this.inference.assignClassIn(tx, { id: native }, workClass);
     await this.indexTaskIn(tx, task, task.sources);
     receipt.receipt = { hash, sender: input.sender_conversation_id, work_class: input.work_class };
@@ -1054,6 +1053,13 @@ export class TaskStore {
           ...(sender === undefined ? {} : { sender }) });
         actor.state = { state: "open" };
         task.state = { state: "open" };
+        if (origin !== undefined || agentId !== undefined) {
+          const native: unknown = Number(actor.conversation_id), parent: unknown = Number(task.conversation_id);
+          if (!conversationIdentity(native) || native.toString() !== actor.conversation_id ||
+              !conversationIdentity(parent) || parent.toString() !== task.conversation_id) throw new TaskError("Task conversation identity is invalid");
+          if (origin !== undefined) await this.inference.promoteForegroundIn(tx, { id: native });
+          else await this.inference.assignClassIn(tx, { id: native }, await this.inference.workClassIn(tx, { id: parent }));
+        }
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
       }, BACKGROUND_CONTEXT));
@@ -1111,6 +1117,7 @@ export class TaskStore {
       if (task.agents.some((agent) => agent.id === input.id)) return;
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+      await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent));
       const lineage = await tx.doc(NoticeLineage, parent.id);
       if (lineage.origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...lineage.origin };
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
@@ -1550,6 +1557,13 @@ export class TaskStore {
       attached = true;
       active.attached = input.type === "run_task";
       const conversation = await this.conversation(actor.conversation_id);
+      if (input.interactive === true || input.agent_id !== undefined) {
+        const parent = input.agent_id === undefined ? conversation : await this.conversation(task.conversation_id);
+        await this.session.commit(async tx => {
+          if (input.interactive === true) await this.inference.promoteForegroundIn(tx, conversation);
+          else await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent));
+        }, BACKGROUND_CONTEXT);
+      }
       if (input.type === "background") active.conversation = conversation;
       if (controller?.signal.aborted) { abort(); throw new TaskError("Background execution stopped; its native input is retained"); }
       let executionHost = input.type === "background" ? await this.backgroundHost(task, input.agent_id)

@@ -18,6 +18,7 @@ import { createGuidance } from "../src/guidance.js";
 import { SourceReviews, type SourceReviewOptions } from "../src/source-review.js";
 import { SourceJournal } from "../src/sources.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
+import { UserNoticeEntry } from "../src/transcript.js";
 import { Executions } from "../src/tools.js";
 import { fixtureModel } from "./model.js";
 import { FakeClock, pump } from "./fixtures/background-runtime.js";
@@ -355,5 +356,30 @@ test("reviewers load current live guidance and workflow policy and reject judgme
     unavailable = false; version = "THREE";
     app.faux.setResponses([input => { current(input, "THREE"); return answer(dismissed(groups(input))); }, fauxAssistantMessage("")]);
     assert.equal(await app.reviews.review(0, controller.signal), true); assert.deepEqual(await app.sources.events({ pending: true }), []);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a provider signal needing a user decision publishes once without manufacturing an investigation task", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-direct-notice-")), path = join(directory, "session.sqlite");
+  let app = await open(path, { workers: 1 });
+  const controller = new AbortController(), text = "The proposed review needs a decision.";
+  let proposals: SourceReviewDecision[] = [], conversation = "";
+  try {
+    await admit(app.sources, [event("needed-decision", "approval-thread", "Can the proposed review proceed?")]);
+    app.faux.setResponses([
+      input => { proposals = [{ type: "notify", groups: groups(input).map(group => group.id), keys: [], task_id: null, text }];
+        return answer(proposals, "notify-provider"); },
+      async input => { assert.deepEqual(JSON.parse(toolResult(input)), { accounted: 1, superseded: 0 });
+        conversation = (await app.reviews.diagnostics()).active_reviews[0]?.conversation_id ?? ""; return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.deepEqual(await app.reviews.apply(conversation, "notify-provider", proposals), { accounted: 1, superseded: 0 });
+    await pump(async () => !(await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(task =>
+      task.record.kind === "agent.source.effects"));
+    assert.deepEqual(await app.tasks.list(), []); assert.deepEqual(await app.sources.events({ pending: true }), []);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 1 });
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const notices = (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(UserNoticeEntry.is);
+    assert.equal(notices.length, 1); assert.equal(notices[0]?.data.text, text);
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

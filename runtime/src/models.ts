@@ -78,7 +78,7 @@ export function savedHost(host: WorkerHost): WorkerHost {
 // A native conversation may receive its work class before its first model is
 // configured. Model choice remains native; these fields bind application-only
 // fast-mode and resource-admission policy to that exact provider session.
-type ModelPolicy = Partial<ModelSelection> & { work_class?: InferenceClass };
+type ModelPolicy = Partial<ModelSelection> & { work_class?: InferenceClass; foreground_owned?: true };
 const Policies = defineDoc<{ sessions: Record<string, ModelPolicy> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
@@ -200,13 +200,27 @@ export class ConversationModels {
     const native = await tx.doc(ProviderDoc, conversation.id);
     const slot = await tx.doc(Policy, native.sessionId, null);
     slot.policy ??= { ...await this.policyIn(tx, native.sessionId) };
-    slot.policy.work_class = workClass;
+    if (slot.policy.foreground_owned !== true) slot.policy.work_class = workClass;
+  }
+  async promoteForegroundIn(tx: Tx, conversation: Pick<Conversation, "id">): Promise<void> {
+    const native = await tx.doc(ProviderDoc, conversation.id);
+    // Inherited/default foreground is still background-owned work. Only a
+    // trusted user input or validated interactive attachment claims ownership.
+    (await tx.doc(Policy, native.sessionId, null)).policy = {
+      ...await this.policyIn(tx, native.sessionId), work_class: "foreground", foreground_owned: true,
+    };
+  }
+  async workClassIn(tx: Tx, conversation: Pick<Conversation, "id">): Promise<InferenceClass> {
+    const native = await tx.doc(ProviderDoc, conversation.id);
+    return (await this.policyIn(tx, native.sessionId))?.work_class ?? "foreground";
   }
   async configureIn(tx: Tx, conversation: Pick<Conversation, "id">, selection: ModelSelection, change: AgentChange, workClass?: InferenceClass): Promise<void> {
     const native = await tx.doc(ProviderDoc, conversation.id);
-    const previous = (await this.policyIn(tx, native.sessionId))?.work_class;
-    const selectedClass = workClass ?? previous;
-    (await tx.doc(Policy, native.sessionId, null)).policy = { ...selection, ...(selectedClass === undefined ? {} : { work_class: selectedClass }) };
+    const previous = await this.policyIn(tx, native.sessionId);
+    const selectedClass = previous?.foreground_owned === true ? "foreground" : workClass ?? previous?.work_class;
+    const policy: ModelPolicy = { ...selection, ...(selectedClass === undefined ? {} : { work_class: selectedClass }) };
+    if (previous?.foreground_owned === true) policy.foreground_owned = true;
+    (await tx.doc(Policy, native.sessionId, null)).policy = policy;
     await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },
       thinkingLevel: selection.reasoning });
     // Keep explicit tool/extension selections while adding the internal policy.
