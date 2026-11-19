@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { AgentDoc, LiveDoc } from "@earendil-works/pi-durable";
-import { pump } from "./fixtures/background-runtime.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
 
 function gate() {
@@ -62,10 +61,11 @@ test("a resumed actor admits steering and follow-ups while joining its placed na
     assert.deepEqual(await receipt("continuation-input"), original);
     assert.deepEqual((await app.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run, previousRun);
     assert.deepEqual(await app.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT), configuration);
-    providerHeld.release();
-    const restored = app;
-    await pump(async () => !restored.tasks.isRunning(task.id) &&
-      (await receipt("resumed-steer"))?.status === "done" && (await receipt("resumed-follow-up"))?.status === "done");
+    const completed = app.tasks.runBackground(task.id);
+    providerHeld.release(); await completed;
+    assert.equal(app.tasks.isRunning(task.id), false);
+    assert.equal((await receipt("resumed-steer"))?.status, "done");
+    assert.equal((await receipt("resumed-follow-up"))?.status, "done");
     assert.equal((await receipt("continuation-input"))?.status, "done");
     assert.deepEqual((await app.tasks.get(task.id)).pending, []);
     assert.equal(app.commands.filter(command => command.type === "exec").length, 0, "Reattachment must not replay the retained host tool");
