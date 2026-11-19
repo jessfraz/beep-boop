@@ -1644,7 +1644,13 @@ export class TaskStore {
           continue;
         }
         if (next === undefined) {
-          await conversation.waitForIdle(BACKGROUND_CONTEXT);
+          // A reopened actor may already own placed native work after its app
+          // outbox was consumed. Keep control admission live while joining it.
+          active.nativeActive = true;
+          try {
+            await this.admitActiveInputs(active);
+            await conversation.waitForIdle(BACKGROUND_CONTEXT);
+          } finally { active.nativeActive = false; }
           if (active.revision !== revision) continue;
           task = await this.get(input.task_id);
           actor = this.actor(task, input.agent_id);
