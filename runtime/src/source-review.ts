@@ -382,11 +382,13 @@ export class SourceReviews {
           if (proposal.task_id === null && job === undefined && resource === undefined && refs.length > 1) throw new TaskError("Unrelated threads need separate task owners");
           const outcomeOwners = [...new Set(records.flatMap(record => record.outcome === undefined ? [] : [record.outcome.task_id]))];
           if (outcomeOwners.length > 1 && proposal.task_id === null && job === undefined) throw new TaskError("Different task outcomes need explicit ownership");
-          const logical = resource ?? (job === undefined ? outcomeOwners[0] === undefined
-            ? `source:${[...refs.map(sourceReference)].sort()[0]}` : `task:${outcomeOwners[0]}` : `job:${job.job.id}`);
+          // A configured workflow owns its actor even when another task also
+          // concerns this resource. Its authority cannot move to that task.
+          const logical = job !== undefined ? `job:${job.job.id}` : resource ?? (outcomeOwners[0] === undefined
+            ? `source:${[...refs.map(sourceReference)].sort()[0]}` : `task:${outcomeOwners[0]}`);
           const owner = await tx.doc(WorkOwners, digest(logical), null);
-          const resourceOwners = resource === undefined ? [] : await this.journal.index.resourceOwnersIn(tx, resource, 2);
-          const existing = resourceOwners.length > 0 ? resourceOwners
+          const resourceOwners = job !== undefined || resource === undefined ? [] : await this.journal.index.resourceOwnersIn(tx, resource, 2);
+          const existing = job !== undefined ? [] : resourceOwners.length > 0 ? resourceOwners
             : [...new Set((await this.tasks.sourceLinksIn(tx, refs, 2)).map(link => link.task_id))];
           // Source decisions and manual corrections are authoritative. A
           // routing receipt must not pin work to an owner since corrected.
@@ -400,7 +402,9 @@ export class SourceReviews {
             const existing = await this.tasks.sourceLinksIn(tx, [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }], 2);
             const ids = [...new Set(existing.map(link => link.task_id))];
             if (ids.length > 1 && job.task_id === undefined) throw new TaskError("Workflow ownership is ambiguous; inspect its current actor");
-            taskId ??= job.task_id ?? ids[0] ?? scheduledTaskId(`job:${job.job.id}`);
+            const current = job.task_id ?? ids[0];
+            if (current !== undefined) owner.task_id = current;
+            taskId = current ?? owner.task_id ?? scheduledTaskId(`job:${job.job.id}`);
           }
           taskId ??= scheduledTaskId(`source-work:${logical}`);
           if (owner.task_id !== null && owner.task_id !== taskId) throw new TaskError("This work already has another durable owner");

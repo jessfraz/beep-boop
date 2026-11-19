@@ -225,18 +225,20 @@ test("retained GitHub decisions and configured workflows keep cross-thread signa
       assert.equal((await reopened.tasks.list()).length, 2);
       assert.equal((await reopened.tasks.get("retained-github-owner")).pending.length, 1,
         "The rebuilt resource projection must retain the preexisting task owner");
-      await admit(reopened.sources, [event("workflow-a", "workflow-thread-a"), event("workflow-b", "workflow-thread-b")]);
+      await admit(reopened.sources, [event("workflow-a", "workflow-thread-a", resource), event("workflow-b", "workflow-thread-b", resource)]);
       reopened.faux.setResponses([
         () => fauxAssistantMessage([fauxToolCall("list_source_workflows", {}), fauxToolCall("read_source_workflow", { job_id: job.job.id })], { stopReason: "toolUse" }),
         input => { assert.match(toolResult(input, "list_source_workflows"), /workflow-owner/u);
           assert.match(toolResult(input, "read_source_workflow"), /AUTHORIZED_WORKFLOW/u);
-          return answer([routed(groups(input), { job_id: job.job.id })]); },
+          return answer([routed(groups(input), { job_id: job.job.id, work_url: resource })]); },
         input => { toolResult(input); return fauxAssistantMessage(""); },
       ]);
       assert.equal(await reopened.reviews.review(0, controller.signal), true);
       assert.equal((await reopened.tasks.list()).length, 2);
       const saved = await reopened.tasks.get(workflow.id); assert.equal(saved.pending.length, 1);
       assert.match(saved.pending[0]?.content ?? "", /AUTHORIZED_WORKFLOW/u); assert.equal(saved.sources.length, 3);
+      assert.equal((await reopened.tasks.get("retained-github-owner")).pending.length, 1,
+        "A shared resource cannot replace the explicitly selected configured workflow's actor");
       assert.deepEqual(await reopened.sources.events({ pending: true }), []);
     } finally { await reopened.session.close(BACKGROUND_CONTEXT); }
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
