@@ -25,7 +25,7 @@ import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
 import { createToolsets, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
-import { SourceCollectors } from "./source-collectors.js";
+import { SourceCollectors, discoverSourceCatalogs } from "./source-collectors.js";
 import { SourceReviews } from "./source-review.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
@@ -201,11 +201,15 @@ async function openApplication(): Promise<Application> {
   const collectors = new SourceCollectors(harness, registry, {
     ready: waitForBackground, enabled: () => backgroundSources,
     states: () => sources.states(),
-    async discover(signal) {
+    async discover(signal, publish) {
       const settings = (await environment.environment()).settings;
-      const result = await backgroundCall({ type: "background", request: { type: "discover_sources", sources: settings.sources, states: await sources.states() } }, signal);
-      if (result.type !== "background" || result.response.type !== "source_catalog") throw new TaskError("Source catalog discovery is unavailable");
-      return result.response;
+      const states = await sources.states(); signal.throwIfAborted();
+      // Each admitted RPC becomes an independent Tokio HostEffects task.
+      await discoverSourceCatalogs(settings.sources, signal, async (source, abort) => {
+        const result = await backgroundCall({ type: "background", request: { type: "discover_sources", sources: [source], states } }, abort);
+        if (result.type !== "background" || result.response.type !== "source_catalog") throw new TaskError("Source catalog discovery is unavailable");
+        return result.response;
+      }, publish);
     },
     async poll(source, state, signal) {
       const result = await backgroundCall({ type: "background", request: { type: "poll_source", source, state } }, signal);

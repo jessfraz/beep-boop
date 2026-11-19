@@ -322,6 +322,8 @@ rotation survive restarts. Retries retain captured versions and exact input.
 
 Each discovered account owns a native Pi collector task. One invocation polls
 one bounded page, then sleeps at its provider's pace or failure backoff.
+Configured providers discover accounts independently and start their readers
+as soon as each catalog arrives, while slower discoveries continue.
 Global and provider limits bound transport concurrency without serializing
 unrelated accounts. Cursor admission compares against the checkpoint used by
 that page. Discovery and polling preserve configured credential scopes.

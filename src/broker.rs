@@ -257,91 +257,106 @@ impl Broker {
     pub async fn execute_cancelled(
         &self,
         command: HostCommand,
-        cancelled: watch::Receiver<bool>,
+        mut cancelled: watch::Receiver<bool>,
     ) -> HostResult {
-        let result =
-            match command {
-                HostCommand::Background { request } => crate::background::execute(request)
-                    .await
-                    .map(|response| HostResult::Background { response }),
-                HostCommand::ReadUsage { expected_email } => {
-                    return HostResult::Usage {
-                        usage: crate::usage::account(&expected_email).await,
-                    };
+        let result = match command {
+            HostCommand::Background { request } => {
+                // Background requests are read-only. Drop the read on
+                // cancellation so its owned process-group guards stop
+                // source helpers and descendants instead of detaching them.
+                tokio::select! {
+                    biased;
+                    () = async {
+                        loop {
+                            if *cancelled.borrow_and_update() { return; }
+                            if cancelled.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    } => Err(anyhow::anyhow!("Background read was cancelled")),
+                    response = crate::background::execute(request) => response.map(|response| HostResult::Background { response }),
                 }
-                HostCommand::ReloadGuidance => {
-                    let refreshed = ContextStore::load(
-                        &self
-                            .contexts
-                            .repositories()
-                            .iter()
-                            .map(|item| item.root.clone().into())
-                            .collect::<Vec<_>>(),
-                    );
-                    match refreshed {
-                        Ok(contexts) => crate::instructions::global_snapshot(&self.instructions)
-                            .map(|global| HostResult::SharedGuidance {
+            }
+            HostCommand::ReadUsage { expected_email } => {
+                return HostResult::Usage {
+                    usage: crate::usage::account(&expected_email).await,
+                };
+            }
+            HostCommand::ReloadGuidance => {
+                let refreshed = ContextStore::load(
+                    &self
+                        .contexts
+                        .repositories()
+                        .iter()
+                        .map(|item| item.root.clone().into())
+                        .collect::<Vec<_>>(),
+                );
+                match refreshed {
+                    Ok(contexts) => {
+                        crate::instructions::global_snapshot(&self.instructions).map(|global| {
+                            HostResult::SharedGuidance {
                                 global,
                                 workflow_policy: crate::instructions::WORKFLOW_POLICY.into(),
                                 context_repositories: contexts.repositories().to_vec(),
                                 context_sources: contexts.instruction_sources().to_vec(),
-                            }),
-                        Err(error) => Err(error),
+                            }
+                        })
                     }
+                    Err(error) => Err(error),
                 }
-                HostCommand::ReadContext {
-                    repository_id,
-                    path,
-                    offset,
-                    limit,
-                } => {
-                    self.contexts
-                        .read(&repository_id, &path, offset, limit)
-                        .await
+            }
+            HostCommand::ReadContext {
+                repository_id,
+                path,
+                offset,
+                limit,
+            } => {
+                self.contexts
+                    .read(&repository_id, &path, offset, limit)
+                    .await
+            }
+            HostCommand::SearchContext {
+                repository_id,
+                path,
+                query,
+                limit,
+            } => {
+                self.contexts
+                    .search(&repository_id, path.as_deref(), &query, limit)
+                    .await
+            }
+            HostCommand::OnNode { host_id, command } => {
+                if matches!(
+                    *command,
+                    HostCommand::OnNode { .. }
+                        | HostCommand::Background { .. }
+                        | HostCommand::ReloadGuidance
+                        | HostCommand::ReadContext { .. }
+                        | HostCommand::SearchContext { .. }
+                        | HostCommand::ReadUsage { .. }
+                ) {
+                    return HostResult::Failed {
+                        delivery: Some(HostDelivery::NotStarted),
+                        message: "Nested node routing and remote context access are unsupported"
+                            .into(),
+                    };
                 }
-                HostCommand::SearchContext {
-                    repository_id,
-                    path,
-                    query,
-                    limit,
-                } => {
-                    self.contexts
-                        .search(&repository_id, path.as_deref(), &query, limit)
-                        .await
+                if target(&command).is_some_and(|target| target != host_id) {
+                    return HostResult::Failed {
+                        delivery: Some(HostDelivery::NotStarted),
+                        message: "The explicit node differs from the resource's native owner"
+                            .into(),
+                    };
                 }
-                HostCommand::OnNode { host_id, command } => {
-                    if matches!(
-                        *command,
-                        HostCommand::OnNode { .. }
-                            | HostCommand::Background { .. }
-                            | HostCommand::ReloadGuidance
-                            | HostCommand::ReadContext { .. }
-                            | HostCommand::SearchContext { .. }
-                            | HostCommand::ReadUsage { .. }
-                    ) {
-                        return HostResult::Failed {
-                            delivery: Some(HostDelivery::NotStarted),
-                            message:
-                                "Nested node routing and remote context access are unsupported"
-                                    .into(),
-                        };
-                    }
-                    if target(&command).is_some_and(|target| target != host_id) {
-                        return HostResult::Failed {
-                            delivery: Some(HostDelivery::NotStarted),
-                            message: "The explicit node differs from the resource's native owner"
-                                .into(),
-                        };
-                    }
-                    return self.node(&host_id, *command, cancelled).await;
+                return self.node(&host_id, *command, cancelled).await;
+            }
+            command => {
+                if let Some(id) = target(&command).map(str::to_owned) {
+                    return self.node(&id, command, cancelled).await;
                 }
-                command => {
-                    if let Some(id) = target(&command).map(str::to_owned) {
-                        return self.node(&id, command, cancelled).await;
-                    }
-                    return self.executor.execute_cancelled(command, cancelled).await;
-                }
-            };
+                return self.executor.execute_cancelled(command, cancelled).await;
+            }
+        };
         result.unwrap_or_else(|error| HostResult::Failed {
             delivery: None,
             message: error.to_string(),
@@ -510,6 +525,7 @@ fn unavailable() -> HostResult {
 #[cfg(test)]
 mod tests {
     mod delivery;
+    mod source_cancellation;
     use crate::{
         broker::Broker,
         models::ModelSelection,

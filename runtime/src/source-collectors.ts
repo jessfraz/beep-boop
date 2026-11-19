@@ -21,10 +21,11 @@ const Slots = defineDocFamily<Slot, null>({ kind: "agent.source.collector", scop
     pages: 0, events: 0, admitted_events: 0, wait_ms: null, poll_ms: null, admit_ms: null,
     started_at: null, finished_at: null, duration_ms: null, next_at: null, error: null }), checkpointWhen: () => true });
 
+export type SourceCollectorCatalog = { sources: SourceConfig[]; reads: SourceRead[] };
 export type SourceCollectorCallbacks = {
   ready?(signal: AbortSignal): Promise<void>;
   enabled?(): boolean;
-  discover(signal: AbortSignal): Promise<{ sources: SourceConfig[]; reads: SourceRead[] }>;
+  discover(signal: AbortSignal, publish: (catalog: SourceCollectorCatalog) => Promise<void>): Promise<SourceCollectorCatalog | void>;
   states(): Promise<SourceState[]>;
   poll(source: SourceConfig, state: SourceState | null, signal: AbortSignal): Promise<SourceRead>;
   admit(read: SourceRead): Promise<{ checkpoint_advanced: boolean; new_events?: number; state?: SourceState }>;
@@ -92,6 +93,24 @@ class Capacity {
   }
 }
 
+/** Discovery uses the shared host transport, whose pending receipts are bounded.
+ * Leave room for active page readers and other background work while independent
+ * configurations wait for admission, without a provider blocking other queues. */
+export async function discoverSourceCatalogs(sources: readonly SourceConfig[], signal: AbortSignal,
+  discover: (source: SourceConfig, signal: AbortSignal) => Promise<SourceCollectorCatalog>,
+  publish: (catalog: SourceCollectorCatalog) => Promise<void>): Promise<void> {
+  const capacity = new Capacity(8, 2);
+  const discoveries = await Promise.allSettled(sources.map(async source => {
+    const release = await capacity.acquire(source.provider, signal);
+    try {
+      const catalog = await discover(source, signal); signal.throwIfAborted();
+      await publish(catalog);
+    } finally { release(); }
+  }));
+  signal.throwIfAborted();
+  for (const result of discoveries) if (result.status === "rejected") throw result.reason;
+}
+
 /** A native task per discovered account owns one bounded page per phase. Source
  * originals and cursor admission remain the SourceJournal's atomic commit. */
 export class SourceCollectors {
@@ -101,6 +120,7 @@ export class SourceCollectors {
   private readonly spacing: number;
   private readonly intervals: Readonly<Record<string, number>>;
   private syncing: Promise<void> | undefined;
+  private discovery: AbortController | undefined;
   constructor(private readonly session: Harness, registry: Registry, private readonly callbacks: SourceCollectorCallbacks,
     options: SourceCollectorOptions = {}) {
     this.capacity = new Capacity(valid(options.concurrency ?? 4, "Collector concurrency"),
@@ -204,58 +224,98 @@ export class SourceCollectors {
       .finally(() => { this.syncing = undefined; });
   }
   private async reconcile(intervalMs: number, signal: AbortSignal): Promise<void> {
-    signal.throwIfAborted();
-    await this.session.root(BACKGROUND_CONTEXT);
-    const catalog = await this.callbacks.discover(signal); signal.throwIfAborted();
-    if (this.callbacks.enabled?.() === false) { await this.stop(); return; }
+    const discovery = new AbortController(); this.discovery = discovery;
+    const active = AbortSignal.any([signal, discovery.signal]);
     const sources = new Map<string, { source: SourceConfig; key: SourceKey }>();
-    for (const source of catalog.sources) {
-      const key = collectorSourceKey(source), id = identity(key);
-      if (sources.has(id)) throw new Error("Duplicate discovered source account");
-      sources.set(id, { source, key });
+    const reads: SourceRead[] = [], publications: Promise<void>[] = [];
+    let accepting = true;
+    const publish = (catalog: SourceCollectorCatalog): Promise<void> => {
+      const publication = (async () => {
+        active.throwIfAborted();
+        if (!accepting) throw new Error("Source catalog discovery has already finished");
+        if (this.callbacks.enabled?.() === false) { await this.stop(); active.throwIfAborted(); }
+        const discovered: { source: SourceConfig; key: SourceKey }[] = [];
+        for (const source of catalog.sources) {
+          const key = collectorSourceKey(source), id = identity(key);
+          if (sources.has(id)) throw new Error("Duplicate discovered source account");
+          sources.set(id, { source, key }); discovered.push({ source, key });
+        }
+        reads.push(...catalog.reads);
+        for (const read of catalog.reads) { active.throwIfAborted(); await this.callbacks.admit(read); }
+        active.throwIfAborted();
+        await this.activate(discovered, intervalMs, active);
+      })();
+      publications.push(publication); return publication;
+    };
+    try {
+      active.throwIfAborted();
+      await this.session.root(BACKGROUND_CONTEXT); active.throwIfAborted();
+      let failure: { error: unknown } | undefined;
+      try {
+        const catalog = await this.callbacks.discover(active, publish);
+        if (catalog !== undefined) await publish(catalog);
+      } catch (error) { failure = { error }; }
+      accepting = false;
+      // Discovery owns every operation it starts. Drain partial publications
+      // even after failure/abort before allowing a later refresh to replace it.
+      const completed = await Promise.allSettled(publications);
+      active.throwIfAborted();
+      if (failure !== undefined) throw failure.error;
+      for (const result of completed) if (result.status === "rejected") throw result.reason;
+      if (this.callbacks.enabled?.() === false) { await this.stop(); return; }
+      const reconciled = await this.session.commit(async tx => {
+        active.throwIfAborted();
+        const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [], retained: TaskId<null>[] = [];
+        for (const id of [...saved.members]) {
+          if (sources.has(id)) continue;
+          const slot = await tx.doc(Slots, id, null);
+          // Unknown account coverage retains its previously authorized reader.
+          if (reads.some(read => read.batch.source.provider === slot.source.provider &&
+            (read.batch.source.account === "discovery" || read.batch.source.account === slot.source.account))) {
+            if (slot.enabled && slot.task !== null) retained.push(slot.task);
+            continue;
+          }
+          slot.enabled = false; slot.generation += 1;
+          if (slot.task !== null) cancelled.push(slot.task);
+          slot.task = null; slot.next_at = null;
+          saved.members.splice(saved.members.indexOf(id), 1);
+        }
+        active.throwIfAborted(); return { cancelled, retained };
+      }, BACKGROUND_CONTEXT);
+      for (const task of reconciled.cancelled) await this.session.abortTask(task, BACKGROUND_CONTEXT);
+      for (const task of reconciled.retained) await this.session.retryTask(task, BACKGROUND_CONTEXT);
+      this.session.resume();
+    } finally {
+      accepting = false;
+      if (this.discovery === discovery) this.discovery = undefined;
     }
-    for (const read of catalog.reads) { signal.throwIfAborted(); await this.callbacks.admit(read); }
-    const cancelled = await this.session.commit(async tx => {
-      const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [];
-      const members = [...saved.members];
-      for (const id of members) {
-        if (sources.has(id)) continue;
-        const slot = await tx.doc(Slots, id, null);
-        // A temporary catalog failure must not revoke a previously discovered
-        // account. Its independently scoped reader can keep making progress.
-        if (catalog.reads.some(read => read.batch.source.provider === slot.source.provider &&
-          (read.batch.source.account === "discovery" || read.batch.source.account === slot.source.account))) continue;
-        slot.enabled = false; slot.generation += 1;
-        if (slot.task !== null) cancelled.push(slot.task);
-        slot.task = null; slot.next_at = null;
-        saved.members.splice(saved.members.indexOf(id), 1);
-      }
-      for (const [id, { source, key }] of sources) {
+  }
+  private async activate(sources: readonly { source: SourceConfig; key: SourceKey }[], intervalMs: number, signal: AbortSignal): Promise<void> {
+    const activated = await this.session.commit(async tx => {
+      signal.throwIfAborted();
+      const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [], owned: TaskId<null>[] = [];
+      for (const { source, key } of sources) {
+        const id = identity(key);
         const slot = await tx.doc(Slots, id, null);
         const revision = createHash("sha256").update(JSON.stringify({ source, intervalMs })).digest("hex");
-        if (slot.enabled && slot.task !== null && slot.revision === revision) continue;
+        if (slot.enabled && slot.task !== null && slot.revision === revision) { owned.push(slot.task); continue; }
         if (slot.task !== null) cancelled.push(slot.task);
         slot.source = key; slot.revision = revision; slot.enabled = true; slot.generation += 1; slot.error = null;
         const task = await tx.createTask(this.task, { source, key, generation: slot.generation, interval_ms: intervalMs },
           { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
-        slot.task = task; slot.next_at = null;
+        slot.task = task; slot.next_at = null; owned.push(task);
         if (!saved.members.includes(id)) saved.members.push(id);
       }
-      return cancelled;
+      signal.throwIfAborted(); return { cancelled, owned };
     }, BACKGROUND_CONTEXT);
-    for (const task of cancelled) await this.session.abortTask(task, BACKGROUND_CONTEXT);
-    const members = (await this.session.snapshot(Catalog, BACKGROUND_CONTEXT))?.members ?? [];
-    const owned = new Set<TaskId>();
-    for (const id of members) {
-      const slot = await this.session.snapshot(Slots, id, BACKGROUND_CONTEXT);
-      if (slot?.enabled && slot.task !== null && slot.task !== undefined) owned.add(slot.task);
-    }
+    for (const task of activated.cancelled) await this.session.abortTask(task, BACKGROUND_CONTEXT);
     // Pi checks its restart fence for the exact owned task; no global native
     // task inventory is needed to recover a collector.
-    for (const task of owned) await this.session.retryTask(task, BACKGROUND_CONTEXT);
+    for (const task of activated.owned) await this.session.retryTask(task, BACKGROUND_CONTEXT);
     this.session.resume();
   }
   async stop(): Promise<void> {
+    this.discovery?.abort(new Error("Source collection stopped during discovery"));
     const cancelled = await this.session.commit(async tx => {
       const catalog = await tx.doc(Catalog), cancelled: TaskId<null>[] = [];
       for (const id of catalog.members) {
