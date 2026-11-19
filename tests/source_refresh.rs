@@ -278,3 +278,159 @@ async fn local_helper_can_run_while_its_script_is_open_for_writing() {
     assert_eq!(batch.events.len(), 1);
     assert_eq!(batch.events[0].text.len(), 32);
 }
+
+#[tokio::test]
+async fn independently_discovered_accounts_read_one_durable_page_at_a_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let command = helper(directory.path(), &[1_500_000; 3]);
+    let config: Vec<_> = ["workspace-first", "workspace-second"]
+        .into_iter()
+        .map(|account| SourceConfig::Slack {
+            enabled: true,
+            command: command.clone(),
+            account: account.into(),
+        })
+        .collect();
+    let catalog = background::execute(BackgroundRequest::DiscoverSources {
+        sources: config,
+        states: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let BackgroundResponse::SourceCatalog { sources, reads } = catalog else {
+        panic!("Expected an account catalog");
+    };
+    assert_eq!(sources.len(), 2);
+    assert!(reads.is_empty());
+    let source = sources[0].clone();
+    let mut state: Option<SourceState> = None;
+    let mut bytes = 0;
+    let mut pages = 0;
+    loop {
+        let response = background::execute(BackgroundRequest::PollSource {
+            source: source.clone(),
+            state: state.clone(),
+        })
+        .await
+        .unwrap();
+        let wire = serde_json::to_vec(&HostResult::Background { response }).unwrap();
+        assert!(wire.len() <= MAX_FRAME_BYTES);
+        bytes += wire.len();
+        let HostResult::Background {
+            response: BackgroundResponse::SourcePage { read },
+        } = serde_json::from_slice(&wire).unwrap()
+        else {
+            panic!("Expected one bounded account page");
+        };
+        assert_eq!(read.batch.source.account, "workspace-first");
+        assert_eq!(
+            read.expected_checkpoint,
+            state.as_ref().and_then(|state| state.checkpoint.clone())
+        );
+        assert_eq!(read.batch.events.len(), 1);
+        assert_eq!(read.batch.events[0].text.len(), 1_500_000);
+        let complete = read.batch.coverage == SourceCoverage::Complete;
+        state = Some(SourceState {
+            source: read.batch.source,
+            checkpoint: read.batch.checkpoint,
+            coverage: read.batch.coverage,
+            checked_at: 0,
+            last_completed_at: None,
+            progress: read.batch.progress,
+        });
+        pages += 1;
+        if complete {
+            break;
+        }
+        assert!(
+            pages <= 6,
+            "An account must finish its bounded provider continuation"
+        );
+    }
+    assert_eq!(pages, 6);
+    assert!(bytes > MAX_FRAME_BYTES);
+}
+
+#[tokio::test]
+async fn single_account_page_rejects_another_accounts_checkpoint_before_running_a_helper() {
+    let key = agent_cli::sources::SourceKey {
+        provider: "slack".into(),
+        account: "workspace-other".into(),
+    };
+    let result = background::execute(BackgroundRequest::PollSource {
+        source: SourceConfig::Slack {
+            enabled: true,
+            command: vec!["missing-example-source-helper".into()],
+            account: "workspace-owned".into(),
+        },
+        state: Some(SourceState {
+            source: key,
+            checkpoint: Some(agent_cli::sources::SourceCheckpoint {
+                value: "owned-by-another-account".into(),
+            }),
+            coverage: SourceCoverage::Complete,
+            checked_at: 0,
+            last_completed_at: None,
+            progress: None,
+        }),
+    })
+    .await;
+    assert!(result.unwrap_err().to_string().contains("another account"));
+    for namespaces in [
+        None,
+        Some(vec!["github.first".into(), "github.second".into()]),
+    ] {
+        let result = background::execute(BackgroundRequest::PollSource {
+            source: SourceConfig::GitHub {
+                enabled: true,
+                namespaces,
+            },
+            state: None,
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "A page must not trigger broad account discovery"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_failure_reports_unknown_coverage_with_the_previous_account_checkpoint() {
+    let checkpoint = agent_cli::sources::SourceCheckpoint {
+        value: "retained-provider-cursor".into(),
+    };
+    let state = SourceState {
+        source: agent_cli::sources::SourceKey {
+            provider: "slack".into(),
+            account: "workspace-invalid".into(),
+        },
+        checkpoint: Some(checkpoint.clone()),
+        coverage: SourceCoverage::Complete,
+        checked_at: 0,
+        last_completed_at: None,
+        progress: None,
+    };
+    let response = background::execute(BackgroundRequest::DiscoverSources {
+        sources: vec![SourceConfig::Slack {
+            enabled: true,
+            command: Vec::new(),
+            account: "workspace-invalid".into(),
+        }],
+        states: vec![state],
+    })
+    .await
+    .unwrap();
+    let BackgroundResponse::SourceCatalog { sources, reads } = response else {
+        panic!("Expected an account catalog");
+    };
+    assert!(sources.is_empty());
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].expected_checkpoint, Some(checkpoint));
+    assert!(matches!(
+        reads[0].batch.coverage,
+        SourceCoverage::Unavailable { .. }
+    ));
+    assert!(reads[0].batch.events.is_empty());
+    assert!(reads[0].batch.checkpoint.is_none());
+}

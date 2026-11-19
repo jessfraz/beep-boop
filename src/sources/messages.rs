@@ -13,8 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds, read_command,
+        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
+        SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds,
+        read_command,
     },
 };
 
@@ -616,6 +617,12 @@ impl MessagesSource {
 
 #[async_trait::async_trait]
 impl Source for MessagesSource {
+    fn configuration(&self) -> SourceConfig {
+        SourceConfig::Messages {
+            enabled: true,
+            namespaces: Some(self.namespace.iter().cloned().collect()),
+        }
+    }
     fn key(&self) -> SourceKey {
         SourceKey {
             provider: "messages".into(),

@@ -608,6 +608,58 @@
             "sources",
             "states"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceConfig"
+              }
+            },
+            "states": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceState"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "discover_sources"
+            }
+          },
+          "required": [
+            "type",
+            "sources",
+            "states"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "$ref": "#/$defs/SourceConfig"
+            },
+            "state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "poll_source"
+            }
+          },
+          "required": [
+            "type",
+            "source"
+          ]
         }
       ]
     },
@@ -2693,6 +2745,15 @@
         "gaps"
       ]
     },
+    "InferenceClass": {
+      "type": "string",
+      "enum": [
+        "foreground",
+        "fresh",
+        "cron",
+        "backfill"
+      ]
+    },
     "InputBlockReason": {
       "type": "string",
       "enum": [
@@ -4431,6 +4492,22 @@
         {
           "type": "object",
           "properties": {
+            "diagnostics": {
+              "$ref": "#/$defs/SourcePipelineDiagnostics"
+            },
+            "type": {
+              "type": "string",
+              "const": "source_diagnostics"
+            }
+          },
+          "required": [
+            "type",
+            "diagnostics"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "checkpoint_advanced": {
               "type": "boolean"
             },
@@ -5174,6 +5251,96 @@
         "value"
       ]
     },
+    "SourceCollectorDiagnostics": {
+      "type": "object",
+      "properties": {
+        "admit_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "admitted_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "finished_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pages": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "poll_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "source",
+        "enabled",
+        "pages",
+        "events",
+        "admitted_events"
+      ]
+    },
     "SourceConfig": {
       "oneOf": [
         {
@@ -5388,6 +5555,125 @@
         "account"
       ]
     },
+    "SourcePipelineDiagnostics": {
+      "type": "object",
+      "properties": {
+        "active_reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceReviewDiagnostics"
+          }
+        },
+        "collectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceCollectorDiagnostics"
+          }
+        },
+        "dirty_entities": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics": {
+          "$ref": "#/$defs/SourcePipelineMetrics"
+        },
+        "migrated_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "migration_ready": {
+          "type": "boolean"
+        },
+        "pending_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retained_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "streams": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceStreamDiagnostics"
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "migration_ready",
+        "migrated_events",
+        "retained_events",
+        "pending_events",
+        "dirty_entities",
+        "streams",
+        "collectors",
+        "active_reviews",
+        "metrics"
+      ]
+    },
+    "SourcePipelineMetrics": {
+      "type": "object",
+      "properties": {
+        "admitted_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "claim_milliseconds": {
+          "type": "number",
+          "format": "double"
+        },
+        "claimed_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "completed_reviews": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "decided_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failed_reviews": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "input_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "review_milliseconds": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "admitted_events",
+        "decided_events",
+        "claimed_events",
+        "completed_reviews",
+        "failed_reviews",
+        "input_bytes",
+        "claim_milliseconds",
+        "review_milliseconds"
+      ]
+    },
     "SourcePollCursor": {
       "type": "object",
       "properties": {
@@ -5422,6 +5708,53 @@
         "provider",
         "account",
         "thread_id"
+      ]
+    },
+    "SourceReviewDiagnostics": {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "class": {
+          "$ref": "#/$defs/InferenceClass"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "entities": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "events": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "started_at": {
+          "$ref": "#/$defs/UtcMillis"
+        }
+      },
+      "required": [
+        "id",
+        "conversation_id",
+        "class",
+        "events",
+        "entities",
+        "input_bytes",
+        "attempt",
+        "started_at"
       ]
     },
     "SourceScanPhase": {
@@ -5533,6 +5866,45 @@
         "checked_at"
       ]
     },
+    "SourceStreamDiagnostics": {
+      "type": "object",
+      "properties": {
+        "dirty_entities": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "oldest_pending_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retained": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "$ref": "#/$defs/SourceKey"
+        }
+      },
+      "required": [
+        "source",
+        "retained",
+        "pending",
+        "dirty_entities"
+      ]
+    },
     "TaskAgentRecord": {
       "type": "object",
       "properties": {
@@ -5634,6 +6006,12 @@
             "reason"
           ]
         }
+      ]
+    },
+    "TaskExecution": {
+      "type": "string",
+      "enum": [
+        "coordinator"
       ]
     },
     "TaskId": {
@@ -5761,6 +6139,16 @@
         },
         "conversation_id": {
           "type": "string"
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskExecution"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "id": {
           "$ref": "#/$defs/TaskId"

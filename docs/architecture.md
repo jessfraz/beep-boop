@@ -281,15 +281,15 @@ online host. Failed inspection and offline machines never prove closure.
 ## Sources and follow-through
 
 ```text
-  provider read -> atomic event admission + cursor compare-and-swap
-                                      |
-                               pending source event
-                                      |
-                      find/read task conversations
-                                      |
-                    link and continue / dismiss with reason
-                                      |
-                          verified result or next check
+  per-account page collectors -> originals + cursor compare-and-swap
+                                        |
+                           indexed dirty source entities
+                                        |
+                     concurrent routing-only reviewers
+                                        |
+                  atomic decision + task input / notice outbox
+                                        |
+                       independent execution and delivery
 ```
 
 Background sources implement a transport-neutral Rust trait in
@@ -312,19 +312,52 @@ interrupted, not replayed. Existing submissions and source decisions remain
 authoritative.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
-work. New batches rotate across provider/account streams and alternate oldest
-and newest pending events within each account. Provider message times keep
-current mail ahead of historical pages admitted later; undated records retain
-their admission order. A large backlog cannot hide new arrivals, and new
-arrivals cannot starve old work. Account rotation and each
-account's selection direction persist across restarts, including accounts that
-receive only one slot per batch. Retries keep their exact claimed batch and
-admitted input.
+work. New batches rotate across provider/account streams. An entity is one
+source thread, or one task-outcome conversation. Its pending originals have
+independent oldest and newest queue positions, so busy threads stay eligible
+for backfill. Fresh reviews alternate selection direction within each thread.
+Provider message times keep current mail ahead of historical pages admitted
+later; undated records retain admission order. Selection direction and account
+rotation survive restarts. Retries retain captured versions and exact input.
 
-Polling and judgment have separate serialized lanes in the same Pi scheduler.
-A long model turn cannot delay the next provider poll. Poll completion requests
-judgment; its own durable timer also handles due follow-ups and retries. The
-source journal retains one claimed batch across restart and retry.
+Each discovered account owns a native Pi collector task. One invocation polls
+one bounded page, then sleeps at its provider's pace or failure backoff.
+Global and provider limits bound transport concurrency without serializing
+unrelated accounts. Cursor admission compares against the checkpoint used by
+that page. Discovery and polling preserve configured credential scopes.
+
+Four native reviewer actors operate on disjoint leased entities. One actor is
+reserved for fresh evidence and one for backfill; the other two share work.
+Claims are bounded by originals, entities and input bytes independently of
+retained history. Current workspace guidance refreshes for every model request.
+Reviewers read evidence, task status and configured workflows, then commit
+structured routing decisions. They have no provider execution tools. They keep
+the configured model; there is no automatic cheaper-model dismissal path.
+
+One Pi transaction validates captured decision revisions, records exact version
+decisions, admits deduplicated task inputs and creates durable effect tasks.
+Manual corrections fence stale reviews. Arrivals during a claim stay pending.
+Recognized resource identities and current source ownership reuse task actors
+across threads without merging unrelated work by a shared hostname. Existing
+Rex execution ownership stays intact. Execution and notification delivery retry
+independently after entity leases are released. Due follow-ups admit their input
+and retryable wake together. Admitted legacy global reviews finish under their
+original tools before new actors run.
+
+Ordered projections use bounded native Pi document pages for original identity,
+filters, pending order, entity ownership and task deadlines. Migration replays
+retained records in resumable batches and keeps old documents intact. Ordinary
+reads and claims do not hydrate unrelated originals or copy the pending corpus.
+Idle native documents expire after one second, while attached state stays owned;
+high-rate admission does not retain ten minutes of unrelated original payloads.
+`sources --diagnostics` exposes indexed backlog counts, reviewer claims,
+collector timing and cumulative admission/decision measurements.
+
+Per-account inference admission reserves request and token working-set capacity
+for foreground input, cron, fresh evidence and backfill. Weighted fair admission
+allows history to progress while preserving interactive room. These are local
+resource limits; provider quota recovery remains separate, and no monetary or
+provider token limit is guessed.
 
 An immutable-version conflict marks only that source batch unavailable. It
 retains originals, decisions and the checkpoint while other sources continue.

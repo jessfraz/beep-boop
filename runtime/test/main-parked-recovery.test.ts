@@ -13,7 +13,9 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import { ChatGptAuth } from "../src/auth.js";
 import * as mainObservation from "../src/main_observation.js";
-import { DEFAULT_MODEL } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
+import { SourceJournal } from "../src/sources.js";
+import { TaskStore } from "../src/tasks.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -161,14 +163,18 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
       events: [{ id: "retained-event", version: "original", source: { provider: "mail", account: "fixture", thread_id: "original" },
         title: "Original source evidence", text: "Continue the existing hardware question." }],
     } }); await peer.done(1);
-    peer.send(2, { type: "triage_sources", instructions: "", model: { ...DEFAULT_MODEL, model_id: "missing-fixture-model" }, cwd: "/tmp", hosts: [] });
-    await peer.done(2);
-    assert.ok(peer.events(2).some((event) => event.type === "failure"), "The real triage path must retain a claim when model preflight fails");
     peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
 
     const app = await open(path);
     const round = await (async () => {
       try {
+        // Build an actually admitted legacy global claim through its original
+        // producer. New commands use revisioned reviewers; upgrade recovery
+        // must still preserve the old owner's tools and native input.
+        const journal = new SourceJournal(app.session, new TaskStore(app.session, new ConversationModels(createModels())));
+        await assert.rejects(journal.triage({ type: "triage_sources", instructions: "",
+          model: { ...DEFAULT_MODEL, model_id: "missing-fixture-model" }, cwd: "/tmp", hosts: [] }, () => () => {}, []));
+        assert.equal(await journal.legacyActive(), true, "The legacy producer must retain its admitted claim after preflight fails");
         const conversations = (await app.storage.scanConversations({}, 10, undefined, BACKGROUND_CONTEXT)).items;
         const candidates = conversations.filter((record) => record.id !== app.root.id);
         assert.equal(candidates.length, 1, "Production triage must create exactly one owning source conversation");

@@ -57,6 +57,7 @@ impl RequestLifecycle {
             | RuntimeCommand::RunJob { .. }
             | RuntimeCommand::Environment { .. }
             | RuntimeCommand::SourceStates
+            | RuntimeCommand::SourceDiagnostics
             | RuntimeCommand::IngestSource { .. }
             | RuntimeCommand::TriageSources { .. }
             | RuntimeCommand::Status

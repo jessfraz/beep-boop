@@ -260,6 +260,48 @@
             "type",
             "reads"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reads": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceRead"
+              }
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceConfig"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "source_catalog"
+            }
+          },
+          "required": [
+            "type",
+            "sources",
+            "reads"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "read": {
+              "$ref": "#/$defs/SourceRead"
+            },
+            "type": {
+              "type": "string",
+              "const": "source_page"
+            }
+          },
+          "required": [
+            "type",
+            "read"
+          ]
         }
       ]
     },
@@ -2831,6 +2873,18 @@
             "type": {
               "type": "string",
               "const": "source_states"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "source_diagnostics"
             }
           },
           "required": [

@@ -41,12 +41,15 @@ import type { AllocationOperation } from "./generated/AllocationOperation.js";
 import type { AllocationResult } from "./generated/AllocationResult.js";
 import { AllocationDecisionEntry, allocationResult } from "./allocation.js";
 import { PartitionedRecords } from "./partitioned-records.js";
+import { OrderedIndex } from "./ordered-index.js";
+import type { InferenceClass } from "./generated/InferenceClass.js";
+import type { TaskExecution } from "./generated/TaskExecution.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt };
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt; execution?: TaskExecution };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type BackgroundInput = Pick<WorkerInput, "task_id" | "agent_id"> & { type: "background"; interactive?: false };
 type ActorInput = WorkerInput | BackgroundInput;
@@ -77,6 +80,15 @@ const Tasks = defineDoc<TaskIndex>({
 const SourceLinksEntry = defineEntry<{ task_id: string; added: SourceRef[]; removed: SourceRef[] }>("agent.source_links");
 const SourceOwners = defineDocFamily<{ ids: string[] }, null>({ kind: "agent.task.sources", scope: "session", family: true, version: 1,
   initial: () => ({ ids: [] }), checkpointWhen: () => false });
+const RoutingMigration = defineDoc<{ migrated: number; complete: boolean }>({ kind: "agent.task.routing.migration", scope: "session", version: 1,
+  initial: () => ({ migrated: 0, complete: false }), checkpointWhen: () => true });
+const DueKeys = defineDocFamily<{ key: string | null }, null>({ kind: "agent.task.due.key", scope: "session", family: true, version: 1,
+  initial: () => ({ key: null }), checkpointWhen: () => true });
+const ReviewInputs = defineDocFamily<{ receipt: { hash: string; sender: string; work_class: InferenceClass } | null }, null>({
+  kind: "agent.task.review-input", scope: "session", family: true, version: 1, initial: () => ({ receipt: null }), checkpointWhen: () => true });
+function orderedTime(value: number): string {
+  return value < 0 ? "0" + String(Number.MAX_SAFE_INTEGER + value).padStart(16, "0") : "1" + String(value).padStart(16, "0");
+}
 const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: string | null }, null>({ kind: "agent.task.owners", scope: "session", family: true, version: 1,
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
 function conversationIdentity(value: unknown): value is ConversationId {
@@ -157,7 +169,10 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
 
 /** Application metadata lives on Pi's commit line, beside its conversations. */
 export class TaskStore {
-  private readonly recordsStore = new PartitionedRecords<TaskRecord>("agent.task");
+  private readonly recordsStore = new PartitionedRecords<TaskRecord>("agent.task", true, true);
+  private readonly sourceOwners = new OrderedIndex<{ id: string }>("agent.task.source-owners");
+  private readonly deadlines = new OrderedIndex<{ id: string; next_check: string }>("agent.task.due");
+  private routingPreparing: Promise<void> | undefined;
   private readonly running = new Map<string, AttachedWorker>();
   private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
@@ -171,16 +186,58 @@ export class TaskStore {
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
       (tx, task) => this.indexTaskIn(tx, task));
+    await (this.routingPreparing ??= this.prepareRouting().catch(error => { this.routingPreparing = undefined; throw error; }));
     await this.outcomes?.prepare?.();
   }
+  private async prepareRouting(): Promise<void> {
+    if ((await this.session.snapshot(RoutingMigration, BACKGROUND_CONTEXT))?.complete) return;
+    for (;;) {
+      const complete = await this.session.commit(async tx => {
+        const progress = await tx.doc(RoutingMigration);
+        if (progress.complete) return true;
+        const directory = await tx.doc(this.recordsStore.directory);
+        let ordinal = progress.migrated, bytes = 0;
+        for (; ordinal < directory.count && ordinal - progress.migrated < 32; ordinal += 1) {
+          const page = await tx.doc(this.recordsStore.pages, String(Math.floor(ordinal / 128)), null), id = page.keys[ordinal % 128];
+          if (id === undefined) throw new TaskError("Task routing migration is missing an indexed task");
+          const task = await this.recordsStore.valueIn(tx, id);
+          if (task === undefined) throw new TaskError("Task routing migration is missing an original task");
+          const size = Buffer.byteLength(JSON.stringify(task));
+          if (ordinal > progress.migrated && bytes + size > 4 * 1024 * 1024) break;
+          bytes += size; await this.indexTaskIn(tx, task);
+        }
+        progress.migrated = ordinal; progress.complete = ordinal === directory.count;
+        return progress.complete;
+      }, BACKGROUND_CONTEXT);
+      if (complete) return;
+      await setImmediate();
+    }
+  }
+  private async indexDueIn(tx: Tx, task: TaskRecord): Promise<void> {
+    const previous = await tx.doc(DueKeys, task.id, null);
+    const next = task.state.state === "waiting" ? task.state.next_check : null;
+    const time = next === null ? NaN : Date.parse(next);
+    const key = next !== null && Number.isSafeInteger(time) && task.pending.length === 0 ? orderedTime(time) + ":" + task.id : null;
+    if (previous.key === key) return;
+    if (previous.key !== null) await this.deadlines.deleteIn(tx, "due", previous.key);
+    if (key !== null && next !== null) await this.deadlines.setIn(tx, "due", key, { id: task.id, next_check: next });
+    previous.key = key;
+  }
   private async indexTaskIn(tx: Tx, task: TaskRecord, previous: readonly SourceRef[] = []): Promise<void> {
+    const transitional = !(await tx.doc(RoutingMigration)).complete;
     for (const source of previous) if (!task.sources.some(saved => related(saved, source))) {
-      const owners = await tx.doc(SourceOwners, sourceReference(source), null), index = owners.ids.indexOf(task.id);
-      if (index >= 0) owners.ids.splice(index, 1);
+      await this.sourceOwners.deleteIn(tx, sourceReference(source), task.id);
+      if (transitional) {
+        const owners = await tx.doc(SourceOwners, sourceReference(source), null), index = owners.ids.indexOf(task.id);
+        if (index >= 0) owners.ids.splice(index, 1);
+      }
     }
     for (const source of task.sources) {
-      const owners = await tx.doc(SourceOwners, sourceReference(source), null);
-      if (!owners.ids.includes(task.id)) owners.ids.push(task.id);
+      if (!previous.some(saved => related(saved, source))) await this.sourceOwners.setIn(tx, sourceReference(source), task.id, { id: task.id });
+      if (transitional) {
+        const owners = await tx.doc(SourceOwners, sourceReference(source), null);
+        if (!owners.ids.includes(task.id)) owners.ids.push(task.id);
+      }
     }
     for (const actor of [task, ...task.agents ?? []]) {
       const owner = await tx.doc(ConversationOwner, actor.conversation_id, null);
@@ -190,6 +247,7 @@ export class TaskStore {
       }
       owner.task_id = task.id; owner.agent_id = agentId;
     }
+    await this.indexDueIn(tx, task);
   }
   private async taskIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
     const saved = await this.recordsStore.valueIn(tx, id);
@@ -206,7 +264,7 @@ export class TaskStore {
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useBackgroundExecution(execution: BackgroundExecution): void { this.background = execution; }
   isBackgroundTask(task: TaskRecord): boolean {
-    return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
+    return task.execution === "coordinator" || task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
   }
   private async backgroundHost(task: TaskRecord, agentId?: string): Promise<WorkerHost> {
     if (this.environment === undefined) throw new TaskError("The coordinator execution environment is unavailable");
@@ -218,7 +276,7 @@ export class TaskStore {
     const cwd = actor.pending[0]?.scheduled?.job.cwd ?? configured?.cwd ?? parent?.cwd ??
       (task.worker.state === "unassigned" ? "/" : task.worker.host.cwd);
     const host = await this.environment.defaultHost(await this.environment.hosts(cwd, null, []));
-    if (host === null) throw new TaskError("The scheduled job's coordinator execution host is offline; its task is retained");
+    if (host === null) throw new TaskError("The task's coordinator execution host is offline; its input is retained");
     return { ...host, cwd };
   }
   /** Background jobs use the same actor and native outbox, without a terminal transport. */
@@ -259,6 +317,22 @@ export class TaskStore {
       void this.runBackground(id, undefined, agentId).catch(() => {});
     }
     return this.get(id);
+  }
+  /** Source effects kick the existing actor after their admission commit. A
+   * legacy worker keeps its binding; only explicitly owned coordinator actors
+   * use background execution. This waits for transport admission, not its work. */
+  async wakeBackground(id: string, signal?: AbortSignal): Promise<TaskRecord> {
+    signal?.throwIfAborted();
+    const active = this.running.get(id);
+    if (active !== undefined && active.controller?.signal.aborted !== true && active.observer?.signal.aborted !== true) {
+      active.revision += 1; active.wake?.(); await this.admitActiveInputs(active); return this.get(id);
+    }
+    const task = await this.get(id);
+    if (this.isBackgroundTask(task)) return this.dispatchBackground(id);
+    const execution = this.background;
+    if (execution === undefined || !execution.available()) throw new TaskError("Task execution transport is unavailable; its source input is retained");
+    const host = task.worker.state === "unassigned" ? await this.backgroundHost(task) : task.worker.host;
+    return this.dispatch(id, host, command => execution.call(command, host, signal ?? new AbortController().signal));
   }
   /** Rebind only admitted work. Open or waiting task metadata alone is not a new turn. */
   async resumeBackground(): Promise<void> {
@@ -469,6 +543,7 @@ export class TaskStore {
       }
       task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
       await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
+      await this.indexDueIn(tx, task);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
       await this.outcomes?.recordIn(tx, outcome, provenance.settled);
@@ -506,8 +581,15 @@ export class TaskStore {
     return { type: "task", task_id: task.id, conversation_id: conversationId, title: agent?.title ?? task.title };
   }
   async findOwner(conversationId: string): Promise<{ task: TaskRecord; agent?: TaskAgentRecord } | undefined> {
-    await this.prepare();
-    const owner = await this.session.snapshot(ConversationOwner, conversationId, BACKGROUND_CONTEXT);
+    let owner = await this.session.snapshot(ConversationOwner, conversationId, BACKGROUND_CONTEXT);
+    if (owner?.task_id === null || owner?.task_id === undefined) {
+      const directory = await this.session.snapshot(this.recordsStore.directory, BACKGROUND_CONTEXT);
+      // An unowned imported view must not initialize task or outcome indexes.
+      // Existing records still need migration before absence is established.
+      if ((directory?.count ?? 0) === 0 && ((await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks.length ?? 0) === 0) return undefined;
+      await this.prepare();
+      owner = await this.session.snapshot(ConversationOwner, conversationId, BACKGROUND_CONTEXT);
+    }
     if (owner?.task_id === null || owner?.task_id === undefined) return undefined;
     const task = await this.get(owner.task_id);
     if (owner.agent_id === null) return { task };
@@ -529,6 +611,47 @@ export class TaskStore {
     const task = saved === undefined ? undefined : this.savedTask(saved);
     if (task === undefined) throw new TaskError("Unknown task");
     return task;
+  }
+  async dueChecks(now: number, limit = 20): Promise<{ id: string; next_check: string }[]> {
+    if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 0 || limit > 100) throw new TaskError("Due checks need a finite time and bounded limit");
+    if (limit === 0) return [];
+    await this.prepare();
+    // A waiting actor may still be finishing its current native turn. The
+    // extra candidates are bounded by live actors, never retained task history.
+    return this.session.commit(async tx => {
+      const candidates = await this.deadlines.rangeIn(tx, "due", { before: orderedTime(now) + ";", limit: limit + this.running.size });
+      const result: { id: string; next_check: string }[] = [];
+      for (const { value } of candidates) {
+        const task = await this.recordsStore.valueIn(tx, value.id);
+        if (task === undefined) throw new TaskError("Due index is missing its original task");
+        if (task.state.state === "waiting" && task.state.next_check === value.next_check &&
+          task.pending.length === 0 && !this.isRunning(task.id) && Date.parse(value.next_check) <= now) result.push(value);
+        if (result.length === limit) break;
+      }
+      return result;
+    }, BACKGROUND_CONTEXT);
+  }
+  async findBySources(sources: readonly SourceRef[], limit = 8): Promise<TaskRecord[]> {
+    if (!Number.isSafeInteger(limit) || limit < 0 || limit > 100) throw new TaskError("Source ownership lookup needs a bounded limit");
+    if (limit === 0) return [];
+    await this.prepare();
+    return this.session.commit(async tx => {
+      const result: TaskRecord[] = [], seen = new Set<string>();
+      for (const source of new Map(sources.map(source => [sourceReference(source), source])).values()) {
+        // Already returned owners may also belong to this source. One page
+        // containing those plus the remaining result slots is sufficient.
+        const page = await this.sourceOwners.rangeIn(tx, sourceReference(source), { limit: limit - result.length + seen.size });
+        for (const { value } of page) {
+          if (seen.has(value.id)) continue;
+          seen.add(value.id);
+          const task = await this.recordsStore.valueIn(tx, value.id);
+          if (task === undefined || !task.sources.some(saved => related(saved, source))) throw new TaskError("Source ownership index is missing its task link");
+          result.push(this.savedTask(task));
+          if (result.length === limit) return result;
+        }
+      }
+      return result;
+    }, BACKGROUND_CONTEXT);
   }
   async canReleaseIn(tx: Tx, id: string): Promise<boolean> {
     const task = await this.taskIn(tx, id);
@@ -741,10 +864,22 @@ export class TaskStore {
     const task = await this.taskIn(tx, id);
     return task === undefined ? undefined : this.savedTask(task);
   }
-  async sourceLinksIn(tx: Tx, sources: readonly SourceRef[]): Promise<{ task_id: string; source: SourceRef }[]> {
+  async sourceLinksIn(tx: Tx, sources: readonly SourceRef[], maximum = Number.MAX_SAFE_INTEGER): Promise<{ task_id: string; source: SourceRef }[]> {
     const links: { task_id: string; source: SourceRef }[] = [];
+    const transitional = !(await tx.doc(RoutingMigration)).complete;
     for (const ref of new Map(sources.map(source => [sourceReference(source), source])).values()) {
-      for (const id of (await tx.doc(SourceOwners, sourceReference(ref), null)).ids) links.push({ task_id: id, source: { ...ref } });
+      const ids = new Set<string>(transitional ? (await tx.doc(SourceOwners, sourceReference(ref), null)).ids : []);
+      let after: string | undefined;
+      for (;;) {
+        const page = await this.sourceOwners.rangeIn(tx, sourceReference(ref), { ...(after === undefined ? {} : { after }), limit: Math.min(128, maximum) });
+        if (page.length === 0) break;
+        for (const entry of page) { ids.add(entry.value.id); after = entry.key; }
+        if (ids.size >= maximum) break;
+      }
+      for (const id of ids) {
+        links.push({ task_id: id, source: { ...ref } });
+        if (new Set(links.map(link => link.task_id)).size >= maximum) return links;
+      }
     }
     return links;
   }
@@ -758,6 +893,7 @@ export class TaskStore {
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
+    if (input.execution !== undefined) task.execution = input.execution;
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     return { id, native: conversation.id };
   }
@@ -775,7 +911,9 @@ export class TaskStore {
     if (task === undefined) throw new TaskError("Unknown task");
     Object.assign(task, this.savedTask(task));
     const sources = task.sources.map(source => ({ ...source }));
+    const execution = task.execution;
     await change(task);
+    if (task.execution !== execution) throw new TaskError("A task's execution owner cannot be changed");
     await this.indexTaskIn(tx, task, sources);
     task.updated_at = Date.now();
   }
@@ -827,6 +965,44 @@ export class TaskStore {
   }
   async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments, undefined, origin, sender);
+  }
+  /** The dedicated request namespace and exact receipt survive outbox
+   * consumption. Reopening or another reviewer cannot reinterpret an admitted
+   * intent as a different body, sender or inference budget. */
+  async enqueueReviewIn(tx: Tx, input: { task_id: string; content: string; input_id: string;
+    sender_conversation_id: string; work_class: InferenceClass }): Promise<void> {
+    validateInput(input.content);
+    if (!input.input_id.startsWith("source-review:") || input.input_id.length > 512) throw new TaskError("A source review input needs its stable request namespace");
+    const task = await this.taskIn(tx, input.task_id);
+    if (task === undefined) throw new TaskError("Unknown source review task");
+    const native: unknown = Number(task.conversation_id), senderId: unknown = Number(input.sender_conversation_id);
+    if (!conversationIdentity(native) || native.toString() !== task.conversation_id ||
+      !conversationIdentity(senderId) || senderId.toString() !== input.sender_conversation_id) throw new TaskError("Source review conversation identity is invalid");
+    // Document acquisition validates this conversation through Pi and is safe
+    // after an atomic createIn; public table reads prohibit read-after-write.
+    await tx.doc(AgentDoc, senderId);
+    const sender: TaskMessageSender = { type: "coordinator", conversation_id: input.sender_conversation_id };
+    const hash = createHash("sha256").update(JSON.stringify([input.content, "follow_up", sender, input.work_class])).digest("hex");
+    const receipt = await tx.doc(ReviewInputs, JSON.stringify([task.id, input.input_id]), null);
+    if (receipt.receipt !== null) {
+      if (receipt.receipt.hash !== hash || receipt.receipt.sender !== input.sender_conversation_id || receipt.receipt.work_class !== input.work_class) {
+        throw new TaskError("A source review input ID cannot be reused with different content, sender or inference class");
+      }
+      return;
+    }
+    const previous = task.pending.find(value => value.id === input.input_id);
+    if (previous !== undefined && (previous.content !== input.content || (previous.mode ?? "follow_up") !== "follow_up" ||
+      !sameSender(previous.sender, sender) || (previous.attachments?.length ?? 0) > 0 || previous.scheduled !== undefined || previous.origin !== undefined)) {
+      throw new TaskError("A source review input conflicts with an existing native actor input");
+    }
+    if (previous === undefined) task.pending.push({ id: input.input_id, content: input.content, mode: "follow_up", sender });
+    task.state = { state: "open" }; task.updated_at = Date.now();
+    const active = this.running.get(task.id);
+    const workClass = task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local") ? "cron"
+      : active?.input.type === "run_task" && active.input.interactive === true ? "foreground" : input.work_class;
+    await this.inference.assignClassIn(tx, { id: native }, workClass);
+    await this.indexTaskIn(tx, task, task.sources);
+    receipt.receipt = { hash, sender: input.sender_conversation_id, work_class: input.work_class };
   }
   async enqueueScheduled(id: string, content: string, occurrence: ScheduledOccurrence): Promise<TaskRecord> {
     return this.enqueueActor(id, content, occurrence.id, undefined, undefined, undefined, undefined, occurrence);
@@ -940,9 +1116,9 @@ export class TaskStore {
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
-      await this.indexTaskIn(tx, task);
       task.state = { state: "open" };
       task.updated_at = Date.now();
+      await this.indexTaskIn(tx, task);
       return conversation.id;
     }, BACKGROUND_CONTEXT));
     if (native !== undefined) this.nativeIds.set(native.toString(), native);
@@ -1339,7 +1515,7 @@ export class TaskStore {
       const deadline = Date.now() + 10_000;
       let task = await this.get(input.task_id);
       let actor = this.actor(task, input.agent_id);
-      if (input.type === "background" && !this.isBackgroundTask(task)) throw new TaskError("Only job-owned tasks use coordinator background execution");
+      if (input.type === "background" && !this.isBackgroundTask(task)) throw new TaskError("Only coordinator-owned tasks use coordinator background execution");
       if (input.type === "run_task") {
         while ((actor.worker.state === "allocating" || actor.worker.state === "resuming") && Date.now() < deadline) {
           await new Promise<void>((resolve) => setTimeout(resolve, 25));

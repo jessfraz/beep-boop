@@ -5,4 +5,4 @@ import type { SourcePollCursor } from "./SourcePollCursor.js";
 import type { SourceState } from "./SourceState.js";
 import type { UtcMillis } from "./UtcMillis.js";
 
-export type BackgroundRequest = { "type": "plan", cadence: BackgroundCadence, after: UtcMillis | null, now: UtcMillis, } | { "type": "poll_sources", sources: Array<SourceConfig>, states: Array<SourceState>, cursor: SourcePollCursor | null, };
+export type BackgroundRequest = { "type": "plan", cadence: BackgroundCadence, after: UtcMillis | null, now: UtcMillis, } | { "type": "poll_sources", sources: Array<SourceConfig>, states: Array<SourceState>, cursor: SourcePollCursor | null, } | { "type": "discover_sources", sources: Array<SourceConfig>, states: Array<SourceState>, } | { "type": "poll_source", source: SourceConfig, state: SourceState | null, };

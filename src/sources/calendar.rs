@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        SourceScanPhase, SourceScanProgress, SourceScanUnit, google::GoogleSource, now_seconds,
-        read_command,
+        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
+        SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit,
+        google::GoogleSource, now_seconds, read_command,
     },
 };
 
@@ -477,6 +477,12 @@ impl CalendarSource {
 
 #[async_trait::async_trait]
 impl Source for CalendarSource {
+    fn configuration(&self) -> SourceConfig {
+        SourceConfig::GoogleCalendar {
+            enabled: true,
+            namespaces: Some(vec![self.namespace.clone()]),
+        }
+    }
     fn key(&self) -> SourceKey {
         SourceKey {
             provider: "google_calendar".into(),

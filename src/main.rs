@@ -96,7 +96,11 @@ enum Action {
     Logout,
     Usage,
     /// Show background source coverage and checkpoints.
-    Sources,
+    Sources {
+        /// Show retained work, review throughput, and active source claims.
+        #[arg(long)]
+        diagnostics: bool,
+    },
     /// Validate or reconcile Git-managed scheduled jobs, independently of sources.
     Jobs {
         #[command(subcommand)]
@@ -678,7 +682,13 @@ async fn main() -> Result<()> {
                 .provider,
         },
         Action::Logout => RuntimeCommand::Logout,
-        Action::Sources => RuntimeCommand::SourceStates,
+        Action::Sources { diagnostics } => {
+            if diagnostics {
+                RuntimeCommand::SourceDiagnostics
+            } else {
+                RuntimeCommand::SourceStates
+            }
+        }
         Action::Jobs { command } => match command {
             JobsAction::Run(args) => args.request(),
             JobsAction::Sync { directories } => {
@@ -3933,6 +3943,9 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         }
         RuntimeEventKind::Sources { sources } => {
             println!("{}", agent_cli::source_view::format(sources));
+        }
+        RuntimeEventKind::SourceDiagnostics { diagnostics } => {
+            println!("{}", serde_json::to_string_pretty(diagnostics)?);
         }
         event @ (RuntimeEventKind::JobsSynced { .. }
         | RuntimeEventKind::JobStatus { .. }

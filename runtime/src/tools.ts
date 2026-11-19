@@ -23,7 +23,7 @@ import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.j
 import { importedSummary } from "./history.js";
 import type { BackgroundScheduler } from "./background.js";
 
-export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
+export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage" | "review";
   origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;
   search?: SearchQuery;
   project?: () => Promise<HostResult>;

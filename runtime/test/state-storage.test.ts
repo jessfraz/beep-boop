@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { LegacySources, LegacyTasks, openStateStorage, seedLegacy } from "./fixtures/state-storage.js";
 import type { TaskOutcome } from "../src/generated/TaskOutcome.js";
+import { SourceMetrics } from "../src/source-metrics.js";
 
 for (const kind of ["agent.task.directory", "agent.source.event.directory"]) {
   test(`partition migration resumes after native close at ${kind} without changing legacy ownership`, async () => {
@@ -40,6 +41,7 @@ for (const kind of ["agent.task.directory", "agent.source.event.directory"]) {
       assert.ok(control);
       const resumed = await app.storage.document(control.id, "current", BACKGROUND_CONTEXT);
       assert.deepEqual(resumed?.value.active, active, "The interrupted native claim must retain its exact input, due work, identity and attempt");
+      assert.equal(await app.sources.legacyActive(), true);
       assert.equal(resumed?.value.conversation_id, legacySources?.conversation_id);
       assert.deepEqual(resumed?.value.last_claimed_source, legacySources?.last_claimed_source);
       assert.deepEqual(resumed?.value.next_event, legacySources?.next_event);
@@ -82,6 +84,8 @@ test("migration of handled originals does not allocate a pending source index", 
     const original = await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT); assert.ok(original);
     const state = original.sources[0]; assert.ok(state);
     await app.sources.prepare();
+    assert.equal(await app.session.snapshot(SourceMetrics, BACKGROUND_CONTEXT), undefined,
+      "Rebuilding projections must not count retained originals as newly admitted or decided work");
     assert.equal(await app.storage.findDocument({ kind: "agent.source.pending", scope: { kind: "session" },
       key: JSON.stringify(["mail", "fixture"]) }, "current", BACKGROUND_CONTEXT), undefined,
     "Already-handled originals must not materialize a pending source index");
@@ -96,6 +100,9 @@ test("migration of handled originals does not allocate a pending source index", 
     await app.sources.decide([key], { type: "dismissed", reason: "Handled once" });
     await app.sources.decide([key], { type: "dismissed", reason: "Handled once" });
     assert.deepEqual(await app.sources.events({ pending: true }), []);
+    const metrics = await app.session.snapshot(SourceMetrics, BACKGROUND_CONTEXT);
+    assert.equal(metrics?.admitted_events, 1); assert.equal(metrics?.decided_events, 1,
+      "Exact duplicate admissions and unchanged judgments must not inflate throughput counters");
     assert.deepEqual(await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT), original);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

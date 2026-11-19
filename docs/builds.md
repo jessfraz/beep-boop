@@ -23,6 +23,12 @@ Qualify the final Git revision. Packaged checks include test fixtures, so
 concurrent test edits change the output even when production code is identical.
 Compare the release and Global Nix output paths before rollout.
 
+Before deploying a new durable projection, retain a consistent SQLite backup
+and its original application revision. Migration preserves original records and
+legacy documents, but new writes do not maintain obsolete indexes. Rolling back
+requires stopping the coordinator and restoring that backup with its matching
+application; replacing only the binary can expose stale work.
+
 The existing read-only Cachix action installs the client without enabling
 post-build uploads. The final explicit `cachix push` receives only the immutable
 output from `nix build .#beep-boop`, uploading that package's runtime closure to

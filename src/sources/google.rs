@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        now_seconds, read_command,
+        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
+        SourceEvent, SourceKey, now_seconds, read_command,
     },
 };
 
@@ -268,6 +268,12 @@ impl GoogleSource {
 
 #[async_trait::async_trait]
 impl Source for GoogleSource {
+    fn configuration(&self) -> SourceConfig {
+        SourceConfig::Google {
+            enabled: true,
+            namespaces: Some(vec![self.namespace.clone()]),
+        }
+    }
     fn key(&self) -> SourceKey {
         SourceKey {
             provider: "google".into(),

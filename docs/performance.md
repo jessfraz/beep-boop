@@ -1,5 +1,27 @@
 # CLI performance
 
+Source-pipeline qualification also has two explicit native replay commands:
+
+```sh
+nix develop --command node runtime/dist/test/source-pipeline-benchmark.js \
+  --sizes=100000,1000000,10000000 --keep-database
+nix develop --command node runtime/dist/test/source-review-benchmark.js \
+  --events 600 --latency-ms 100
+```
+
+The first admits invented, skewed, versioned originals through `SourceJournal`
+and reopens native SQLite before bounded reads, claims and decisions. It records
+actual SQL, query plans, hydrated originals, disk use and elapsed time. Its
+runtime and free-space guards report unfinished sizes explicitly. `--resume`
+with the same `--directory` continues a retained database after checking its
+native corpus and cursor, without replacing records or seeding counters.
+
+The second compares one, two and four real reviewer actors with a fixed faux
+provider delay, fresh evidence arriving over backfill, and a blocked durable
+worker effect. It reports native overhead separately from synthetic model
+latency. Neither benchmark predicts real model speed or provider quotas; those
+require live indexed backlog and delivery readback after rollout.
+
 The separate **CLI performance** CI job compares a change with its pull request
 base or previous main commit on the same runner. It builds both in release mode,
 alternates baseline and candidate launches, and saves every timing in JSON.

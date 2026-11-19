@@ -3,7 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
-import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Registry, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, configure, defineDoc, defineDocFamily, ProviderDoc, type AgentChange, type Conversation, type Harness, type Registry, type Tx } from "@earendil-works/pi-durable";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -11,9 +11,11 @@ import type { Reasoning } from "./generated/Reasoning.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
+import type { InferenceClass } from "./generated/InferenceClass.js";
 import { withWebSearch } from "./web-search.js";
 import { QuotaRecovery } from "./quota.js";
 import { createCompaction, guardCompactionRequests } from "./compaction.js";
+import { InferenceCapacity } from "./inference-capacity.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
@@ -73,9 +75,15 @@ export function savedHost(host: WorkerHost): WorkerHost {
   };
 }
 
-const Policies = defineDoc<{ sessions: Record<string, ModelSelection> }>({
+// A native conversation may receive its work class before its first model is
+// configured. Model choice remains native; these fields bind application-only
+// fast-mode and resource-admission policy to that exact provider session.
+type ModelPolicy = Partial<ModelSelection> & { work_class?: InferenceClass };
+const Policies = defineDoc<{ sessions: Record<string, ModelPolicy> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
+const Policy = defineDocFamily<{ policy: ModelPolicy | null }, null>({ kind: "agent.model_policy", scope: "session", family: true,
+  version: 1, initial: () => ({ policy: null }), checkpointWhen: () => true });
 
 /** Pi owns model catalogs, auth and inference. This adapter owns saved application choices. */
 export class ConversationModels {
@@ -83,7 +91,8 @@ export class ConversationModels {
   private bindSession: ((session: Harness) => void) | undefined;
   private readonly session = new Promise<Harness>((resolve) => { this.bindSession = resolve; });
   private readonly compaction = createCompaction(this.session);
-  constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth, registry?: Registry) {
+  constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth, registry?: Registry,
+    capacity: InferenceCapacity = new InferenceCapacity()) {
     registry?.install(this.compaction);
     for (const id of ["openai", "openai-codex"]) {
       const provider = models.getProvider(id);
@@ -109,9 +118,7 @@ export class ConversationModels {
         streamSimple: (model, context, options) => openai.streamSimple(model, context, { ...options,
           onPayload: async (payload, actual) => {
             const previous = await options?.onPayload?.(payload, actual);
-            const session = await this.session;
-            const policy = options?.sessionId === undefined ? undefined
-              : (await session.snapshot(Policies, BACKGROUND_CONTEXT))?.sessions[options.sessionId];
+            const policy = options?.sessionId === undefined ? undefined : await this.policy(options.sessionId);
             if (policy?.fast !== true) return previous;
             // A settings change can commit after this generation chose its model.
             // Its next request owns the new policy; do not alter this older one.
@@ -132,12 +139,22 @@ export class ConversationModels {
       // Access-token refreshes keep the account's cooldown; credentials never
       // enter durable request state or notices.
       return createHash("sha256").update(JSON.stringify([model.provider, model.baseUrl, identity])).digest("hex");
-    });
+    }, {}, { capacity, workClass: async (_model, options) => {
+      return options.sessionId === undefined ? "foreground" : (await this.policy(options.sessionId))?.work_class ?? "foreground";
+    } });
     for (const provider of models.getProviders()) models.setProvider(quota.wrapProvider(provider));
     quota.wrapComplete();
     if (registry !== undefined) guardCompactionRequests(models);
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
+  private async policy(id: string): Promise<Readonly<ModelPolicy> | undefined> {
+    const session = await this.session;
+    return (await session.snapshot(Policy, id, BACKGROUND_CONTEXT))?.policy
+      ?? (await session.snapshot(Policies, BACKGROUND_CONTEXT))?.sessions[id];
+  }
+  private async policyIn(tx: Tx, id: string): Promise<ModelPolicy | undefined> {
+    return (await tx.doc(Policy, id, null)).policy ?? (await tx.doc(Policies)).sessions[id];
+  }
   validate(selection: ModelSelection): void {
     const model = this.models.getModel(selection.provider, selection.model_id);
     if (model === undefined) throw new ModelError(`Unknown model ${selection.provider}/${selection.model_id}.`);
@@ -174,15 +191,22 @@ export class ConversationModels {
       throw new AuthError("needs_sign_in", `No authentication configured for ${selection.provider}. Configure its Pi authentication in the coordinator environment.`);
     }
   }
-  async configure(conversation: Conversation, selection: ModelSelection, change: AgentChange): Promise<void> {
+  async configure(conversation: Conversation, selection: ModelSelection, change: AgentChange, workClass?: InferenceClass): Promise<void> {
     this.validate(selection);
     const session = await this.session;
-    await session.commit((tx) => this.configureIn(tx, conversation, selection, change), BACKGROUND_CONTEXT);
+    await session.commit((tx) => this.configureIn(tx, conversation, selection, change, workClass), BACKGROUND_CONTEXT);
   }
-  private async configureIn(tx: Tx, conversation: Conversation, selection: ModelSelection, change: AgentChange): Promise<void> {
+  async assignClassIn(tx: Tx, conversation: Pick<Conversation, "id">, workClass: InferenceClass): Promise<void> {
     const native = await tx.doc(ProviderDoc, conversation.id);
-    const policies = await tx.doc(Policies);
-    policies.sessions[native.sessionId] = { ...selection };
+    const slot = await tx.doc(Policy, native.sessionId, null);
+    slot.policy ??= { ...await this.policyIn(tx, native.sessionId) };
+    slot.policy.work_class = workClass;
+  }
+  async configureIn(tx: Tx, conversation: Pick<Conversation, "id">, selection: ModelSelection, change: AgentChange, workClass?: InferenceClass): Promise<void> {
+    const native = await tx.doc(ProviderDoc, conversation.id);
+    const previous = (await this.policyIn(tx, native.sessionId))?.work_class;
+    const selectedClass = workClass ?? previous;
+    (await tx.doc(Policy, native.sessionId, null)).policy = { ...selection, ...(selectedClass === undefined ? {} : { work_class: selectedClass }) };
     await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },
       thinkingLevel: selection.reasoning });
     // Keep explicit tool/extension selections while adding the internal policy.
@@ -196,9 +220,9 @@ export class ConversationModels {
     if (native.model === undefined) return { ...fallback };
     if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
     const connection = await tx.doc(ProviderDoc, conversation.id);
-    const saved = (await tx.doc(Policies)).sessions[connection.sessionId];
+    const saved = await this.policyIn(tx, connection.sessionId);
     return { provider: native.model.provider, model_id: native.model.modelId, reasoning: native.thinkingLevel ?? null,
-      fast: saved?.provider === native.model.provider && saved.model_id === native.model.modelId && saved.fast };
+      fast: saved?.provider === native.model.provider && saved.model_id === native.model.modelId && saved.fast === true };
   }
   /** Startup context must not overwrite a setting changed while it was loading. */
   async configureCurrent(conversation: Conversation, fallback: ModelSelection, change: AgentChange): Promise<ModelSelection> {
@@ -249,9 +273,8 @@ export class ConversationModels {
     if (native?.model === undefined) return { ...fallback };
     if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
     const connection = await session.snapshot(ProviderDoc, conversation.id, BACKGROUND_CONTEXT);
-    const policy = connection === undefined ? undefined
-      : (await session.snapshot(Policies, BACKGROUND_CONTEXT))?.sessions[connection.sessionId];
+    const policy = connection === undefined ? undefined : await this.policy(connection.sessionId);
     return { provider: native.model.provider, model_id: native.model.modelId, reasoning: native.thinkingLevel ?? null,
-      fast: policy?.provider === native.model.provider && policy.model_id === native.model.modelId && policy.fast };
+      fast: policy?.provider === native.model.provider && policy.model_id === native.model.modelId && policy.fast === true };
   }
 }

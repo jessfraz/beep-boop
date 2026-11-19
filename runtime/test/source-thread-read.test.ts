@@ -138,3 +138,73 @@ test("cold exact thread reads hydrate only indexed originals beside unrelated re
     assert.deepEqual(reads, [], "An unknown exact thread must not fall back to scanning the retained corpus");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("provider and account misses hydrate no retained originals across cold reopen", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-filter-bound-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    await admit(app.sources, Array.from({ length: 128 }, (_, index) => event(`slack-${index}`, `slack-thread-${index}`, "Retained Slack evidence")));
+    await admit(app.sources, Array.from({ length: 128 }, (_, index) =>
+      event(`mail-${index}`, `mail-thread-${index}`, "Retained mail evidence", { provider: "mail", account: "beta" })));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    const hydrated: string[] = [], findDocument = app.storage.findDocument.bind(app.storage);
+    app.storage.findDocument = async (address, at, context) => {
+      if (address.kind === "agent.source.event.records" && typeof address.key === "string") hydrated.push(address.key);
+      return findDocument(address, at, context);
+    };
+    assert.deepEqual(await app.sources.events({ provider: "unknown" }), []);
+    assert.deepEqual(await app.sources.events({ account: "unknown" }), []);
+    assert.deepEqual(await app.sources.events({ provider: "slack", account: "beta" }), []);
+    assert.deepEqual(hydrated, [], "Negative indexed selections must not scan unrelated originals");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("substring pages bound candidate hydration and retain continuation through empty matches", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-query-page-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    await admit(app.sources, [event("first", "first", "The older NEEDLE remains searchable"),
+      ...Array.from({ length: 8 }, (_, index) => event(`newer-${index}`, `newer-${index}`, "Unrelated retained evidence"))]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    const hydrated: string[] = [], findDocument = app.storage.findDocument.bind(app.storage);
+    app.storage.findDocument = async (address, at, context) => {
+      if (address.kind === "agent.source.event.records" && typeof address.key === "string") hydrated.push(address.key);
+      return findDocument(address, at, context);
+    };
+    const filter = { provider: "slack", account: "alpha", query: "needle", limit: 3 };
+    let page = await app.sources.eventPage(filter);
+    assert.deepEqual(page.events, []); assert.equal(page.scanned, 3); assert.equal(page.complete, false); assert.ok(page.cursor);
+    assert.equal(new Set(hydrated).size, 3, "A substring miss hydrates only its bounded indexed candidates");
+    await assert.rejects(app.sources.eventPage({ ...filter, query: "different", cursor: page.cursor }), /another selection/u);
+    const matches: string[] = [];
+    while (page.cursor !== null) {
+      page = await app.sources.eventPage({ ...filter, cursor: page.cursor });
+      assert.ok(page.scanned <= 3); matches.push(...page.events.map(record => record.event.id));
+    }
+    assert.equal(page.complete, true); assert.deepEqual(matches, ["first"]);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new source admission and identity lookup bypass retained legacy membership buckets", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-membership-bound-")), path = join(directory, "session.sqlite");
+  let app = await open(path);
+  try {
+    await app.sources.prepare();
+    const membershipReads: string[] = [], findDocument = app.storage.findDocument.bind(app.storage);
+    app.storage.findDocument = async (address, at, context) => {
+      if (address.kind === "agent.source.event.membership" && typeof address.key === "string") membershipReads.push(address.key);
+      return findDocument(address, at, context);
+    };
+    const original = event("new-original", "new-thread", "Original evidence remains intact");
+    await admit(app.sources, [original]);
+    const record = (await app.sources.events({ provider: "slack", account: "alpha" }))[0]; assert.ok(record);
+    await app.sources.decide([record.key], { type: "dismissed", reason: "Verified no action needed" });
+    assert.deepEqual(membershipReads, []);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    await app.session.commit(async tx => {
+      const restored = await app.sources.sourceRecordIn(tx, record.key);
+      assert.deepEqual(restored?.event, original);
+      assert.deepEqual(restored?.decision, { type: "dismissed", reason: "Verified no action needed" });
+    }, BACKGROUND_CONTEXT);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});

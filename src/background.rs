@@ -98,6 +98,14 @@ pub enum BackgroundRequest {
         states: Vec<SourceState>,
         cursor: Option<SourcePollCursor>,
     },
+    DiscoverSources {
+        sources: Vec<SourceConfig>,
+        states: Vec<SourceState>,
+    },
+    PollSource {
+        source: SourceConfig,
+        state: Option<SourceState>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -121,6 +129,13 @@ pub enum BackgroundResponse {
     Sources {
         reads: Vec<SourceRead>,
         cursor: Option<SourcePollCursor>,
+    },
+    SourceCatalog {
+        sources: Vec<SourceConfig>,
+        reads: Vec<SourceRead>,
+    },
+    SourcePage {
+        read: Box<SourceRead>,
     },
 }
 
@@ -299,6 +314,16 @@ pub async fn execute(request: BackgroundRequest) -> Result<BackgroundResponse> {
         } => {
             let (reads, cursor) = crate::intake::poll(&sources, &states, cursor).await?;
             Ok(BackgroundResponse::Sources { reads, cursor })
+        }
+        BackgroundRequest::DiscoverSources { sources, states } => {
+            let (sources, reads) = crate::intake::discover(&sources, &states).await?;
+            Ok(BackgroundResponse::SourceCatalog { sources, reads })
+        }
+        BackgroundRequest::PollSource { source, state } => {
+            let read = crate::intake::poll_source(&source, state.as_ref()).await?;
+            Ok(BackgroundResponse::SourcePage {
+                read: Box::new(read),
+            })
         }
     }
 }

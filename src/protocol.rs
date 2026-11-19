@@ -140,6 +140,127 @@ pub struct CoordinatorBootstrap {
     pub background: Option<crate::background::BackgroundSettings>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceClass {
+    Foreground,
+    Fresh,
+    Cron,
+    Backfill,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskExecution {
+    Coordinator,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceReviewDecision {
+    Dismiss {
+        groups: Vec<String>,
+        keys: Vec<String>,
+        reason: String,
+    },
+    Task {
+        groups: Vec<String>,
+        keys: Vec<String>,
+        task_id: Option<TaskId>,
+        job_id: Option<crate::jobs::JobId>,
+        work_url: Option<String>,
+        title: String,
+        outcome: String,
+        input: String,
+    },
+    Notify {
+        groups: Vec<String>,
+        keys: Vec<String>,
+        task_id: Option<TaskId>,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourcePipelineMetrics {
+    #[ts(type = "number")]
+    pub admitted_events: u64,
+    #[ts(type = "number")]
+    pub decided_events: u64,
+    #[ts(type = "number")]
+    pub claimed_events: u64,
+    #[ts(type = "number")]
+    pub completed_reviews: u64,
+    #[ts(type = "number")]
+    pub failed_reviews: u64,
+    #[ts(type = "number")]
+    pub input_bytes: u64,
+    pub claim_milliseconds: f64,
+    pub review_milliseconds: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourceStreamDiagnostics {
+    pub source: SourceKey,
+    #[ts(type = "number")]
+    pub retained: u64,
+    #[ts(type = "number")]
+    pub pending: u64,
+    #[ts(type = "number")]
+    pub dirty_entities: u64,
+    pub oldest_pending_at: Option<crate::jobs::UtcMillis>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourceReviewDiagnostics {
+    pub id: String,
+    pub conversation_id: String,
+    pub class: InferenceClass,
+    pub events: u32,
+    pub entities: u32,
+    #[ts(type = "number")]
+    pub input_bytes: u64,
+    pub attempt: u32,
+    pub started_at: crate::jobs::UtcMillis,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourceCollectorDiagnostics {
+    pub source: SourceKey,
+    pub enabled: bool,
+    #[ts(type = "number")]
+    pub pages: u64,
+    #[ts(type = "number")]
+    pub events: u64,
+    #[ts(type = "number")]
+    pub admitted_events: u64,
+    pub wait_ms: Option<f64>,
+    pub poll_ms: Option<f64>,
+    pub admit_ms: Option<f64>,
+    pub started_at: Option<crate::jobs::UtcMillis>,
+    pub finished_at: Option<crate::jobs::UtcMillis>,
+    pub next_at: Option<crate::jobs::UtcMillis>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourcePipelineDiagnostics {
+    pub schema_version: u32,
+    pub migration_ready: bool,
+    #[ts(type = "number")]
+    pub migrated_events: u64,
+    #[ts(type = "number")]
+    pub retained_events: u64,
+    #[ts(type = "number")]
+    pub pending_events: u64,
+    #[ts(type = "number")]
+    pub dirty_entities: u64,
+    pub streams: Vec<SourceStreamDiagnostics>,
+    pub collectors: Vec<SourceCollectorDiagnostics>,
+    pub active_reviews: Vec<SourceReviewDiagnostics>,
+    pub metrics: SourcePipelineMetrics,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]
 pub struct TaskId(#[ts(type = "string")] Uuid);
 
@@ -373,6 +494,7 @@ pub enum RuntimeCommand {
     },
     Watch,
     SourceStates,
+    SourceDiagnostics,
     IngestSource {
         batch: SourceBatch,
         expected_checkpoint: Option<SourceCheckpoint>,
@@ -778,6 +900,9 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub scheduled_run: Option<crate::background::JobRunReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub execution: Option<TaskExecution>,
     pub state: TaskState,
     pub worker: WorkerState,
     pub sources: Vec<SourceRef>,
@@ -1175,6 +1300,9 @@ pub enum RuntimeEventKind {
     },
     Sources {
         sources: Vec<SourceState>,
+    },
+    SourceDiagnostics {
+        diagnostics: SourcePipelineDiagnostics,
     },
     SourceAdmitted {
         new_events: u32,

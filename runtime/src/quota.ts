@@ -8,6 +8,8 @@ import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { defineDoc, defineDocFamily, defineEntry, ROOT_CONVERSATION_ID, type Harness, type SetTimer, type Tx } from "@earendil-works/pi-durable";
 import { UserNoticeEntry } from "./transcript.js";
+import type { InferenceClass } from "./generated/InferenceClass.js";
+import { estimatedInferenceTokens, type InferenceCapacity } from "./inference-capacity.js";
 
 type SavedOptions = Pick<SimpleStreamOptions, "reasoning" | "maxTokens" | "temperature" | "sessionId" | "transport" | "cacheRetention" | "toolChoice" | "thinkingBudgets" | "timeoutMs" | "deferred">;
 type PendingRequest = { account: string; provider: string; model: string } & (
@@ -23,6 +25,7 @@ const Pending = defineDocFamily<{ request: PendingRequest | null }, null>({ kind
 const Notice = defineEntry<{ provider: string; paused: boolean }>("agent.quota_state");
 const PREFIX = "beep-boop:quota:", BASE = 300_000, LIMIT = 3_600_000, PROBE_LEASE = 90_000;
 export type QuotaClock = { now?: () => number; random?: () => number; setTimer?: SetTimer };
+type InferenceAdmission = { capacity: InferenceCapacity; workClass(model: Model<Api>, options: SimpleStreamOptions): Promise<InferenceClass> };
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 export function isQuotaExhaustion(message: string | undefined): boolean {
@@ -83,7 +86,8 @@ export class QuotaRecovery {
   private readonly random: () => number;
   private readonly probes = new Map<string, string>();
   constructor(private readonly models: MutableModels, private readonly session: Promise<Harness>,
-    private readonly account: (model: Model<Api>, options: ProviderRequestOptions) => Promise<string>, private readonly clock: QuotaClock = {}) {
+    private readonly account: (model: Model<Api>, options: ProviderRequestOptions) => Promise<string>, private readonly clock: QuotaClock = {},
+    private readonly admission?: InferenceAdmission) {
     this.now = clock.now ?? Date.now; this.random = clock.random ?? Math.random;
   }
   owns(handle: DeferredHandle | undefined): handle is DeferredHandle { return handle?.id.startsWith(PREFIX) === true; }
@@ -153,7 +157,19 @@ export class QuotaRecovery {
   }
   private async request(provider: Provider, model: Model<Api>, id: string, context: TranscriptContext, options: SimpleStreamOptions, emit: (event: AssistantMessageEvent) => void, retained = false): Promise<AssistantMessage> {
     options.signal?.throwIfAborted();
-    const session = await this.session, account = await this.account(model, options);
+    const account = await this.account(model, options);
+    if (this.admission === undefined) return this.requestAdmitted(provider, model, id, context, options, emit, account, retained);
+    const workClass = await this.admission.workClass(model, options);
+    // Resource waits are outside Pi's mutation line. Recheck the durable quota
+    // gate only after admission, so a queued request cannot use an old permit
+    // to send traffic after another request exhausted the account.
+    return this.admission.capacity.run(account, workClass, estimatedInferenceTokens(model, context, options),
+      () => this.requestAdmitted(provider, model, id, context, options, emit, account, retained), options.signal);
+  }
+  private async requestAdmitted(provider: Provider, model: Model<Api>, id: string, context: TranscriptContext, options: SimpleStreamOptions,
+    emit: (event: AssistantMessageEvent) => void, account: string, retained: boolean): Promise<AssistantMessage> {
+    options.signal?.throwIfAborted();
+    const session = await this.session;
     await session.root(BACKGROUND_CONTEXT);
     const permit = await session.commit(async tx => {
       const state = await tx.doc(State), cooldown = state.accounts[account];

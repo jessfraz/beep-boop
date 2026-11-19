@@ -25,6 +25,8 @@ import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
 import { createToolsets, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
+import { SourceCollectors } from "./source-collectors.js";
+import { SourceReviews } from "./source-review.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
 import { activity, history, toolDetails } from "./transcript.js";
@@ -37,7 +39,6 @@ import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNo
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
-import type { SourcePollCursor } from "./generated/SourcePollCursor.js";
 import { Notifications, NotificationError } from "./notifications.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import { annotateTranscript, TranscriptAnnotationError } from "./transcript_visibility.js";
@@ -110,6 +111,7 @@ const inference = new ConversationModels(undefined, auth, registry);
 const models = inference.models;
 let backgroundOwner: number | undefined;
 let backgroundSources = false;
+let backgroundIntervalSeconds = 60;
 let backgroundAvailable = false;
 let stopBackground: (() => void) | undefined;
 const backgroundWaiters = new Set<() => void>();
@@ -133,7 +135,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; collectors: SourceCollectors; reviews: SourceReviews };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -143,8 +145,10 @@ async function openApplication(): Promise<Application> {
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
   try {
+    // Intake can touch many originals between model turns. Keep idle native
+    // documents briefly; attached conversations retain their owned state.
     harness = await startup.run("harness_recovery", () => Harness.open(storage, { models, registry, identity: { attribution: null }, telemetry: telemetry.context,
-      settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT));
+      settings: { steeringMode: "all", followUpMode: "one-at-a-time", documentRetentionMs: 1000 } }, BACKGROUND_CONTEXT));
   } catch (error) { await telemetry.close(); throw error; }
   try { return await startup.run("application_recovery", async () => {
   const notifications = new Notifications(harness, registry, notificationConfig());
@@ -194,7 +198,44 @@ async function openApplication(): Promise<Application> {
       for (const observer of mainObservers.values()) observer.publish(event);
     }
   });
-  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
+  const collectors = new SourceCollectors(harness, registry, {
+    ready: waitForBackground, enabled: () => backgroundSources,
+    states: () => sources.states(),
+    async discover(signal) {
+      const settings = (await environment.environment()).settings;
+      const result = await backgroundCall({ type: "background", request: { type: "discover_sources", sources: settings.sources, states: await sources.states() } }, signal);
+      if (result.type !== "background" || result.response.type !== "source_catalog") throw new TaskError("Source catalog discovery is unavailable");
+      return result.response;
+    },
+    async poll(source, state, signal) {
+      const result = await backgroundCall({ type: "background", request: { type: "poll_source", source, state } }, signal);
+      if (result.type !== "background" || result.response.type !== "source_page") throw new TaskError("The source page could not be read");
+      return result.response.read;
+    },
+    admit: read => sources.admit(read.batch, read.expected_checkpoint),
+  });
+  const reviews = new SourceReviews(harness, registry, sources, tasks, executions, {
+    extensions: [guidance],
+    ready: waitForBackground, enabled: () => backgroundSources,
+    async settings() {
+      const settings = (await environment.environment()).settings;
+      return { model: settings.model, cwd: "/", hosts: await environment.hosts("/", null, []), instructions: "" };
+    },
+    workflows: () => background.listJobs(),
+    async legacy(signal) {
+      if (backgroundOwner === undefined) throw new TaskError("The background source owner is disconnected");
+      const settings = (await environment.environment()).settings;
+      await triageSources(await app(), backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] }, signal);
+    },
+    bind: (conversation, model, signal, settings) => executions.bind(conversation.id.toString(), {
+      model, cwd: settings.cwd, hosts: settings.hosts, role: "review",
+      search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
+        operation => backgroundCall(operation, signal), importer.isRunning(), mode),
+      call: operation => backgroundCall(operation, signal),
+    }),
+  });
+  registry.install(reviews.tools);
+  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry, collectors, reviews };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     ready: waitForBackground,
     async plan(cadence, after, now, signal) {
@@ -205,25 +246,13 @@ async function openApplication(): Promise<Application> {
     },
     async refreshSources(signal) {
       signal.throwIfAborted();
-      if (!backgroundSources) return;
-      const settings = (await environment.environment()).settings;
-      let cursor: SourcePollCursor | null = null;
-      do {
-        signal.throwIfAborted();
-        const result = await backgroundCall({ type: "background", request: { type: "poll_sources", sources: settings.sources, states: await sources.states(), cursor } }, signal);
-        signal.throwIfAborted();
-        if (result.type !== "background" || result.response.type !== "sources") throw new TaskError("Background source coverage could not be read");
-        for (const read of result.response.reads) {
-          signal.throwIfAborted(); await sources.admit(read.batch, read.expected_checkpoint);
-        }
-        cursor = result.response.cursor;
-      } while (cursor !== null);
+      if (!backgroundSources) { await collectors.stop(); return; }
+      await collectors.sync(backgroundIntervalSeconds, signal);
     },
     async triageSources(signal) {
       signal.throwIfAborted();
       if (!backgroundSources) return;
-      const settings = (await environment.environment()).settings;
-      if (backgroundOwner !== undefined) await triageSources(await app(), backgroundOwner, { type: "triage_sources", instructions: "", model: settings.model, cwd: "/", hosts: [] }, signal);
+      await reviews.start();
     },
     async collectResources(signal) {
       signal.throwIfAborted();
@@ -317,7 +346,7 @@ type TriageApplication = { sources: SourceJournal; environment: CoordinatorEnvir
 async function triageSources(application: TriageApplication, id: number, command: Extract<RuntimeCommand, { type: "triage_sources" }>, signal?: AbortSignal): Promise<void> {
   const { sources, environment, executions, toolsets } = application;
   signal?.throwIfAborted();
-  if (!await sources.hasWork()) return;
+  if (!await sources.legacyActive()) return;
   const hosts = await environment.hosts(command.cwd, null, command.hosts);
   const default_host = await environment.defaultHost(hosts);
   const search = (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
@@ -441,6 +470,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         backgroundOwner = id;
         backgroundAvailable = true;
         backgroundSources = command.settings.sources;
+        backgroundIntervalSeconds = command.settings.poll_interval_seconds;
         for (const ready of backgroundWaiters) ready();
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
@@ -660,6 +690,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "source_states": emit(id, { type: "sources", sources: await (await app()).sources.states() }); break;
+      case "source_diagnostics": {
+        const core = await app();
+        emit(id, { type: "source_diagnostics", diagnostics: await core.reviews.diagnostics(await core.collectors.status()) });
+        break;
+      }
       case "ingest_source": {
         const result = await (await app()).sources.admit(command.batch, command.expected_checkpoint);
         emit(id, { type: "source_admitted", ...result });
@@ -667,7 +702,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "triage_sources": {
         const application = await app();
-        await triageSources(application, id, command);
+        const signal = new AbortController().signal;
+        if (await application.sources.legacyActive()) await triageSources(application, id, command, signal);
+        else await application.reviews.review(0, signal, command);
         emit(id, { type: "sources", sources: await application.sources.states() });
         break;
       }

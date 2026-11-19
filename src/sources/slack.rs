@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds, read_command,
+        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
+        SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds,
+        read_command,
     },
 };
 
@@ -327,6 +328,13 @@ impl SlackSource {
 
 #[async_trait::async_trait]
 impl Source for SlackSource {
+    fn configuration(&self) -> SourceConfig {
+        SourceConfig::Slack {
+            enabled: true,
+            command: self.command.clone(),
+            account: self.account.clone(),
+        }
+    }
     fn key(&self) -> SourceKey {
         SourceKey {
             provider: "slack".into(),

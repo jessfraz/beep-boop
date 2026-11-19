@@ -1,7 +1,7 @@
 //! GitHub notification intake through the existing Switchboard GitHub CLI.
 //! Includes read threads in a seven-day initial window, then overlaps settled
 //! windows by two minutes. GitHub's notification feed is not a repository archive.
-//! The native CLI owns pagination; returned updates need not be in time order.
+//! Each native CLI request reads one bounded page of a frozen time window.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        now_seconds, read_command,
+        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
+        SourceEvent, SourceKey, now_seconds, read_command,
     },
 };
 
@@ -31,10 +31,16 @@ struct Namespace {
 }
 #[derive(Debug, Deserialize, Serialize)]
 struct Window {
+    #[serde(default)]
+    version: u8,
     account: String,
     since: u64,
     until: u64,
     not_before: u64,
+    #[serde(default = "first_page")]
+    page: u32,
+    #[serde(default = "default_poll_interval")]
+    poll_interval: u64,
 }
 #[derive(Deserialize, Serialize)]
 struct Envelope {
@@ -71,13 +77,22 @@ struct Subject {
 }
 struct Page {
     notifications: Vec<Notification>,
-    has_next: bool,
+    next_page: Option<u32>,
     poll_interval: u64,
 }
 struct Scan {
     notifications: Vec<Notification>,
-    exhausted: bool,
+    next_page: Option<u32>,
+    complete_page: bool,
+    pages: u32,
     poll_interval: u64,
+}
+
+fn first_page() -> u32 {
+    1
+}
+fn default_poll_interval() -> u64 {
+    60
 }
 
 impl GitHubSource {
@@ -129,19 +144,33 @@ impl GitHubSource {
             Some(checkpoint) => serde_json::from_str(&checkpoint.value)
                 .context("Invalid GitHub source checkpoint")?,
             None => Window {
+                version: 1,
                 account: self.namespace.clone(),
                 since: now.saturating_sub(7 * 86_400),
                 until: 0,
                 not_before: 0,
+                page: 1,
+                poll_interval: 60,
             },
         };
         ensure!(
             window.account == self.namespace,
             "GitHub checkpoint belongs to another account"
         );
-        // Every native scan starts from the last committed baseline. Legacy
-        // before/page fields are ignored rather than carrying their stuck keyset.
-        window.until = now.saturating_add(1);
+        ensure!(window.version <= 1, "Unsupported GitHub checkpoint version");
+        // Old aggregate scans never admitted an intermediate native page. Start
+        // those checkpoints at the committed baseline rather than reusing their
+        // obsolete page field. Current continuations retain the frozen cutoff.
+        if window.version == 0 || window.until == 0 {
+            window.until = now.saturating_add(1);
+            window.page = 1;
+            window.poll_interval = 60;
+        }
+        window.version = 1;
+        ensure!(
+            window.page > 0 && window.page <= 1_000_000,
+            "GitHub checkpoint page is invalid"
+        );
         ensure!(
             window.since < window.until,
             "GitHub checkpoint window is invalid"
@@ -247,14 +276,25 @@ impl GitHubSource {
             || fields.status != "ok"
             || invalid
             || output.truncated
-            || !scan.exhausted
+            || !scan.complete_page
         {
             return batch;
         }
-        window.not_before = now.saturating_add(scan.poll_interval.max(60));
-        window.since = window.until.saturating_sub(120);
-        window.until = 0;
-        batch.coverage = SourceCoverage::Complete;
+        window.poll_interval = window.poll_interval.max(scan.poll_interval);
+        if let Some(next) = scan.next_page {
+            if window.page.checked_add(scan.pages) != Some(next) {
+                return batch;
+            }
+            window.page = next;
+            window.not_before = 0;
+            batch.coverage = SourceCoverage::More;
+        } else {
+            window.not_before = now.saturating_add(window.poll_interval.max(60));
+            window.since = window.until.saturating_sub(120);
+            window.until = 0;
+            window.page = 1;
+            batch.coverage = SourceCoverage::Complete;
+        }
         if let Ok(value) = serde_json::to_string(&window) {
             batch.checkpoint = Some(SourceCheckpoint { value });
         }
@@ -264,6 +304,12 @@ impl GitHubSource {
 
 #[async_trait::async_trait]
 impl Source for GitHubSource {
+    fn configuration(&self) -> SourceConfig {
+        SourceConfig::GitHub {
+            enabled: true,
+            namespaces: Some(vec![self.namespace.clone()]),
+        }
+    }
     fn key(&self) -> SourceKey {
         SourceKey {
             provider: "github".into(),
@@ -296,9 +342,11 @@ impl Source for GitHubSource {
         // before capture so repository metadata cannot crowd out notifications.
         let argv = vec![
             "switchboard".into(), "github.cli.read".into(), "--ns".into(), self.namespace.clone(), "--json".into(), "--".into(),
-            "api".into(), "notifications".into(), "--method".into(), "GET".into(), "--include".into(), "--paginate".into(),
+            "api".into(), "notifications".into(), "--method".into(), "GET".into(), "--include".into(),
             "-F".into(), "all=true".into(), "-F".into(), "per_page=50".into(),
             "-F".into(), format!("since={}", utc_timestamp(window.since)?),
+            "-F".into(), format!("before={}", utc_timestamp(window.until)?),
+            "-F".into(), format!("page={}", window.page),
             "--jq".into(), "map({id,updated_at,reason,repository:{full_name:.repository.full_name},subject:{title:.subject.title,url:.subject.url,latest_comment_url:.subject.latest_comment_url,type:.subject.type}})".into(),
         ];
         Ok(match read_command(&argv).await {
@@ -311,12 +359,15 @@ impl Source for GitHubSource {
     }
 }
 
-/// `gh --include --paginate` emits one HTTP header block and JSON array per
-/// page. Keep earlier pages when a later response or projection fails.
+/// A page contains native HTTP headers followed by its projected JSON array.
+/// Accept retained aggregate fixtures too; a malformed later page keeps earlier
+/// evidence but cannot advance its durable checkpoint.
 fn parse_scan(output: &str) -> Result<Scan> {
     let mut scan = Scan {
         notifications: Vec::new(),
-        exhausted: false,
+        next_page: None,
+        complete_page: false,
+        pages: 0,
         poll_interval: 60,
     };
     let mut remaining = output.trim_start();
@@ -328,14 +379,16 @@ fn parse_scan(output: &str) -> Result<Scan> {
             Err(error) => return Err(error),
         };
         parsed_page = true;
+        scan.pages += 1;
         scan.notifications.extend(page.notifications);
         scan.poll_interval = scan.poll_interval.max(page.poll_interval);
         remaining = tail.trim_start();
         if remaining.is_empty() {
-            scan.exhausted = !page.has_next;
+            scan.next_page = page.next_page;
+            scan.complete_page = true;
             return Ok(scan);
         }
-        if !page.has_next {
+        if page.next_page.is_none() {
             return Ok(scan);
         }
     }
@@ -354,7 +407,7 @@ fn parse_page(output: &str) -> Result<(Page, &str)> {
         status.starts_with("HTTP/") && status.split_whitespace().nth(1) == Some("200"),
         "GitHub notification request failed"
     );
-    let mut has_next = false;
+    let mut next_page = None;
     let mut poll_interval = 60;
     for line in headers.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -379,10 +432,34 @@ fn parse_page(output: &str) -> Result<(Page, &str)> {
                     .split(';')
                     .find_map(|param| param.trim().strip_prefix("rel="))
                     .context("Missing GitHub pagination relation")?;
-                has_next |= relation
+                let is_next = relation
                     .trim_matches('"')
                     .split_whitespace()
                     .any(|relation| relation == "next");
+                if is_next {
+                    ensure!(next_page.is_none(), "Duplicate GitHub next-page relation");
+                    let target = target
+                        .trim()
+                        .strip_prefix('<')
+                        .context("Invalid GitHub pagination target")?;
+                    let (endpoint, query) = target
+                        .split_once('?')
+                        .context("Missing GitHub pagination query")?;
+                    ensure!(
+                        endpoint.starts_with("https://") && endpoint.ends_with("/notifications"),
+                        "GitHub pagination target changed endpoint"
+                    );
+                    let page = query
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("page="))
+                        .context("Missing GitHub next-page number")?
+                        .parse::<u32>()?;
+                    ensure!(
+                        page > 1 && page <= 1_000_000,
+                        "Invalid GitHub next-page number"
+                    );
+                    next_page = Some(page);
+                }
             }
         }
     }
@@ -391,7 +468,7 @@ fn parse_page(output: &str) -> Result<(Page, &str)> {
     Ok((
         Page {
             notifications,
-            has_next,
+            next_page,
             poll_interval,
         },
         &body[json.byte_offset()..],
@@ -623,15 +700,15 @@ mod tests {
     }
 
     #[test]
-    fn native_pagination_requires_the_final_page_even_when_an_earlier_page_is_valid() {
+    fn each_valid_page_advances_its_continuation_before_the_scan_finishes() {
         let source = source();
         let missing = source.normalize(
             output(NOTIFICATION, true),
             source.window(None, 1_700_000_000).unwrap(),
             1_700_000_000,
         );
-        assert!(matches!(missing.coverage, SourceCoverage::Partial { .. }));
-        assert!(missing.checkpoint.is_none());
+        assert_eq!(missing.coverage, SourceCoverage::More);
+        assert!(missing.checkpoint.is_some());
         assert_eq!(missing.events[0].id, "123456");
         let complete = source.normalize(
             paginated(&[output(NOTIFICATION, true), output("[]", false)]),
@@ -641,6 +718,64 @@ mod tests {
         assert_eq!(complete.coverage, SourceCoverage::Complete);
         assert_eq!(complete.events.len(), 1);
         assert!(complete.checkpoint.is_some());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PageCheckpoint {
+        since: u64,
+        until: u64,
+        page: u32,
+        not_before: u64,
+    }
+
+    #[test]
+    fn page_checkpoint_continues_the_frozen_window_after_restart() {
+        let source = source();
+        let first = source.normalize(
+            output(NOTIFICATION, true),
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert_eq!(
+            first.coverage,
+            SourceCoverage::More,
+            "A complete native page must make durable progress without reading all remaining pages"
+        );
+        let checkpoint = first.checkpoint.unwrap();
+        let saved: PageCheckpoint = serde_json::from_str(&checkpoint.value).unwrap();
+        assert_eq!(saved.page, 2);
+        assert_eq!(saved.until, 1_700_000_001);
+        assert_eq!(saved.not_before, 0);
+        let reopened = source.window(Some(&checkpoint), 1_700_000_500).unwrap();
+        let retained: PageCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&reopened).unwrap()).unwrap();
+        assert_eq!(retained.until, saved.until);
+        assert_eq!(retained.since, saved.since);
+        assert_eq!(retained.page, 2);
+        let second = source.normalize(output("[]", false), reopened, 1_700_000_500);
+        assert_eq!(second.coverage, SourceCoverage::Complete);
+        let completed: PageCheckpoint =
+            serde_json::from_str(&second.checkpoint.unwrap().value).unwrap();
+        assert_eq!(completed.since, saved.until - 120);
+        assert_eq!(completed.until, 0);
+        assert_eq!(completed.not_before, 1_700_000_620);
+    }
+
+    #[test]
+    fn an_unexpected_next_page_cannot_skip_unread_notification_pages() {
+        let source = source();
+        let mut response = output(NOTIFICATION, true);
+        response.stdout = response
+            .stdout
+            .replace("notifications?page=2", "notifications?page=3");
+        let page = source.normalize(
+            response,
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert!(matches!(page.coverage, SourceCoverage::Partial { .. }));
+        assert!(page.checkpoint.is_none());
+        assert_eq!(page.events.len(), 1);
     }
 
     #[test]

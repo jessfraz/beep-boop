@@ -79,6 +79,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
     outcome: occurrence.job.prompt, model: occurrence.job.model,
     sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] });
   const conversation = await tasks.conversation(task.conversation_id);
+  await session.commit((tx) => tasks.inference.assignClassIn(tx, conversation, "cron"), BACKGROUND_CONTEXT);
   let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
   if (submission?.status === "done") return;
   if (submission?.status === "unanswered") { await recoverQuotaTask(session, tasks, sources, id, occurrence.id, signal); return; }

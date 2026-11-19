@@ -105,7 +105,7 @@ pub struct SourceBatch {
 }
 
 impl SourceBatch {
-    fn unavailable(source: SourceKey, message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(source: SourceKey, message: impl Into<String>) -> Self {
         Self {
             source,
             events: Vec::new(),
@@ -234,6 +234,7 @@ fn discovery_failure(error: &anyhow::Error, fallback: &str) -> String {
 #[async_trait::async_trait]
 pub trait Source: Debug + Send + Sync {
     fn key(&self) -> SourceKey;
+    fn configuration(&self) -> SourceConfig;
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch>;
 }
 

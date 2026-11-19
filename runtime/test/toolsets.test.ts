@@ -115,7 +115,8 @@ test("the main profile exposes usable inventory and explicit compact or full tas
           fauxToolCall("read_source_events", {}), fauxToolCall("read_task", { task_id: task.id, include_history: false })], { stopReason: "toolUse" });
       },
       (input) => {
-        for (const name of ["read_resources", "list_jobs", "read_source_events"]) assert.equal(toolResult(input, name), "[]");
+        for (const name of ["read_resources", "list_jobs"]) assert.equal(toolResult(input, name), "[]");
+        assert.deepEqual(JSON.parse(toolResult(input, "read_source_events")), { events: [], cursor: null, complete: true, scanned: 0 });
         const compact: unknown = JSON.parse(toolResult(input, "read_task")); assert.ok(object(compact));
         assert.equal("history" in compact, false); assert.equal(JSON.stringify(compact).includes("ORIGINAL_TASK_EVIDENCE"), false);
         return fauxAssistantMessage(fauxToolCall("read_task", { task_id: task.id, include_history: true }), { stopReason: "toolUse" });
