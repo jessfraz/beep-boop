@@ -13,12 +13,12 @@ import { legacySourceWorkResources } from "./source-work.js";
 
 export type SourceRecord = { key: string; event: SourceEvent;
   decision: { type: "task"; task_id: string } | { type: "dismissed"; reason: string } | null;
-  outcome?: TaskOutcome; occurred_at?: number; work_resource?: string };
+  outcome?: TaskOutcome; occurred_at?: number; received_at?: number; work_resource?: string };
 export type SourceEntity = { source: SourceRef; revision: number; decision_revision: number; pending: number;
   owner_task_id: string | null; claim_id: string | null; next_newest: boolean };
 type Entity = SourceEntity & { ready_order: string | null; oldest_order: string | null; outcome_owner: string | null; owner_links: number };
 type Projection = { ordinal: number; entity: string; source: SourceRef; order: string; pending: boolean;
-  decision: string; owner_task_id: string | null; resources: string[] };
+  decision: string; owner_task_id: string | null; resources: string[]; receipt_ordered?: true };
 type Reference = SourceRef & { key: string; pending: boolean };
 type Position = { key: string; at: number | null };
 type Counts = { retained: number; pending: number; dirty_entities: number };
@@ -155,13 +155,14 @@ export class SourceIndex {
     const ordered = retainedOrder(record.key, ordinal), id = sourceEntityId(record), source = record.event.source;
     if (ordinal >= Number.MAX_SAFE_INTEGER) throw new Error("Source projection revision exceeds safe integer range");
     const at = record.occurred_at ?? record.event.occurred_at ?? null;
-    const order = number(at ?? 0) + ":" + ordered, pending = record.decision === null, signature = decision(record);
+    const receiptOrdered = at === null && record.received_at !== undefined;
+    const order = number(at ?? record.received_at ?? 0) + ":" + ordered, pending = record.decision === null, signature = decision(record);
     const owner = record.decision?.type === "task" ? record.decision.task_id : null;
     const previous = await this.lookup.getIn(tx, "events", record.key);
     if (previous !== undefined && (previous.ordinal !== ordinal || previous.entity !== id || sourceReference(previous.source) !== sourceReference(source))) {
       throw new Error("An immutable source projection identity changed");
     }
-    if (previous?.order === order && previous.decision === signature) return;
+    if (previous?.order === order && previous.decision === signature && (previous.receipt_ordered === true) === receiptOrdered) return;
     const entity = await this.entities.getIn(tx, "entities", id) ?? { source: { ...source }, revision: 0, decision_revision: 0,
       pending: 0, owner_task_id: null, claim_id: null, next_newest: true, ready_order: null, oldest_order: null,
       outcome_owner: record.outcome?.task_id ?? null, owner_links: 0 };
@@ -181,7 +182,11 @@ export class SourceIndex {
     }
     for (const position of [stream(source), id]) {
       if (previous?.pending === true && (!pending || previous.order !== order)) await this.positions.deleteIn(tx, position, previous.order);
-      if (pending && (previous?.pending !== true || previous.order !== order)) await this.positions.setIn(tx, position, order, { key: record.key, at });
+      // A newly learned provider clock may equal the first receipt's ordering
+      // key. Its diagnostic timestamp still changes from unknown to known.
+      if (pending && (previous?.pending !== true || previous.order !== order || (previous.receipt_ordered === true) !== receiptOrdered)) {
+        await this.positions.setIn(tx, position, order, { key: record.key, at });
+      }
     }
     if (previous === undefined) await this.positions.setIn(tx, JSON.stringify(["retained", id]), ordered, { key: record.key, at });
     if (previous?.owner_task_id !== null && previous?.owner_task_id !== undefined && previous.owner_task_id !== owner) {
@@ -205,7 +210,7 @@ export class SourceIndex {
       ? (await this.owners.rangeIn(tx, id, { reverse: true, limit: 1 }))[0]?.value.task_id ?? null : entity.outcome_owner;
     if (entity.owner_links < 0 || entity.owner_links > 0 && entity.owner_task_id === null) throw new Error("Source entity ownership is inconsistent");
     await this.lookup.setIn(tx, "events", record.key, { ordinal, entity: id, source: { ...source }, order, pending,
-      decision: signature, owner_task_id: owner, resources });
+      decision: signature, owner_task_id: owner, resources, ...(receiptOrdered ? { receipt_ordered: true } : {}) });
     await this.adjust(tx, source, previous === undefined ? 1 : 0, pendingDelta, Number(entity.pending > 0) - Number(beforePending > 0));
     await this.queue(tx, id, entity);
   }

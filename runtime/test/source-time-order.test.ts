@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import type { SourceEvent } from "../src/generated/SourceEvent.js";
 import { ConversationModels } from "../src/models.js";
 import { SourceJournal } from "../src/sources.js";
 import { TaskStore } from "../src/tasks.js";
+import { LegacySources } from "./fixtures/state-storage.js";
 
 async function open(directory: string) {
   const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
@@ -102,4 +104,47 @@ test("invalid provider times cannot mutate source evidence or advance its checkp
     assert.deepEqual(await app.sources.events({ provider: "google" }), []);
     assert.ok((await app.sources.states()).every((state) => state.source.provider !== "google"));
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("receipt freshness is immutable, provider clocks take precedence and legacy undated originals remain backfill", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-receipt-order-")); let app = await open(directory);
+  const now = Date.UTC(2035, 0, 1), source = { provider: "google", account: "alpha" };
+  t.mock.timers.enable({ apis: ["Date"], now });
+  try {
+    const original = event("legacy-undated"), key = createHash("sha256").update(JSON.stringify([source.provider, source.account, original.id, original.version])).digest("hex");
+    await app.session.commit(async tx => {
+      const legacy = await tx.doc(LegacySources); legacy.events.push({ key, event: original, decision: null });
+      legacy.sources.push({ source, checkpoint: null, coverage: { status: "complete" }, checked_at: 1 });
+    }, BACKGROUND_CONTEXT);
+    const retainedLegacy = await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT);
+    await app.sources.prepare();
+    const undated = event("received-undated"), old = event("known-old", "alpha", now - 86_400_000), epoch = event("epoch", "alpha", 0);
+    await app.sources.admit({ source, events: [undated, old, epoch], coverage: { status: "complete" }, checkpoint: null }, null);
+    const admitted = await app.sources.events({ limit: 100 }), received = admitted.find(record => record.event.id === undated.id); assert.ok(received);
+    assert.equal(received.received_at, now); assert.equal(admitted.find(record => record.key === key)?.received_at, undefined);
+    assert.ok(admitted.filter(record => record.event.occurred_at !== undefined).every(record => record.received_at === undefined));
+    await app.session.commit(async tx => {
+      const pending = await app.sources.index.streamPendingIn(tx, source, { limit: 10 });
+      const ordered: string[] = [];
+      for (const item of pending) { const record = await app.sources.sourceRecordIn(tx, item.key); assert.ok(record); ordered.push(record.event.id); }
+      assert.deepEqual(ordered, [original.id, epoch.id, old.id, undated.id]);
+      assert.deepEqual((await app.sources.index.entitiesIn(tx, source, { fresh: true, now, limit: 10 })).map(entity => entity.source.thread_id), [undated.id]);
+    }, BACKGROUND_CONTEXT);
+    t.mock.timers.tick(3_600_000);
+    await app.sources.admit({ source, events: [original, undated], coverage: { status: "complete" }, checkpoint: null }, null);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); await app.sources.prepare();
+    assert.deepEqual(await app.sources.originals([key, received.key]), [received, { key, event: original, decision: null }]);
+    await app.session.commit(async tx => {
+      assert.deepEqual(await app.sources.index.entitiesIn(tx, source, { fresh: true, now: Date.now(), limit: 10 }), [],
+        "A duplicate page must not refresh either a first receipt or an undated legacy original");
+    }, BACKGROUND_CONTEXT);
+    await app.sources.decide(admitted.filter(record => record.key !== received.key).map(record => record.key), { type: "dismissed", reason: "Retained comparison originals reviewed" });
+    assert.equal(await app.session.commit(tx => app.sources.index.countsIn(tx, source), BACKGROUND_CONTEXT).then(counts => counts.oldest_pending_at), null);
+    await app.sources.admit({ source, events: [{ ...undated, occurred_at: now }], coverage: { status: "complete" }, checkpoint: null }, null);
+    assert.equal(await app.session.commit(tx => app.sources.index.countsIn(tx, source), BACKGROUND_CONTEXT).then(counts => counts.oldest_pending_at), now,
+      "Provider-time enrichment must update diagnostics even when its time equals the receipt ordering key");
+    const enriched = (await app.sources.originals([received.key]))[0]; assert.ok(enriched);
+    assert.deepEqual(enriched.event, undated); assert.equal(enriched.received_at, now); assert.equal(enriched.occurred_at, now);
+    assert.deepEqual(await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT), retainedLegacy);
+  } finally { t.mock.timers.reset(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

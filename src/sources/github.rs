@@ -11,7 +11,7 @@ use crate::{
     protocol::SourceRef,
     sources::{
         ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
-        SourceEvent, SourceKey, now_seconds, read_command,
+        SourceEvent, SourceKey, now_seconds, read_command, rfc3339_millis,
     },
 };
 
@@ -210,7 +210,8 @@ impl GitHubSource {
                     invalid = true;
                     return None;
                 };
-                if parse_timestamp(&notification.updated_at).is_err() {
+                let occurred_at = rfc3339_millis(&notification.updated_at);
+                if occurred_at.is_none() {
                     invalid = true;
                     return None;
                 }
@@ -248,7 +249,7 @@ impl GitHubSource {
                     hex::encode(digest.finalize())
                 );
                 Some(SourceEvent {
-                    occurred_at: None,
+                    occurred_at,
                     id: notification.id.clone(),
                     version,
                     legacy_version: None,
@@ -481,12 +482,6 @@ fn utc_timestamp(seconds: u64) -> Result<String> {
     Ok(date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-fn parse_timestamp(value: &str) -> Result<u64> {
-    Ok(chrono::DateTime::parse_from_rfc3339(value)?
-        .timestamp()
-        .try_into()?)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::sources::{
@@ -607,6 +602,54 @@ mod tests {
         assert!(
             matches!(batch.coverage, SourceCoverage::Unavailable { message } if message.starts_with("Source helper storage failure during persistence;") && !message.contains("private-token"))
         );
+    }
+
+    #[test]
+    fn provider_update_time_is_retained_as_milliseconds_without_changing_notification_provenance() {
+        let source = source();
+        let body = NOTIFICATION.replace("2023-11-14T21:00:00Z", "2023-11-14T16:00:00.123-05:00");
+        let first = source.normalize(
+            output(&body, false),
+            source.window(None, 1_700_000_000).unwrap(),
+            1_700_000_000,
+        );
+        assert_eq!(first.coverage, SourceCoverage::Complete);
+        assert_eq!(first.events.len(), 1);
+        let event = &first.events[0];
+        assert_eq!(event.occurred_at, Some(1_699_995_600_123));
+        assert_eq!(event.id, "123456");
+        assert!(event.version.starts_with("2023-11-14T16:00:00.123-05:00:"));
+        assert!(
+            event
+                .text
+                .contains("Updated: 2023-11-14T16:00:00.123-05:00")
+        );
+        let repeated = source.normalize(
+            output(&body, false),
+            source.window(None, 1_700_000_500).unwrap(),
+            1_700_000_500,
+        );
+        assert_eq!(event.id, repeated.events[0].id);
+        assert_eq!(event.version, repeated.events[0].version);
+        assert_eq!(event.text, repeated.events[0].text);
+        for updated in [
+            "",
+            "unknown",
+            "1969-12-31T23:59:59.999Z",
+            "999999-01-01T00:00:00Z",
+        ] {
+            let invalid = source.normalize(
+                output(
+                    &NOTIFICATION.replace("2023-11-14T21:00:00Z", updated),
+                    false,
+                ),
+                source.window(None, 1_700_000_000).unwrap(),
+                1_700_000_000,
+            );
+            assert!(invalid.events.is_empty());
+            assert!(matches!(invalid.coverage, SourceCoverage::Partial { .. }));
+            assert!(invalid.checkpoint.is_none());
+        }
     }
 
     #[test]

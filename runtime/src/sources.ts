@@ -209,7 +209,7 @@ export class SourceJournal {
     const event: SourceEvent = { id: outcome.task_id + ":" + outcome.conversation_id,
       version: createHash("sha256").update(JSON.stringify([outcome, attemptId ?? null])).digest("hex"),
       source: { ...OUTCOMES, thread_id: outcome.task_id }, title: "Task " + outcome.state.state,
-      text: JSON.stringify(outcome) };
+      text: JSON.stringify(outcome), occurred_at: Date.now() };
     const key = eventKey(event);
     if (await this.sourceRecordIn(tx, key) !== undefined) return;
     for await (const page of this.relatedPagesIn(tx, "outcome:" + JSON.stringify([outcome.task_id, outcome.conversation_id]), true)) for (const record of page) {
@@ -448,7 +448,8 @@ export class SourceJournal {
             await this.indexIn(tx, saved);
           }
         } else {
-          const record = await this.insertOriginalIn(tx, key, { key, event, decision: null });
+          const record = await this.insertOriginalIn(tx, key, { key, event, decision: null,
+            ...(event.occurred_at === undefined ? { received_at: Date.now() } : {}) });
           await this.indexIn(tx, record.value); records.set(key, record.value);
           if (record.inserted) { new_events += 1; (await tx.doc(SourceMetrics)).admitted_events += 1; }
         }

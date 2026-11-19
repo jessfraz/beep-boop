@@ -15,7 +15,7 @@ use crate::{
     sources::{
         ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
         SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds,
-        read_command,
+        read_command, rfc3339_millis,
     },
 };
 
@@ -560,7 +560,7 @@ impl MessagesSource {
                     let version =
                         hex::encode(Sha256::digest(serde_json::to_vec(&(&title, &text))?));
                     events.push(SourceEvent {
-                        occurred_at: None,
+                        occurred_at: message.date.as_deref().and_then(rfc3339_millis),
                         id: message.id,
                         version,
                         legacy_version: None,
@@ -922,6 +922,61 @@ mod tests {
             source
                 .normalize(clipped, source.window(None, NOW).unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_message_clock_retains_milliseconds_and_undated_messages_keep_their_originals() {
+        let source = MessagesSource::local();
+        let dates = [
+            Some("2023-11-14T16:00:00.123-05:00"),
+            None,
+            Some("unknown"),
+            Some("1969-12-31T23:59:59.999Z"),
+            Some("999999-01-01T00:00:00Z"),
+        ];
+        let originals: Vec<_> = dates
+            .iter()
+            .enumerate()
+            .map(|(index, date)| {
+                let mut value = message(&format!("message-{index}"), "chat-example");
+                value.date = date.map(str::to_owned);
+                value
+            })
+            .collect();
+        let native = Response::Messages {
+            scanned_messages: originals.len() as u64,
+            messages: originals,
+            next_cursor: None,
+            unsupported_bodies: 0,
+        };
+        let first = source
+            .normalize(output(&native), messages(&["chat-example"], None))
+            .unwrap();
+        assert_eq!(first.coverage, SourceCoverage::Complete);
+        assert_eq!(first.events.len(), 5);
+        assert_eq!(first.events[0].occurred_at, Some(1_699_995_600_123));
+        assert!(
+            first.events[1..]
+                .iter()
+                .all(|event| event.occurred_at.is_none())
+        );
+        let repeated = source
+            .normalize(output(&native), messages(&["chat-example"], None))
+            .unwrap();
+        for (before, after) in first.events.iter().zip(&repeated.events) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.version, after.version);
+            assert_eq!(before.text, after.text);
+        }
+        let retained: Message = serde_json::from_str(&first.events[0].text).unwrap();
+        assert_eq!(
+            retained.date.as_deref(),
+            Some("2023-11-14T16:00:00.123-05:00")
+        );
+        assert_eq!(
+            retained.text.as_deref(),
+            Some("The example component arrived.")
         );
     }
 

@@ -501,6 +501,14 @@ pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {
     })
 }
 
+pub(crate) fn rfc3339_millis(value: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .timestamp_millis()
+        .try_into()
+        .ok()
+}
+
 fn now_seconds() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)

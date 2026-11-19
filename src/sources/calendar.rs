@@ -11,7 +11,7 @@ use crate::{
     sources::{
         ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
         SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit,
-        google::GoogleSource, now_seconds, read_command,
+        google::GoogleSource, now_seconds, read_command, rfc3339_millis,
     },
 };
 
@@ -440,7 +440,7 @@ impl CalendarSource {
                         text.push_str("\n[Excerpt; read the original event for full details.]");
                     }
                     events.push(SourceEvent {
-                        occurred_at: None,
+                        occurred_at: event.updated.as_deref().and_then(rfc3339_millis),
                         id: id.clone(),
                         version,
                         legacy_version: None,
@@ -607,6 +607,41 @@ mod tests {
             renewed.phase,
             Phase::Calendars { cursor: None, .. }
         ));
+    }
+
+    #[test]
+    fn provider_update_clock_precedes_future_event_start_and_unknown_clocks_remain_absent() {
+        let source = source();
+        let body = r#"{"kind":"calendar#events","items":[{"id":"future-event","etag":"stable-version","updated":"2023-11-14T16:00:00.123-05:00","start":{"dateTime":"2099-01-01T12:00:00Z"}},{"id":"undated-event","etag":"undated-version","start":{"date":"2099-01-02"}},{"id":"malformed","etag":"bad-version","updated":"unknown"},{"id":"negative","etag":"negative-version","updated":"1969-12-31T23:59:59.999Z"},{"id":"unrepresentable","etag":"out-of-range-version","updated":"999999-01-01T00:00:00Z"}]}"#;
+        let first = source
+            .normalize(output(body), events_window(&source))
+            .unwrap();
+        assert_eq!(first.events.len(), 5);
+        assert_eq!(first.events[0].occurred_at, Some(1_699_995_600_123));
+        assert!(
+            first.events[1..]
+                .iter()
+                .all(|event| event.occurred_at.is_none())
+        );
+        assert_eq!(first.events[0].version, "stable-version");
+        let original: Event =
+            serde_json::from_str(first.events[0].text.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            original.updated.as_deref(),
+            Some("2023-11-14T16:00:00.123-05:00")
+        );
+        assert_eq!(
+            original.start.unwrap().date_time.as_deref(),
+            Some("2099-01-01T12:00:00Z")
+        );
+        let repeated = source
+            .normalize(output(body), events_window(&source))
+            .unwrap();
+        for (before, after) in first.events.iter().zip(&repeated.events) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.version, after.version);
+            assert_eq!(before.text, after.text);
+        }
     }
 
     #[test]

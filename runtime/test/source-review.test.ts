@@ -13,6 +13,7 @@ import { CoordinatorEnvironment } from "../src/environment.js";
 import type { ScheduledJobStatus } from "../src/generated/ScheduledJobStatus.js";
 import type { SourceEvent } from "../src/generated/SourceEvent.js";
 import type { SourceReviewDecision } from "../src/generated/SourceReviewDecision.js";
+import type { TaskOutcome } from "../src/generated/TaskOutcome.js";
 import { ConversationModels } from "../src/models.js";
 import { createGuidance } from "../src/guidance.js";
 import { SourceReviews, type SourceReviewOptions } from "../src/source-review.js";
@@ -132,6 +133,43 @@ test("native reviewers overlap only disjoint entities and leave arrivals outside
     assert.equal(await app.reviews.review(0, controller.signal), true);
     assert.deepEqual(await app.sources.events({ pending: true }), []);
   } finally { hold.release(); controller.abort(); await Promise.allSettled(running); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new local task outcomes reach the dedicated fresh reviewer and retain their first publication time across duplicate replay and reopen", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcome-freshness-")), path = join(directory, "session.sqlite");
+  let app = await open(path, { workers: 2 }); const controller = new AbortController();
+  try {
+    const task = await app.tasks.create({ title: "Completed local task", outcome: "Retain the local result" });
+    const outcome: TaskOutcome = { task_id: task.id, conversation_id: task.conversation_id, entry_id: null, tool_call_id: null,
+      summary: "A current local result", sources: [], state: { state: "progress" } };
+    const before = Date.now(); await app.session.commit(tx => app.sources.recordIn(tx, outcome, false), BACKGROUND_CONTEXT); const after = Date.now();
+    const first = (await app.sources.events({ provider: "task_outcomes" }))[0]; assert.ok(first);
+    t.mock.timers.enable({ apis: ["Date"], now: after + 60_000 });
+    try { await app.session.commit(tx => app.sources.recordIn(tx, outcome, false), BACKGROUND_CONTEXT); }
+    finally { t.mock.timers.reset(); }
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 2 });
+    app.faux.setResponses([input => { assert.deepEqual(groups(input).flatMap(group => group.keys), [first.key]); return answer(dismissed(groups(input))); }, fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true, "A new local outcome must be selectable by the reserved fresh actor");
+    assert.ok(first.event.occurred_at !== undefined && first.event.occurred_at >= before && first.event.occurred_at <= after);
+    const saved = await app.sources.originals([first.key]); assert.equal(saved.length, 1); assert.deepEqual(saved[0]?.event, first.event);
+    assert.equal(saved[0]?.received_at, undefined); assert.deepEqual(saved[0]?.outcome, outcome);
+    const metrics = (await app.reviews.diagnostics()).metrics; assert.equal(metrics.admitted_events, 1); assert.equal(metrics.decided_events, 1);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new undated provider evidence reaches the fresh reviewer without inventing a provider timestamp", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-undated-freshness-")), app = await open(join(directory, "session.sqlite"), { workers: 2 });
+  const controller = new AbortController();
+  try {
+    const original = event("new-undated", "undated-thread"); delete original.occurred_at;
+    const before = Date.now(); await admit(app.sources, [original]); const after = Date.now();
+    const pending = (await app.sources.events({ pending: true }))[0]; assert.ok(pending);
+    assert.equal((await app.reviews.diagnostics()).streams.find(item => item.source.provider === "slack")?.oldest_pending_at, null);
+    app.faux.setResponses([input => { assert.deepEqual(groups(input).flatMap(group => group.keys), [pending.key]); return answer(dismissed(groups(input))); }, fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true, "First receipt supplies freshness when the provider has no usable clock");
+    assert.ok(pending.received_at !== undefined && pending.received_at >= before && pending.received_at <= after);
+    assert.deepEqual(pending.event, original); assert.equal(pending.event.occurred_at, undefined); assert.equal(pending.occurred_at, undefined);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a manual judgment fences the stale entity claim before it can enqueue task work", { timeout: 10_000 }, async () => {
