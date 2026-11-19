@@ -58,6 +58,8 @@ function notificationConfig(): ApnsConfig | undefined {
 }
 
 const VERSION = 1;
+// Rust's FrameReader applies this limit to the complete UTF-8 frame, including LF.
+const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 function stateDirectory(): string {
   const directory = process.argv[2];
   if (directory === undefined) throw new Error("State directory is required");
@@ -77,13 +79,28 @@ function emit(id: number, event: RuntimeEventKind): void {
   }
   writeEvent(id, event);
 }
-function writeEvent(id: number, event: RuntimeEventKind): void {
+function encodeEvent(id: number, event: RuntimeEventKind): { event: RuntimeEventKind; wire: string } {
   const frame: RuntimeEvent = { version: VERSION, id, event };
   if (!validEvent(frame)) throw new Error("Invalid runtime event");
+  const wire = JSON.stringify(frame) + "\n";
+  if (Buffer.byteLength(wire) <= MAX_FRAME_BYTES) return { event, wire };
+  const failure: RuntimeEventKind = { type: "failure", code: "invalid_request",
+    message: "The response exceeds the protocol size limit. Saved state is retained." };
+  return { event: failure, wire: JSON.stringify({ version: VERSION, id, event: failure } satisfies RuntimeEvent) + "\n" };
+}
+function writeEvent(id: number, event: RuntimeEventKind): void {
+  const write = event.type !== "text_delta" || mainObservers.has(id);
+  const encoded = encodeEvent(id, event);
+  if (encoded.event !== event) {
+    // End only the view that cannot receive its snapshot; model execution and
+    // durable inputs retain their existing owner.
+    mainObservers.get(id)?.close(); conversationViews.detach(id); mainViews.get(id)?.finish();
+  }
+  event = encoded.event;
   if (event.type === "main_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
   // Text deltas are an ObserveMain opt-in. Existing Chat clients deserialize a
   // closed event enum and must keep receiving their original canonical wire.
-  if (event.type !== "text_delta" || mainObservers.has(id)) process.stdout.write(`${JSON.stringify(frame)}\n`);
+  if (write) process.stdout.write(encoded.wire);
   if (mainTurns.has(id)) {
     for (const observer of mainObservers.values()) {
       const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
@@ -98,8 +115,9 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
     else if (view.live && ["activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings"].includes(event.type)) {
       // Views observe the existing execution. Native effects and notices keep
       // their original owner so reconnecting never executes a tool twice.
-      const mirrored: RuntimeEvent = { version: VERSION, id: viewId, event };
-      process.stdout.write(`${JSON.stringify(mirrored)}\n`);
+      const mirrored = encodeEvent(viewId, event);
+      process.stdout.write(mirrored.wire);
+      if (mirrored.event !== event) view.finish();
     }
   }
 }
