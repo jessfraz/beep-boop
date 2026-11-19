@@ -2749,6 +2749,7 @@
       "type": "string",
       "enum": [
         "foreground",
+        "email",
         "fresh",
         "cron",
         "backfill"
@@ -5586,6 +5587,22 @@
         "migration_ready": {
           "type": "boolean"
         },
+        "noise_policy_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "noise_policy_last_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "pending_events": {
           "type": "integer",
           "format": "uint64",
@@ -5638,6 +5655,12 @@
           "format": "uint64",
           "minimum": 0
         },
+        "coalesced_events": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
         "completed_reviews": {
           "type": "integer",
           "format": "uint64",
@@ -5646,6 +5669,12 @@
         "decided_events": {
           "type": "integer",
           "format": "uint64",
+          "minimum": 0
+        },
+        "expired_events": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
           "minimum": 0
         },
         "failed_reviews": {
@@ -5755,6 +5784,89 @@
         "input_bytes",
         "attempt",
         "started_at"
+      ]
+    },
+    "SourceReviewStatistics": {
+      "type": "object",
+      "properties": {
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "coalesced_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "complete_entry_timing_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "completed_reviews": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expired_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "notified_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "review_milliseconds": {
+          "type": "number",
+          "format": "double"
+        },
+        "reviewed_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "routed_events": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sampled_model_milliseconds": {
+          "type": "number",
+          "format": "double"
+        },
+        "sampled_model_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "reviewed_events",
+        "routed_events",
+        "notified_events",
+        "completed_reviews",
+        "expired_events",
+        "coalesced_events",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "review_milliseconds",
+        "sampled_model_milliseconds",
+        "sampled_model_requests",
+        "complete_entry_timing_samples"
       ]
     },
     "SourceScanPhase": {
@@ -5893,6 +6005,24 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "review": {
+          "$ref": "#/$defs/SourceReviewStatistics",
+          "default": {
+            "cache_read_tokens": 0,
+            "coalesced_events": 0,
+            "complete_entry_timing_samples": 0,
+            "completed_reviews": 0,
+            "expired_events": 0,
+            "input_tokens": 0,
+            "notified_events": 0,
+            "output_tokens": 0,
+            "review_milliseconds": 0.0,
+            "reviewed_events": 0,
+            "routed_events": 0,
+            "sampled_model_milliseconds": 0.0,
+            "sampled_model_requests": 0
+          }
         },
         "source": {
           "$ref": "#/$defs/SourceKey"

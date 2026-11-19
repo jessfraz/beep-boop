@@ -3,8 +3,10 @@ import { setImmediate } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { SourceEvent } from "./generated/SourceEvent.js";
+import type { SourceAttention } from "./generated/SourceAttention.js";
 import type { SourceKey } from "./generated/SourceKey.js";
 import type { SourceRef } from "./generated/SourceRef.js";
+import type { SourcePolicyDecision } from "./generated/SourcePolicyDecision.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import { OrderedIndex, type IndexRange } from "./ordered-index.js";
 import type { PartitionedRecords } from "./partitioned-records.js";
@@ -12,7 +14,9 @@ import { sourceReference } from "./tasks.js";
 import { legacySourceWorkResources } from "./source-work.js";
 
 export type SourceRecord = { key: string; event: SourceEvent;
-  decision: { type: "task"; task_id: string } | { type: "dismissed"; reason: string } | null;
+  attention?: SourceAttention;
+  decision: { type: "task"; task_id: string } | { type: "dismissed"; reason: string }
+    | { type: "skipped"; policy: SourcePolicyDecision } | null;
   outcome?: TaskOutcome; occurred_at?: number; received_at?: number; work_resource?: string };
 export type SourceEntity = { source: SourceRef; revision: number; decision_revision: number; pending: number;
   owner_task_id: string | null; claim_id: string | null; next_newest: boolean };

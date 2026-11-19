@@ -39,7 +39,7 @@ function argument(name: string, fallback: number, minimum: number, maximum: numb
 }
 function corpus(count: number, now: number): SourceEvent[] {
   return Array.from({ length: count }, (_, index) => {
-    const bucket = index % 20, provider = bucket < 13 ? "slack" : bucket < 17 ? "mail" : "github";
+    const bucket = index % 20, provider = bucket < 13 ? "slack" : bucket < 17 ? "google" : "github";
     const fresh = index % 4 === 0;
     // Slack carries 65% of the evidence; half of it shares four hot threads.
     // The rest spans enough independent entities to admit concurrent actors.
@@ -126,8 +126,8 @@ async function run(events: SourceEvent[], reviewers: number, latency: number): P
     })());
     await firstModel.promise;
     freshAdmitted = performance.now();
-    await sources.admit({ source: { provider: "mail", account: "fresh-probe-account" }, events: [{ id: "fresh-probe", version: "v1",
-      source: { provider: "mail", account: "fresh-probe-account", thread_id: "fresh-probe-thread" },
+    await sources.admit({ source: { provider: "google", account: "fresh-probe-account" }, events: [{ id: "fresh-probe", version: "v1",
+      source: { provider: "google", account: "fresh-probe-account", thread_id: "fresh-probe-thread" },
       title: "Fresh evidence arriving during catchup", text: "Invented current evidence", occurred_at: Date.now() }], checkpoint: null, coverage: { status: "complete" } }, null);
     await Promise.all(workers); await effectEntered.promise;
     const elapsed = performance.now() - began, diagnostics = await reviews.diagnostics();
@@ -164,7 +164,7 @@ const comparisons = [1, 2, 4].map(reviewers => {
 });
 process.stdout.write(JSON.stringify({ benchmark: "source_reviews_native_sqlite", corpus_events: events.length,
   timing_scope: "Review drain plus one fresh admission; initial corpus seeding is excluded.",
-  provider_events: Object.fromEntries(["slack", "mail", "github"].map(provider => [provider, events.filter(event => event.source.provider === provider).length])),
+  provider_events: Object.fromEntries(["slack", "google", "github"].map(provider => [provider, events.filter(event => event.source.provider === provider).length])),
   initial_fresh_events: events.filter(event => (event.occurred_at ?? 0) >= corpusNow - 15 * 60_000).length,
   idle_actor_poll_ms: 20, measurements, comparisons,
   interpretation: "Synthetic fixed latency model requests with real native SQLite admissions, decisions, task outbox and effect tasks. Zero latency runs measure application/native/faux overhead. Cases are separate executions and include system-load variation. Concurrent simulated wait totals overlap and cannot be subtracted from elapsed wall time. These are not real LLM throughput or provider quota estimates." }, null, 2) + "\n");

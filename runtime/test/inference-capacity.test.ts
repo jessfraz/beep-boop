@@ -19,7 +19,7 @@ import { FakeClock, pump, START } from "./fixtures/background-runtime.js";
 import { fixtureModel } from "./model.js";
 
 const zeroReservations = {
-  foreground: { requests: 0, tokens: 0 }, cron: { requests: 0, tokens: 0 },
+  foreground: { requests: 0, tokens: 0 }, email: { requests: 0, tokens: 0 }, cron: { requests: 0, tokens: 0 },
   fresh: { requests: 0, tokens: 0 }, backfill: { requests: 0, tokens: 0 },
 };
 const context = (text = "Review the new evidence.") => ({ messages: [{ role: "user", content: text, timestamp: START }] }) satisfies Parameters<ReturnType<typeof createModels>["streamSimple"]>[1];
@@ -78,12 +78,12 @@ test("backfill leaves real wrapped-provider capacity for foreground, fresh work 
   const app = await openControlled(new InferenceCapacity());
   try {
     const bulk = Array.from({ length: 6 }, (_, index) => app.request(`bulk-${index}`, "backfill"));
-    await pump(() => app.starts.length >= 4);
+    await pump(() => app.starts.length >= 3);
     await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(app.starts.length, 4, "Backfill must leave reserved provider capacity for other work");
+    assert.equal(app.starts.length, 3, "Backfill must leave reserved provider capacity for other work");
     const foreground = app.request("interactive", "foreground"), cron = app.request("scheduled", "cron"), fresh = app.request("new-signal", "fresh");
     await pump(() => app.active.has("interactive") && app.active.has("scheduled") && app.active.has("new-signal"));
-    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 4);
+    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 3);
     app.release("interactive"); app.release("scheduled"); app.release("new-signal");
     assert.equal((await foreground).stopReason, "stop"); assert.equal((await cron).stopReason, "stop"); assert.equal((await fresh).stopReason, "stop");
     for (let completed = 0; completed < 6; completed += 1) {
@@ -91,6 +91,39 @@ test("backfill leaves real wrapped-provider capacity for foreground, fresh work 
     }
     assert.ok((await Promise.all(bulk)).every(result => result.stopReason === "stop"));
     assert.ok(app.maxActive() <= 8);
+  } finally { await app.close(); }
+});
+
+test("email starts through the real wrapped provider while fresh work and backfill hold their capacity", async () => {
+  const models = createModels(); models.setProvider(fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }).provider);
+  const model = models.getModel("openai", "fixture"); assert.ok(model);
+  const cost = estimatedInferenceTokens(model, normalizeContext(context()), { maxTokens: 16 });
+  const app = await openControlled(new InferenceCapacity({ maxEstimatedTokens: cost * 8 }));
+  try {
+    const backfill = Array.from({ length: 2 }, (_, index) => app.request(`bulk-${index}`, "backfill"));
+    const fresh = [app.request("held-fresh-one", "fresh"), app.request("held-fresh-two", "fresh")];
+    const foreground = [app.request("interactive-one", "foreground"), app.request("interactive-two", "foreground")];
+    const cron = app.request("held-cron", "cron");
+    await pump(() => app.active.size === 7);
+    const queuedFresh = app.request("queued-fresh", "fresh");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(app.starts.includes("queued-fresh"), false, "Ordinary fresh work must leave the email reservation available");
+    const email = app.request("priority-email", "email");
+    await pump(() => app.active.has("priority-email"));
+    assert.equal(app.active.size, 8, "Email owns both a request and estimated-token reservation beside held work");
+    assert.equal(app.starts.includes("queued-fresh"), false);
+    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 2);
+    app.release("priority-email");
+    assert.equal((await email).stopReason, "stop");
+    app.release("interactive-one"); app.release("interactive-two"); app.release("held-cron");
+    app.release("held-fresh-one"); app.release("held-fresh-two");
+    await Promise.all([...foreground, ...fresh, cron]);
+    for (let index = 0; index < backfill.length; index++) {
+      const id = `bulk-${index}`; await pump(() => app.active.has(id)); app.release(id);
+    }
+    await pump(() => app.active.has("queued-fresh")); app.release("queued-fresh");
+    assert.ok((await Promise.all([...backfill, queuedFresh])).every(result => result.stopReason === "stop"));
+    assert.equal(app.maxActive(), 8);
   } finally { await app.close(); }
 });
 
@@ -238,11 +271,11 @@ test("work classification survives configure-before-model, model edits and nativ
       return fauxAssistantMessage("Done.");
     }));
     // The restored provider session's persisted class must enforce backfill's
-    // four-request ceiling; treating it as foreground would admit a fifth.
+    // three-request ceiling; treating it as foreground would admit a fourth.
     const model = app.models.getModel("openai", "fixture"); assert.ok(model);
     calls = Array.from({ length: 5 }, () => app.models.streamSimple(model, context(), { sessionId: connection.sessionId, maxTokens: 16 }).result());
-    await pump(() => starts.length === 4);
-    assert.equal(starts.length, 4);
+    await pump(() => starts.length === 3);
+    assert.equal(starts.length, 3);
     for (const release of active.splice(0)) release();
     await pump(() => starts.length === 5); for (const release of active.splice(0)) release(); await Promise.all(calls);
   } finally {

@@ -249,6 +249,7 @@ impl GitHubSource {
                     hex::encode(digest.finalize())
                 );
                 Some(SourceEvent {
+                    attention: None,
                     occurred_at,
                     id: notification.id.clone(),
                     version,

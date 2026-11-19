@@ -2,30 +2,34 @@ import { createHash, randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { defineDoc, defineDocFamily, defineExtension, defineTask, defineTool, ROOT_CONVERSATION_ID,
-  type Conversation, type Extension, type Harness, type Registry, type TaskId, type ToolExecutionResult } from "@earendil-works/pi-durable";
+  UsageDoc, type Conversation, type Extension, type Harness, type Registry, type TaskId, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { SourcePipelineDiagnostics } from "./generated/SourcePipelineDiagnostics.js";
 import type { SourceCollectorDiagnostics } from "./generated/SourceCollectorDiagnostics.js";
 import type { SourceReviewDecision } from "./generated/SourceReviewDecision.js";
 import type { SourceRef } from "./generated/SourceRef.js";
+import type { SourceKey } from "./generated/SourceKey.js";
 import type { ScheduledJobStatus } from "./generated/ScheduledJobStatus.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import { SourceJournal, recoverSourceRun, type StoredEvent } from "./sources.js";
-import { SourceMetrics, emptySourceMetrics } from "./source-metrics.js";
+import { SourceMetrics, SourceStatistics, emptySourceMetrics, emptyReviewStatistics } from "./source-metrics.js";
+import { SourceNoisePolicy, sourceStatisticsKey } from "./source-policy.js";
 import { Executions } from "./tools.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore } from "./tasks.js";
 import { scheduledTaskId } from "./scheduled.js";
 import { sourceWorkResource, sourceWorkResources } from "./source-work.js";
 
-type ReviewClass = "fresh" | "backfill";
+type ReviewClass = "email" | "fresh" | "backfill";
 type Capture = { id: string; revision: number; decision_revision: number; keys: string[]; group: string };
 type Effect = { type: "task"; task_id: string } | { type: "notice"; keys: string[]; task_id: string | null; text: string; call_id: string; identity: string };
 type Claim = { id: string; slot: number; conversation_id: string; class: ReviewClass; started_at: number; attempt: number;
+  source?: SourceKey; usage_recorded?: boolean;
   model: ModelSelection | null; review_done: boolean;
   captures: Capture[]; keys: string[]; content: string | null; phase: "review" | "applied" | "complete";
   proposal: string | null; effects: Effect[]; effects_task: TaskId | null; effect_cursor: number };
 type ReviewState = { generation: number; enabled: boolean; workers: TaskId[]; due: TaskId | null;
-  slots: (string | null)[]; turn: number; after: string | null; fresh_after?: string | null };
+  policy?: TaskId | null; policy_error?: string | null; policy_last_at?: number;
+  slots: (string | null)[]; turn: number; after: string | null; fresh_after?: string | null; email_after?: string | null; email_turn?: number };
 const State = defineDoc<ReviewState>({ kind: "agent.source.reviews", scope: "session", version: 1,
   initial: () => ({ generation: 0, enabled: false, workers: [], due: null, slots: [], turn: 0, after: null, fresh_after: null }), checkpointWhen: () => true });
 const Claims = defineDocFamily<{ value: Claim | null }, null>({ kind: "agent.source.review", scope: "session", family: true,
@@ -73,6 +77,7 @@ function taskSources(sources: readonly SourceRef[], captured: readonly SourceRef
 }
 function detachedClaim(value: Readonly<Claim>): Claim {
   return { ...value, model: value.model === null ? null : { ...value.model }, keys: [...value.keys],
+    ...(value.source === undefined ? {} : { source: { ...value.source } }),
     captures: value.captures.map(capture => ({ ...capture, keys: [...capture.keys] })),
     effects: value.effects.map(effect => effect.type === "task" ? { ...effect } : { ...effect, keys: [...effect.keys] }) };
 }
@@ -87,6 +92,8 @@ export class SourceReviews {
   private readonly workerTask;
   private readonly effectTask;
   private readonly dueTask;
+  private readonly policyTask;
+  readonly noisePolicy: SourceNoisePolicy;
   readonly tools: Extension;
   constructor(readonly session: Harness, registry: Registry, readonly journal: SourceJournal, readonly tasks: TaskStore,
     readonly executions: Executions, private readonly callbacks: SourceReviewCallbacks, options: SourceReviewOptions = {}) {
@@ -94,6 +101,34 @@ export class SourceReviews {
     this.maximumBytes = Math.max(1024, options.maximumBytes ?? 128 * 1024);
     this.maximumEvents = Math.min(1024, Math.max(1, options.maximumEvents ?? 1000));
     this.maximumEntities = Math.min(64, Math.max(1, options.maximumEntities ?? 64));
+    this.noisePolicy = new SourceNoisePolicy(journal);
+    this.policyTask = defineTask<{ generation: number }, { phase: "sweep"; attempt: number }, null>({
+      name: "agent.source.noise", version: 1, initial: () => ({ phase: "sweep", attempt: 0 }), phases: {
+        sweep: async (task, runtime, context) => {
+          await callbacks.ready?.(runtime.signal);
+          const state = await session.snapshot(State, context);
+          if (!state?.enabled || state.generation !== task.input.generation) return runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+          try {
+            const result = callbacks.enabled() ? await this.noisePolicy.sweep(runtime.now(), async tx => {
+              const current = await tx.doc(State);
+              return !runtime.signal.aborted && callbacks.enabled() && current.enabled && current.generation === task.input.generation;
+            }) : { more: false };
+            return runtime.commit(async tx => {
+              const current = await tx.doc(State); current.policy_error = null; current.policy_last_at = runtime.now();
+              return { status: "sleeping", until: runtime.now() + (result.more ? 50 : 5000), checkpoint: { phase: "sweep", attempt: 0 } };
+            }, context);
+          } catch (error) {
+            if (runtime.signal.aborted) throw error;
+            const attempt = Math.min(8, task.state.checkpoint.attempt + 1);
+            return runtime.commit(async tx => {
+              (await tx.doc(State)).policy_error = "Slack noise policy is unavailable; original evidence is retained";
+              return { status: "sleeping", until: runtime.now() + Math.min(300_000, 1000 * 2 ** attempt), checkpoint: { phase: "sweep", attempt } };
+            }, context);
+          }
+        },
+      },
+      abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+    });
     this.workerTask = defineTask<{ slot: number; generation: number }, { phase: "run"; attempt: number }, null>({
       name: "agent.source.reviewer", version: 1, initial: () => ({ phase: "run", attempt: 0 }), phases: {
         run: async (task, runtime, context) => {
@@ -140,7 +175,7 @@ export class SourceReviews {
       },
       abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
     });
-    registry.install({ name: "source-review", tasks: [this.workerTask, this.effectTask, this.dueTask] });
+    registry.install({ name: "source-review", tasks: [this.workerTask, this.effectTask, this.dueTask, this.policyTask] });
     this.tools = defineExtension({ name: "source-review-tools", tools: [
       defineTool({ name: "read_source_events", replay: "safe", description: "Read original evidence in bounded pages. Continue with cursor when complete is false; an empty partial page does not establish absence.",
         parameters: Type.Object({ provider: Type.Optional(Type.String()), account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()),
@@ -201,7 +236,7 @@ export class SourceReviews {
     await this.session.root(BACKGROUND_CONTEXT);
     const owned = await this.session.commit(async tx => {
       const state = await tx.doc(State);
-      if (state.enabled && state.workers.length === this.workers && state.due !== null) return [...state.workers, state.due];
+      if (state.enabled && state.workers.length === this.workers && state.due !== null && state.policy != null) return [...state.workers, state.due, state.policy];
       if (state.workers.length !== 0 && state.workers.length !== this.workers) throw new TaskError("Reconcile the existing source reviewer count before resizing");
       state.enabled = true;
       for (let slot = state.workers.length; slot < this.workers; slot++) {
@@ -211,7 +246,9 @@ export class SourceReviews {
       }
       state.due ??= await tx.createTask(this.dueTask, { generation: state.generation },
         { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
-      return [...state.workers, state.due];
+      state.policy ??= await tx.createTask(this.policyTask, { generation: state.generation },
+        { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
+      return [...state.workers, state.due, state.policy];
     }, BACKGROUND_CONTEXT);
     for (const task of owned) await this.session.retryTask(task, BACKGROUND_CONTEXT);
     this.session.resume();
@@ -220,59 +257,72 @@ export class SourceReviews {
   private async claim(slot: number, maximumBytes: number, explicit: boolean): Promise<Claim | undefined> {
     const streams = (await this.journal.states()).map(item => item.source), began = performance.now();
     return this.session.commit(async tx => {
-      const state = await tx.doc(State), previous = state.slots[slot];
+      const state = await tx.doc(State);
+      while (state.slots.length <= slot) state.slots.push(null);
+      const previous = state.slots[slot];
       if (previous !== undefined && previous !== null) {
         const claim = (await tx.doc(Claims, previous, null)).value;
         if (claim !== null && !claim.review_done) return detachedClaim(claim);
         state.slots[slot] = null;
       }
-      const order = [...streams].sort((a, b) => {
+      const emailReserved = !explicit && this.workers >= 4, emailSlot = emailReserved && slot === 0;
+      const order = streams.filter(source => !emailReserved || (source.provider === "google") === emailSlot).sort((a, b) => {
         const left = JSON.stringify([a.provider, a.account]), right = JSON.stringify([b.provider, b.account]);
         return left < right ? -1 : left > right ? 1 : 0;
       });
-      const preference: ReviewClass = state.turn++ % 4 === 3 ? "backfill" : "fresh";
+      const preference: ReviewClass = emailSlot ? "email" : state.turn++ % 4 === 3 ? "backfill" : "fresh";
       // Reserve an actor for new evidence and one for history. Inference
       // reservations alone cannot help if every actor already holds backfill.
-      const classes: ReviewClass[] = !explicit && this.workers > 1 && slot === 0 ? ["fresh"]
+      const classes: ReviewClass[] = emailSlot ? ["email"] : !explicit && this.workers > 1 && slot === (emailReserved ? 1 : 0) ? ["fresh"]
         : !explicit && this.workers > 1 && slot === this.workers - 1 ? ["backfill"]
         : [preference, preference === "fresh" ? "backfill" : "fresh"];
       for (const workClass of classes) {
         // Fresh arrivals must not reset historical streams' rotation. Keep the
         // existing cursor for backfill when reopening version-one state.
-        const cursor = workClass === "fresh" ? state.fresh_after ?? null : state.after;
+        const cursor = workClass === "email" ? state.email_after ?? null : workClass === "fresh" ? state.fresh_after ?? null : state.after;
         const after = cursor === null ? -1 : order.findIndex(source => JSON.stringify([source.provider, source.account]) > cursor);
         const start = after < 0 ? 0 : after;
-        const captures: Capture[] = [], keys: string[] = []; let bytes = 0, attempts = 0;
+        const captures: Capture[] = [], keys: string[] = []; let bytes = 0, attempts = 0, claimedSource: SourceKey | undefined;
         const id = randomUUID();
-        for (let offset = 0; offset < order.length && captures.length < this.maximumEntities; offset++) {
-          const source = order[(start + offset) % order.length]; if (source === undefined) continue;
-          const entities = await this.journal.index.entitiesIn(tx, source, { fresh: workClass === "fresh", now: Date.now(), limit: this.maximumEntities - captures.length });
-          for (const entity of entities) {
-            if (captures.length >= this.maximumEntities || attempts >= this.maximumEvents || bytes >= maximumBytes) break;
-            const newest = workClass === "fresh" && entity.next_newest;
-            const pending = await this.journal.index.pendingIn(tx, entity.id, { reverse: newest, limit: this.maximumEvents - attempts });
-            const selected: string[] = [];
-            for (const item of pending) {
-              attempts++;
-              const record = await this.journal.sourceRecordIn(tx, item.key);
-              if (record === undefined) throw new TaskError("Claimed source evidence is unavailable");
-              if (record.outcome !== undefined && this.tasks.isRunning(record.outcome.task_id)) continue;
-              const size = Buffer.byteLength(JSON.stringify(record.event));
-              if (keys.length + selected.length > 0 && bytes + size > maximumBytes) break;
-              selected.push(item.key); bytes += size;
+        const freshFirst = workClass === "email" ? (state.email_turn ?? 0) % 4 !== 3 : workClass === "fresh";
+        for (const fresh of workClass === "email" ? [freshFirst, !freshFirst] : [freshFirst]) {
+          for (let offset = 0; offset < order.length && captures.length < this.maximumEntities; offset++) {
+            const source = order[(start + offset) % order.length]; if (source === undefined) continue;
+            const entities = await this.journal.index.entitiesIn(tx, source, { fresh, now: Date.now(), limit: this.maximumEntities - captures.length });
+            for (const entity of entities) {
+              if (captures.length >= this.maximumEntities || attempts >= this.maximumEvents || bytes >= maximumBytes) break;
+              const newest = fresh && (workClass === "email" || entity.next_newest);
+              const pending = await this.journal.index.pendingIn(tx, entity.id, { reverse: newest, limit: this.maximumEvents - attempts });
+              const selected: string[] = [];
+              for (const item of pending) {
+                attempts++;
+                const record = await this.journal.sourceRecordIn(tx, item.key);
+                if (record === undefined) throw new TaskError("Claimed source evidence is unavailable");
+                if (record.outcome !== undefined && this.tasks.isRunning(record.outcome.task_id)) continue;
+                const size = Buffer.byteLength(JSON.stringify(record.event));
+                if (keys.length + selected.length > 0 && bytes + size > maximumBytes) break;
+                selected.push(item.key); bytes += size;
+              }
+              if (selected.length === 0) continue;
+              const owned = await this.journal.index.claimEntityIn(tx, entity.id, id, newest);
+              if (owned === undefined) continue;
+              captures.push({ id: entity.id, revision: owned.revision, decision_revision: owned.decision_revision, keys: selected, group: `g${captures.length}` });
+              keys.push(...selected);
+              const cursor = JSON.stringify([source.provider, source.account]);
+              if (workClass === "email") state.email_after = cursor;
+              else if (workClass === "fresh") state.fresh_after = cursor; else state.after = cursor;
             }
-            if (selected.length === 0) continue;
-            const owned = await this.journal.index.claimEntityIn(tx, entity.id, id, newest);
-            if (owned === undefined) continue;
-            captures.push({ id: entity.id, revision: owned.revision, decision_revision: owned.decision_revision, keys: selected, group: `g${captures.length}` });
-            keys.push(...selected);
-            const cursor = JSON.stringify([source.provider, source.account]);
-            if (workClass === "fresh") state.fresh_after = cursor; else state.after = cursor;
+            // One account per claim makes model usage attributable to its source.
+            if (keys.length > 0) { claimedSource = { ...source }; break; }
           }
+          if (keys.length > 0) break;
         }
         if (keys.length === 0) continue;
+        if (claimedSource === undefined) throw new TaskError("Source review lost its account identity");
+        if (workClass === "email") state.email_turn = (state.email_turn ?? 0) + 1;
         const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
         const claim: Claim = { id, slot, conversation_id: conversation.id.toString(), class: workClass, started_at: Date.now(), attempt: 0,
+          source: claimedSource,
           model: null, review_done: false,
           captures, keys, content: null, phase: "review", proposal: null, effects: [], effects_task: null, effect_cursor: 0 };
         (await tx.doc(Claims, id, null)).value = claim; state.slots[slot] = id;
@@ -284,6 +334,7 @@ export class SourceReviews {
   }
 
   async review(slot: number, signal: AbortSignal, override?: SourceReviewSettings): Promise<boolean> {
+    if (!Number.isSafeInteger(slot) || slot < 0 || slot >= this.workers) throw new TaskError("Unknown source reviewer slot");
     if (this.running.has(slot)) return false;
     this.running.add(slot);
     let release: (() => void) | undefined, owned: Conversation | undefined, stopping: Promise<void> | undefined;
@@ -345,12 +396,13 @@ export class SourceReviews {
         }
         return { complete: false, attempt: saved.attempt };
       }, BACKGROUND_CONTEXT);
-      if (admission.complete) return true;
+      if (admission.complete) { await this.recordUsage(claim, conversation); return true; }
       const submitted = await conversation.submit({ type: "input", requestId: `source-review:${claim.id}:${admission.attempt}`, content }, BACKGROUND_CONTEXT);
       const answer = await submitted.wait(BACKGROUND_CONTEXT); signal.throwIfAborted();
       const saved = (await this.session.snapshot(Claims, claim.id, BACKGROUND_CONTEXT))?.value;
       if (answer.type !== "input" || answer.status !== "done" && saved?.phase === "review") throw new TaskError("Source review did not finish; its claim is retained");
       if (saved?.phase === "review") throw new TaskError("Source review left captured work unaccounted for");
+      await this.recordUsage(claim, conversation);
       await this.session.commit(async tx => { const current = (await tx.doc(Claims, claim.id, null)).value;
         if (current !== null && current.phase !== "review") current.review_done = true; }, BACKGROUND_CONTEXT);
       return true;
@@ -364,6 +416,32 @@ export class SourceReviews {
       signal.removeEventListener("abort", abort); if (signal.aborted) abort();
       try { await stopping; } finally { release?.(); this.running.delete(slot); }
     }
+  }
+
+  private async recordUsage(claim: Claim, conversation: Conversation): Promise<void> {
+    if (claim.source === undefined || claim.usage_recorded === true) return;
+    const ledger = await this.session.snapshot(UsageDoc, conversation.id, BACKGROUND_CONTEXT);
+    // Native durations can be absent. Retain the bounded sample's coverage,
+    // rather than attributing all review wall time to model generation.
+    const page = await conversation.entries({ order: "descending" }, 32, undefined, BACKGROUND_CONTEXT);
+    let duration = 0, requests = 0, complete = page.next === undefined;
+    for (const entry of page.items) for (const message of entry.model ?? []) if (message.role === "assistant") {
+      requests++;
+      if (message.durationMs === undefined || !Number.isFinite(message.durationMs) || message.durationMs < 0) complete = false;
+      else duration += message.durationMs;
+    }
+    const source = claim.source;
+    await this.session.commit(async tx => {
+      const current = (await tx.doc(Claims, claim.id, null)).value;
+      if (current === null || current.usage_recorded === true || current.phase === "review") return;
+      const stats = await tx.doc(SourceStatistics, sourceStatisticsKey(source), null);
+      for (const usage of Object.values(ledger?.models ?? {})) {
+        stats.input_tokens += usage.input; stats.output_tokens += usage.output; stats.cache_read_tokens += usage.cacheRead;
+      }
+      stats.sampled_model_milliseconds += duration; stats.sampled_model_requests += requests;
+      if (complete) stats.complete_entry_timing_samples++;
+      current.usage_recorded = true;
+    }, BACKGROUND_CONTEXT);
   }
 
   private keys(claim: Claim, proposal: Proposal): string[] {
@@ -389,6 +467,7 @@ export class SourceReviews {
       const selected = expanded.flatMap(item => item.keys);
       if (new Set(selected).size !== selected.length || selected.length !== claim.keys.length) throw new TaskError("Every captured source version must have exactly one decision");
       const valid = new Set<string>(); let superseded = 0;
+      let routed = 0, notified = 0;
       for (const capture of claim.captures) {
         const entity = await this.journal.index.entityIn(tx, capture.id);
         if (entity === undefined || entity.claim_id !== claim.id || entity.decision_revision !== capture.decision_revision) { superseded += capture.keys.length; continue; }
@@ -401,10 +480,12 @@ export class SourceReviews {
         for (const key of keys) { const record = await this.journal.sourceRecordIn(tx, key); if (record === undefined) throw new TaskError("Source original disappeared"); records.push(record); }
         if (proposal.type === "dismiss") await this.journal.decideBatchIn(tx, keys, { type: "dismissed", reason: proposal.reason }, claim.id);
         else if (proposal.type === "notify") {
+          notified += keys.length;
           if (proposal.task_id !== null && await this.tasks.findIn(tx, proposal.task_id) === undefined) throw new TaskError("Unknown notification owner");
           claim.effects.push({ type: "notice", keys, task_id: proposal.task_id, text: proposal.text, call_id: callId, identity: digest([...keys].sort()) });
           await this.journal.decideBatchIn(tx, keys, { type: "dismissed", reason: "Useful update admitted to durable notification delivery" }, claim.id);
         } else {
+          routed += keys.length;
           if (proposal.task_id !== null && proposal.job_id !== null) throw new TaskError("Choose the existing task or its workflow, not conflicting owners");
           const job = proposal.job_id === null ? undefined : workflows.find(item => item.job.id === proposal.job_id);
           if (proposal.job_id !== null && job === undefined) throw new TaskError("Unknown configured workflow");
@@ -465,6 +546,11 @@ export class SourceReviews {
         { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
       else claim.phase = "complete";
       const metrics = await tx.doc(SourceMetrics); metrics.completed_reviews++; metrics.review_milliseconds += Date.now() - claim.started_at;
+      if (claim.source !== undefined) {
+        const stats = await tx.doc(SourceStatistics, sourceStatisticsKey(claim.source), null);
+        stats.reviewed_events += valid.size; stats.routed_events += routed; stats.notified_events += notified;
+        stats.completed_reviews++; stats.review_milliseconds += Date.now() - claim.started_at;
+      }
       return { accounted: valid.size, superseded };
     }, BACKGROUND_CONTEXT);
   }
@@ -507,7 +593,8 @@ export class SourceReviews {
     const sources = await this.journal.states();
     return this.session.commit(async tx => {
       const state = await tx.doc(State), streams = [];
-      for (const { source } of sources) streams.push({ source, ...await this.journal.index.countsIn(tx, source) });
+      for (const { source } of sources) streams.push({ source, ...await this.journal.index.countsIn(tx, source),
+        review: { ...emptyReviewStatistics(), ...await tx.doc(SourceStatistics, sourceStatisticsKey(source), null) } });
       const active = [];
       for (const id of state.slots) if (id !== null) { const claim = (await tx.doc(Claims, id, null)).value;
         if (claim !== null && !claim.review_done) active.push({ id: claim.id, conversation_id: claim.conversation_id, class: claim.class,
@@ -515,6 +602,8 @@ export class SourceReviews {
       return { schema_version: 1, migration_ready: await this.journal.index.readyIn(tx), migrated_events: streams.reduce((n, item) => n + item.retained, 0),
         retained_events: streams.reduce((n, item) => n + item.retained, 0), pending_events: streams.reduce((n, item) => n + item.pending, 0),
         dirty_entities: streams.reduce((n, item) => n + item.dirty_entities, 0), streams, collectors, active_reviews: active,
+        ...(state.policy_error == null ? {} : { noise_policy_error: state.policy_error }),
+        ...(state.policy_last_at === undefined ? {} : { noise_policy_last_at: state.policy_last_at }),
         metrics: { ...emptySourceMetrics(), ...await tx.doc(SourceMetrics) } };
     }, BACKGROUND_CONTEXT);
   }

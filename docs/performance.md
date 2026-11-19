@@ -1,12 +1,15 @@
 # CLI performance
 
-Source-pipeline qualification also has two explicit native replay commands:
+After building runtime and test output with `nix develop --command make runtime`,
+source-pipeline qualification includes explicit native replay commands:
 
 ```sh
 nix develop --command node runtime/dist/test/source-pipeline-benchmark.js \
   --sizes=100000,1000000,10000000 --keep-database
 nix develop --command node runtime/dist/test/source-review-benchmark.js \
   --events 600 --latency-ms 100
+nix develop --command node runtime/dist/test/source-policy-benchmark.js \
+  --events 2500
 ```
 
 The first admits invented, skewed, versioned originals through `SourceJournal`
@@ -19,8 +22,72 @@ native corpus and cursor, without replacing records or seeding counters.
 The second compares one, two and four real reviewer actors with a fixed faux
 provider delay, fresh evidence arriving over backfill, and a blocked durable
 worker effect. It reports native overhead separately from synthetic model
-latency. Neither benchmark predicts real model speed or provider quotas; those
-require live indexed backlog and delivery readback after rollout.
+latency.
+
+The third calls the real bounded Slack policy against disposable Pi/SQLite state
+with FULL synchronous writes and fullfsync. Setup is outside the measured
+interval. It reports per-sweep latency and policy settlements, checks original
+and counter conservation, protects DMs/mentions/task links/work URLs and email,
+and verifies SQLite integrity and fixture cleanup. There are no model calls or
+synthetic provider delays in its measured path. Its direct sweeps exclude the
+native task's continuation/idle waits. Live model speed, provider limits and
+sustained catch-up still require indexed backlog and delivery readback after
+rollout.
+
+A local native policy qualification expired 2,500 ordinary originals and
+coalesced 12 updates in 2.628 seconds, about 956 settlements per second. Its
+42 direct sweeps had a 63.76-millisecond median, 79.86-millisecond p95 and
+82.07-millisecond maximum. All 2,578 originals remained intact; 50 protected or
+latest Slack originals and 16 emails stayed pending, with zero model calls.
+These are disposable-workload measurements and exclude production pacing;
+they are not model throughput claims or CI latency thresholds.
+
+## Source policy qualification
+
+The default review pool reserves one of its four actors for email, along with a
+separate inference request/token reservation. Email rotates accounts and prefers
+fresh evidence on three of every four turns, with one historical turn and
+fallback when the preferred class is empty. Email is lossless within the
+adapter's documented intake window. Slack noise processing uses a separate
+native task, so it can remove eligible review work without model calls.
+
+The native regression path is:
+
+```sh
+nix develop --command node --test runtime/dist/test/source-noise-policy.test.js
+```
+
+The policy visits bounded native pending pages, keeps original records and
+records exact expired/coalesced decisions. Its default limits are 64 records or
+512 KiB per transaction, with one oversized record allowed alone for progress;
+continuations wait 50 milliseconds and idle passes wait five seconds. Ordinary
+Slack work expires at 24 hours, or at 15 minutes when the account has over 5,000
+pending records. Within a thread, ordinary records at least 60 seconds old may
+coalesce into the newest pending record. DMs, mentions, unknown/private evidence,
+claimed or task-linked work, and recognized work URLs are excluded. GitHub's
+policy is unchanged. See [the architecture](architecture.md#sources-and-follow-through)
+for attention enrichment and legacy protection rules.
+
+New review claims contain one provider/account. Read `sources --diagnostics`
+before and after a live window, keeping the package and measurement interval
+fixed. Compare admissions, backlog change, model-reviewed records and routing
+counts separately from policy expirations/coalescing. A smaller queue after
+expiry does not mean those records received model review or their tasks ran.
+Check email's oldest pending age and collector completion alongside throughput.
+
+Per-stream native input/output/cache-read token totals come from Pi's usage
+ledger. Review wall time includes admission waits, tools and model work. Native
+model duration is a bounded sample from at most 32 conversation entries per
+completed claim; `sampled_model_requests` and `complete_entry_timing_samples`
+expose its coverage. Missing durations or longer histories leave partial timing
+samples. These counters support attribution and comparisons, not billed-spend
+estimates. Legacy mixed-source claims have no inferred per-account usage.
+
+No measured throughput figures for this policy are recorded here yet. The
+storage and task-store results below qualify their named workloads, not the new
+Slack policy or live model speed.
+
+## Retained-source and task-store qualification
 
 A native replay retained 10,000,000 actual originals across five invented
 providers with 512-byte bodies and skewed version histories. SQLite used FULL
@@ -62,6 +129,8 @@ independent 30-second admission watchdog. The original implementation exceeded
 that aggregate deadline; the fixed sequence completed in about 121 milliseconds.
 Separate native checks preserve duplicate references and their order, overlap
 semantics, ownership indexes, transactional rollback and reopen behavior.
+
+## CLI interaction qualification
 
 The separate **CLI performance** CI job compares a change with its pull request
 base or previous main commit on the same runner. It builds both in release mode,

@@ -203,6 +203,7 @@ impl GoogleSource {
                     text.push_str("\n[Excerpt; read the source for the full message.]");
                 }
                 Some(SourceEvent {
+                    attention: None,
                     id: message.gmail_message_id.clone(),
                     version: message.gmail_message_id,
                     legacy_version: None,

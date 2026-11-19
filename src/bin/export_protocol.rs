@@ -36,6 +36,7 @@ fn main() -> Result<()> {
     agent_cli::background::BackgroundCheckpoint::export_all(&config)?;
     TaskOutcome::export_all(&config)?;
     protocol::SourceReviewDecision::export_all(&config)?;
+    protocol::SourcePolicyDecision::export_all(&config)?;
     DelegationDecision::export_all(&config)?;
     AllocationDecision::export_all(&config)?;
     HistoryImportBatch::export_all(&config)?;

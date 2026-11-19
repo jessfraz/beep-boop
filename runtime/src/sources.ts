@@ -18,9 +18,10 @@ import { Executions } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 import { SourceIndex, type SourceRecord } from "./source-index.js";
 import { SourceMetrics } from "./source-metrics.js";
+import { rememberSlackAttentionIn } from "./source-policy.js";
 import type { Draft } from "@earendil-works/chord";
 
-type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
+type Decision = NonNullable<SourceRecord["decision"]>;
 export type StoredEvent = SourceRecord;
 type EventSelection = { keys?: readonly string[]; provider?: string; account?: string; thread_id?: string;
   query?: string; limit?: number; pending?: boolean; cursor?: string };
@@ -439,9 +440,14 @@ export class SourceJournal {
         return true;
       });
       for (const event of conflict ? [] : batch.events) {
+        await rememberSlackAttentionIn(tx, event);
         const key = eventKey(event);
         const saved = records.get(key);
         if (saved !== undefined) {
+          const attention = saved.attention ?? saved.event.attention;
+          if (event.attention !== undefined && attention !== "direct" && attention !== "mention" && attention !== "protected") {
+            saved.attention = event.attention;
+          }
           // Enrich scheduling metadata without rewriting an admitted original.
           if (saved.event.occurred_at === undefined && saved.occurred_at === undefined && event.occurred_at !== undefined) {
             saved.occurred_at = event.occurred_at;

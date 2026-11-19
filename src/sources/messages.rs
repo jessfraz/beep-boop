@@ -560,6 +560,7 @@ impl MessagesSource {
                     let version =
                         hex::encode(Sha256::digest(serde_json::to_vec(&(&title, &text))?));
                     events.push(SourceEvent {
+                        attention: None,
                         occurred_at: message.date.as_deref().and_then(rfc3339_millis),
                         id: message.id,
                         version,

@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     protocol::SourceRef,
     sources::{
-        ReadOutput, Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage,
-        SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress, SourceScanUnit, now_seconds,
-        read_command,
+        ReadOutput, Source, SourceAttention, SourceBatch, SourceCheckpoint, SourceConfig,
+        SourceCoverage, SourceEvent, SourceKey, SourceScanPhase, SourceScanProgress,
+        SourceScanUnit, now_seconds, read_command,
     },
 };
 
@@ -78,6 +78,8 @@ struct Paging {
 }
 #[derive(Deserialize)]
 struct Message {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     ts: String,
     #[serde(default)]
@@ -92,10 +94,47 @@ struct Channel {
     id: String,
     #[serde(default)]
     name: String,
+    is_im: Option<bool>,
+    is_mpim: Option<bool>,
+    is_private: Option<bool>,
 }
 #[derive(Deserialize)]
 struct Edited {
     ts: String,
+}
+
+impl Message {
+    fn attention(&self) -> SourceAttention {
+        // Any positive direct-message evidence wins over missing or conflicting
+        // flags. Prefixes are only a conservative positive guard, never proof
+        // that another conversation is ordinary.
+        if matches!(self.kind.as_deref(), Some("im" | "mpim"))
+            || self.channel.is_im == Some(true)
+            || self.channel.is_mpim == Some(true)
+            || self.channel.id.starts_with('D')
+        {
+            return SourceAttention::Direct;
+        }
+        // Protect all explicit mentions. Resolving only the current user's
+        // mentions would require additional identity and group-membership reads.
+        if ["<@", "<!subteam", "<!here", "<!channel", "<!everyone"]
+            .iter()
+            .any(|prefix| self.text.contains(prefix))
+        {
+            return SourceAttention::Mention;
+        }
+        // Search omits is_im on ordinary public results. Slack documents DMs
+        // and MPIMs as private, so explicit public evidence is sufficient;
+        // absent/private/unknown fields never authorize lossy processing.
+        if self.channel.is_private == Some(false)
+            && matches!(self.kind.as_deref(), Some("message") | None)
+        {
+            return SourceAttention::Ordinary;
+        }
+        // A current unknown/private observation must never be mistaken for a
+        // legacy original that could borrow older public-channel evidence.
+        SourceAttention::Protected
+    }
 }
 
 impl SlackSource {
@@ -206,6 +245,7 @@ impl SlackSource {
                 };
                 let title = format!("Slack: {channel}");
                 let occurred_at = message_millis(&message.ts);
+                let attention = Some(message.attention());
                 let legacy_version = message.edited.map_or(message.ts, |edited| edited.ts);
                 // Search can return edited text without an edited timestamp.
                 // Version the normalized immutable content, excluding cursors
@@ -218,6 +258,7 @@ impl SlackSource {
                 let version = hex::encode(digest.finalize());
                 Some(SourceEvent {
                     occurred_at,
+                    attention,
                     id,
                     version,
                     legacy_version: Some(legacy_version),
@@ -411,7 +452,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::sources::{
-        ReadOutput, Source, SourceCheckpoint, SourceCoverage,
+        ReadOutput, Source, SourceCheckpoint, SourceCoverage, SourceEvent,
         slack::{SlackSource, message_millis, utc_date},
     };
 
@@ -439,6 +480,181 @@ mod tests {
             stdout: text.into(),
             truncated: false,
         }
+    }
+
+    fn classified_event(kind: Option<&str>, channel: &str, text: &str) -> SourceEvent {
+        let kind = kind.map_or_else(String::new, |kind| {
+            format!(",\"type\":{}", serde_json::to_string(kind).unwrap())
+        });
+        let response = format!(
+            r#"{{"ok":true,"messages":{{"matches":[{{"ts":"1700000000.000001","thread_ts":"1699999999.000002","text":{}{kind},"channel":{channel}}}],"paging":{{"next_cursor":""}}}}}}"#,
+            serde_json::to_string(text).unwrap()
+        );
+        let source = source();
+        let batch = source.normalize(
+            output(&response),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        batch.events.into_iter().next().unwrap()
+    }
+
+    // Consume the actual serialized producer contract so these regression
+    // assertions also run against a producer predating attention metadata.
+    #[derive(Deserialize)]
+    struct AttentionEvent {
+        attention: Option<String>,
+    }
+    fn attention(event: &SourceEvent) -> Option<String> {
+        serde_json::from_str::<AttentionEvent>(&serde_json::to_string(event).unwrap())
+            .unwrap()
+            .attention
+    }
+
+    #[test]
+    fn native_search_classifies_only_positively_public_unmentioned_messages_as_ordinary() {
+        for (kind, channel, expected) in [
+            (
+                Some("message"),
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false,"is_mpim":false}"#,
+                Some("ordinary"),
+            ),
+            (
+                None,
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false}"#,
+                Some("ordinary"),
+            ),
+            (
+                Some("im"),
+                r#"{"id":"CEXAMPLE","name":"UEXAMPLE"}"#,
+                Some("direct"),
+            ),
+            (
+                Some("message"),
+                r#"{"id":"DEXAMPLE","name":"UEXAMPLE","is_private":false}"#,
+                Some("direct"),
+            ),
+            (
+                Some("message"),
+                r#"{"id":"CEXAMPLE","name":"engineering","is_im":true,"is_private":false}"#,
+                Some("direct"),
+            ),
+            (
+                Some("group"),
+                r#"{"id":"GEXAMPLE","name":"mpdm-example","is_mpim":true,"is_private":true}"#,
+                Some("direct"),
+            ),
+            (
+                Some("mpim"),
+                r#"{"id":"CEXAMPLE","name":"example"}"#,
+                Some("direct"),
+            ),
+            (
+                Some("message"),
+                r#"{"id":"CEXAMPLE","name":"engineering"}"#,
+                Some("protected"),
+            ),
+            (
+                Some("message"),
+                r#"{"id":"CEXAMPLE","name":"engineering","is_im":false,"is_mpim":false}"#,
+                Some("protected"),
+            ),
+            (
+                Some("group"),
+                r#"{"id":"GEXAMPLE","name":"engineering","is_private":true,"is_mpim":false}"#,
+                Some("protected"),
+            ),
+            (
+                Some("group"),
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false}"#,
+                Some("protected"),
+            ),
+            (
+                Some("unknown"),
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false}"#,
+                Some("protected"),
+            ),
+        ] {
+            let event = classified_event(kind, channel, "An ordinary project update");
+            assert_eq!(
+                attention(&event).as_deref(),
+                expected,
+                "{kind:?}: {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_search_protects_user_group_and_broadcast_mentions_without_identity_reads() {
+        for text in [
+            "Please check this <@UEXAMPLE>",
+            "Please check this <@WEXAMPLE|example-name>",
+            "Please check this <!subteam^SEXAMPLE|example-team>",
+            "Please check this <!here>",
+            "Please check this <!channel>",
+            "Please check this <!everyone>",
+            "An incomplete mention <@UEXAMPLE",
+        ] {
+            for channel in [
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false}"#,
+                r#"{"id":"GEXAMPLE","name":"unknown"}"#,
+            ] {
+                let event = classified_event(Some("message"), channel, text);
+                assert_eq!(attention(&event).as_deref(), Some("mention"));
+            }
+        }
+        let direct = classified_event(
+            Some("im"),
+            r#"{"id":"DEXAMPLE","name":"UEXAMPLE"}"#,
+            "Please check this <@UEXAMPLE>",
+        );
+        assert_eq!(attention(&direct).as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn attention_hints_preserve_immutable_content_versions_and_legacy_identity() {
+        let unknown = classified_event(
+            Some("message"),
+            r#"{"id":"CEXAMPLE","name":"engineering"}"#,
+            "An ordinary project update",
+        );
+        for (channel, expected) in [
+            (
+                r#"{"id":"CEXAMPLE","name":"engineering","is_private":false}"#,
+                "ordinary",
+            ),
+            (
+                r#"{"id":"CEXAMPLE","name":"engineering","is_im":true}"#,
+                "direct",
+            ),
+        ] {
+            let observed = classified_event(Some("message"), channel, &unknown.text);
+            assert_eq!(attention(&observed).as_deref(), Some(expected));
+            assert_eq!(observed.id, unknown.id);
+            assert_eq!(observed.source.provider, unknown.source.provider);
+            assert_eq!(observed.source.account, unknown.source.account);
+            assert_eq!(observed.source.thread_id, unknown.source.thread_id);
+            assert_eq!(observed.title, unknown.title);
+            assert_eq!(observed.text, unknown.text);
+            assert_eq!(observed.version, unknown.version);
+            assert_eq!(observed.legacy_version, unknown.legacy_version);
+        }
+        assert_eq!(attention(&unknown).as_deref(), Some("protected"));
+        let reopened: SourceEvent = serde_json::from_str(
+            r#"{"id":"CEXAMPLE:1700000000.000001","version":"legacy-version","source":{"provider":"slack","account":"workspace-example","thread_id":"CEXAMPLE:1699999999.000002"},"title":"Slack: engineering","text":"An ordinary project update"}"#,
+        )
+        .unwrap();
+        assert_eq!(attention(&reopened), None);
+    }
+
+    #[test]
+    fn native_search_marks_current_unknown_observations_protected_instead_of_legacy() {
+        let event = classified_event(
+            Some("message"),
+            r#"{"id":"CEXAMPLE","name":"engineering"}"#,
+            "An ordinary project update",
+        );
+        assert_eq!(attention(&event).as_deref(), Some("protected"));
     }
 
     #[test]

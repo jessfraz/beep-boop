@@ -144,6 +144,7 @@ pub struct CoordinatorBootstrap {
 #[serde(rename_all = "snake_case")]
 pub enum InferenceClass {
     Foreground,
+    Email,
     Fresh,
     Cron,
     Backfill,
@@ -197,6 +198,52 @@ pub struct SourcePipelineMetrics {
     pub input_bytes: u64,
     pub claim_milliseconds: f64,
     pub review_milliseconds: f64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub expired_events: u64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub coalesced_events: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SourceReviewStatistics {
+    #[ts(type = "number")]
+    pub reviewed_events: u64,
+    #[ts(type = "number")]
+    pub routed_events: u64,
+    #[ts(type = "number")]
+    pub notified_events: u64,
+    #[ts(type = "number")]
+    pub completed_reviews: u64,
+    #[ts(type = "number")]
+    pub expired_events: u64,
+    #[ts(type = "number")]
+    pub coalesced_events: u64,
+    #[ts(type = "number")]
+    pub input_tokens: u64,
+    #[ts(type = "number")]
+    pub output_tokens: u64,
+    #[ts(type = "number")]
+    pub cache_read_tokens: u64,
+    pub review_milliseconds: f64,
+    pub sampled_model_milliseconds: f64,
+    #[ts(type = "number")]
+    pub sampled_model_requests: u64,
+    #[ts(type = "number")]
+    pub complete_entry_timing_samples: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum SourcePolicyDecision {
+    Expired {
+        at: crate::jobs::UtcMillis,
+    },
+    Coalesced {
+        at: crate::jobs::UtcMillis,
+        replacement: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -209,6 +256,8 @@ pub struct SourceStreamDiagnostics {
     #[ts(type = "number")]
     pub dirty_entities: u64,
     pub oldest_pending_at: Option<crate::jobs::UtcMillis>,
+    #[serde(default)]
+    pub review: SourceReviewStatistics,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -259,6 +308,12 @@ pub struct SourcePipelineDiagnostics {
     pub collectors: Vec<SourceCollectorDiagnostics>,
     pub active_reviews: Vec<SourceReviewDiagnostics>,
     pub metrics: SourcePipelineMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub noise_policy_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub noise_policy_last_at: Option<crate::jobs::UtcMillis>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]

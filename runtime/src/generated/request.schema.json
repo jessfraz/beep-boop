@@ -4065,6 +4065,16 @@
         "keyword"
       ]
     },
+    "SourceAttention": {
+      "description": "Provider evidence used by source policy. Missing evidence never establishes\nthat a retained original can be discarded.",
+      "type": "string",
+      "enum": [
+        "ordinary",
+        "direct",
+        "mention",
+        "protected"
+      ]
+    },
     "SourceBatch": {
       "type": "object",
       "properties": {
@@ -4321,6 +4331,17 @@
     "SourceEvent": {
       "type": "object",
       "properties": {
+        "attention": {
+          "description": "A non-content hint. Slack marks only positively public, unmentioned\nmessages ordinary and explicitly protects unclassified observations.\nNon-Slack sources and legacy originals omit the hint.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceAttention"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "type": "string"
         },

@@ -3,5 +3,6 @@ import type { SourceCollectorDiagnostics } from "./SourceCollectorDiagnostics.js
 import type { SourcePipelineMetrics } from "./SourcePipelineMetrics.js";
 import type { SourceReviewDiagnostics } from "./SourceReviewDiagnostics.js";
 import type { SourceStreamDiagnostics } from "./SourceStreamDiagnostics.js";
+import type { UtcMillis } from "./UtcMillis.js";
 
-export type SourcePipelineDiagnostics = { schema_version: number, migration_ready: boolean, migrated_events: number, retained_events: number, pending_events: number, dirty_entities: number, streams: Array<SourceStreamDiagnostics>, collectors: Array<SourceCollectorDiagnostics>, active_reviews: Array<SourceReviewDiagnostics>, metrics: SourcePipelineMetrics, };
+export type SourcePipelineDiagnostics = { schema_version: number, migration_ready: boolean, migrated_events: number, retained_events: number, pending_events: number, dirty_entities: number, streams: Array<SourceStreamDiagnostics>, collectors: Array<SourceCollectorDiagnostics>, active_reviews: Array<SourceReviewDiagnostics>, metrics: SourcePipelineMetrics, noise_policy_error?: string, noise_policy_last_at?: UtcMillis, };

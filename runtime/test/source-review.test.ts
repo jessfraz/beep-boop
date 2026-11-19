@@ -100,11 +100,75 @@ async function open(path: string, options: SourceReviewOptions = {}, workflows: 
         call: guidance ?? (async () => { throw new Error("A source reviewer cannot perform provider effects"); }) });
       return () => { bound.delete(id); unbind(); };
     },
-  }, options);
+  }, { workers: 2, ...options });
   registry.install(reviews.tools);
   await session.root(BACKGROUND_CONTEXT); await tasks.prepare(); await sources.prepare();
   return { session, storage, tasks, sources, reviews, faux, bound };
 }
+
+test("reserved email actor drains old and new mail across accounts while three Slack reviews are held", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-priority-email-")), app = await open(join(directory, "session.sqlite"), { workers: 4, maximumEntities: 1 });
+  const hold = gate(), started = gate(), controller = new AbortController();
+  let running: Promise<boolean>[] = [], slack = 0;
+  try {
+    const now = Date.now();
+    await admit(app.sources, [event("seed-mail", "seed-thread", "Invented warm-up mail", "google")]);
+    app.faux.setResponses([input => answer(dismissed(groups(input)), "seed-mail"), fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    await admit(app.sources, [event("slack-fresh-a"), event("slack-fresh-b"), { ...event("slack-old"), occurred_at: now - 3_600_000 }]);
+    const wait = async (input: TranscriptContext) => { if (++slack === 3) started.release(); await hold.promise; return answer(dismissed(groups(input)), "slack-" + slack); };
+    let mail = 0; const reviewedMail: string[][] = [];
+    const email = (input: TranscriptContext) => {
+      reviewedMail.push(groups(input).flatMap(group => group.originals)); mail++;
+      return answer(dismissed(groups(input)), "mail-" + mail);
+    };
+    app.faux.setResponses([wait, wait, wait, email, fauxAssistantMessage(""), email, fauxAssistantMessage(""),
+      fauxAssistantMessage(""), fauxAssistantMessage(""), fauxAssistantMessage("")]);
+    running = [1, 2, 3].map(slot => app.reviews.review(slot, controller.signal));
+    await started.promise;
+    for (const [id, account, age] of [["old-mail", "mail-a", 48 * 3_600_000], ["new-mail", "mail-b", 0]] satisfies [string, string, number][]) {
+      const message = event(id, id, "Important invented email", "google");
+      message.source.account = account; message.occurred_at = now - age; await admit(app.sources, [message]);
+    }
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.deepEqual(reviewedMail[0], ["new-mail"], "Reserved email review prioritizes fresh mail while Slack is busy");
+    assert.equal(await app.reviews.review(0, controller.signal), true, "Reserved email review must also progress historical mail");
+    assert.deepEqual(reviewedMail[1], ["old-mail"], "Reserved email review rotates its accounts");
+    assert.equal(mail, 2); assert.equal(slack, 3);
+    assert.deepEqual(await app.sources.events({ provider: "google", pending: true }), []);
+    const diagnostics = await app.reviews.diagnostics();
+    for (const account of ["mail-a", "mail-b"]) {
+      const stats = diagnostics.streams.find(stream => stream.source.provider === "google" && stream.source.account === account)?.review;
+      assert.ok(stats); assert.equal(stats.reviewed_events, 1); assert.equal(stats.completed_reviews, 1);
+      assert.ok(stats.input_tokens + stats.output_tokens > 0); assert.ok(stats.sampled_model_requests >= 2);
+      assert.equal(stats.expired_events, 0); assert.equal(stats.coalesced_events, 0);
+    }
+    assert.equal(await app.reviews.review(0, controller.signal), false, "Idle email capacity must not be taken by Slack");
+    assert.equal((await app.reviews.diagnostics()).active_reviews.length, 3);
+    hold.release(); assert.deepEqual(await Promise.all(running), [true, true, true]); running = [];
+  } finally { hold.release(); controller.abort(); await Promise.allSettled(running); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("email prioritizes fresh arrivals in an old hot thread while reserving historical progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-email-history-fairness-")), path = join(directory, "session.sqlite");
+  let app = await open(path, { workers: 4, maximumEntities: 1, maximumEvents: 1 });
+  const controller = new AbortController(), selected: string[] = [];
+  const email = (id: string, occurred: number) => ({ ...event(id, "mail-thread", "Invented mail evidence", "google"), occurred_at: occurred });
+  try {
+    const now = Date.now();
+    await admit(app.sources, [email("old-0", now - 3 * 86_400_000), email("old-1", now - 2 * 86_400_000)]);
+    for (let index = 0; index < 8; index++) {
+      await admit(app.sources, [email("fresh-" + index, Date.now())]);
+      app.faux.setResponses([input => { const captured = groups(input); selected.push(...captured.flatMap(group => group.originals));
+        return answer(dismissed(captured), "email-fairness-" + index); }, fauxAssistantMessage("")]);
+      assert.equal(await app.reviews.review(0, controller.signal), true);
+      if (index === 2) { await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 4, maximumEntities: 1, maximumEvents: 1 }); }
+    }
+    assert.deepEqual(selected, ["fresh-0", "fresh-1", "fresh-2", "old-0", "fresh-4", "fresh-5", "fresh-6", "old-1"]);
+    assert.deepEqual(new Set((await app.sources.events({ provider: "google", pending: true })).map(record => record.event.id)), new Set(["fresh-3", "fresh-7"]));
+    assert.equal((await app.reviews.diagnostics()).streams.find(stream => stream.source.provider === "google")?.review.expired_events, 0);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("native reviewers overlap only disjoint entities and leave arrivals outside their captured versions pending", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-parallel-source-review-")), app = await open(join(directory, "session.sqlite"), { workers: 3, maximumEntities: 1 });

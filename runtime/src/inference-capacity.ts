@@ -18,9 +18,9 @@ type Account = {
   active: Counters; tokens: Counters; queues: Record<InferenceClass, Waiter[]>; deficits: Counters;
   cursor: number; enter: boolean; exclusive: boolean; waiting: Waiter | undefined; pumping: boolean;
 };
-const classes: readonly InferenceClass[] = ["foreground", "cron", "fresh", "backfill"];
-const weights: Counters = { foreground: 4, cron: 3, fresh: 3, backfill: 1 };
-function counters(): Counters { return { foreground: 0, cron: 0, fresh: 0, backfill: 0 }; }
+const classes: readonly InferenceClass[] = ["foreground", "email", "cron", "fresh", "backfill"];
+const weights: Counters = { foreground: 4, email: 4, cron: 3, fresh: 3, backfill: 1 };
+function counters(): Counters { return { foreground: 0, email: 0, cron: 0, fresh: 0, backfill: 0 }; }
 function integer(value: number, name: string, minimum = 1): number {
   if (!Number.isSafeInteger(value) || value < minimum) throw new RangeError(`${name} must be a safe integer >= ${minimum}`);
   return value;
@@ -64,7 +64,7 @@ export class InferenceCapacity {
       };
       return { requests: integer(value.requests, "Reserved inference requests", 0), tokens: integer(value.tokens, "Reserved inference tokens", 0) };
     };
-    this.reserved = { foreground: reservation("foreground", 4), cron: reservation("cron", 8),
+    this.reserved = { foreground: reservation("foreground", 4), email: reservation("email", 8), cron: reservation("cron", 8),
       fresh: reservation("fresh", 8), backfill: reservation("backfill", 8) };
     this.shared = {
       requests: this.maxConcurrent - classes.reduce((sum, workClass) => sum + this.reserved[workClass].requests, 0),
@@ -84,7 +84,7 @@ export class InferenceCapacity {
     signal?.throwIfAborted(); integer(tokens, "Estimated inference tokens");
     let account = this.accounts.get(accountId);
     if (account === undefined) {
-      account = { active: counters(), tokens: counters(), queues: { foreground: [], cron: [], fresh: [], backfill: [] },
+      account = { active: counters(), tokens: counters(), queues: { foreground: [], email: [], cron: [], fresh: [], backfill: [] },
         deficits: counters(), cursor: 0, enter: true, exclusive: false, waiting: undefined, pumping: false };
       this.accounts.set(accountId, account);
     }

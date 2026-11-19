@@ -440,6 +440,7 @@ impl CalendarSource {
                         text.push_str("\n[Excerpt; read the original event for full details.]");
                     }
                     events.push(SourceEvent {
+                        attention: None,
                         occurred_at: event.updated.as_deref().and_then(rfc3339_millis),
                         id: id.clone(),
                         version,

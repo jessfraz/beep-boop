@@ -291,7 +291,11 @@ ownership.
   per-account page collectors -> originals + cursor compare-and-swap
                                         |
                            indexed dirty source entities
-                                        |
+                            |                     |
+                            |            bounded Slack noise policy
+                            |                     |
+                            |              explicit skip receipts
+                            |
                      concurrent routing-only reviewers
                                         |
                   atomic decision + task input / notice outbox
@@ -335,13 +339,20 @@ Global and provider limits bound transport concurrency without serializing
 unrelated accounts. Cursor admission compares against the checkpoint used by
 that page. Discovery and polling preserve configured credential scopes.
 
-Four native reviewer actors operate on disjoint leased entities. One actor is
-reserved for fresh evidence and one for backfill; the other two share work.
-Claims are bounded by originals, entities and input bytes independently of
-retained history. Current workspace guidance refreshes for every model request.
-Reviewers read evidence, task status and configured workflows, then commit
-structured routing decisions. They have no provider execution tools. They keep
-the configured model; there is no automatic cheaper-model dismissal path.
+Four default native reviewer actors operate on disjoint leased entities. Slot
+zero handles email only, slot one handles other fresh evidence, slot two shares
+fresh and historical non-mail work, and slot three handles non-mail backfill.
+Email rotates accounts and prefers fresh evidence on three turns out of four,
+then historical evidence on the fourth, falling back when its preferred class
+is empty. Email originals never expire or coalesce. Other sources cannot occupy
+its actor while it waits for new mail.
+
+Each new claim captures one provider/account, making its native model usage and
+routing counts attributable to that stream. Claims are bounded by originals,
+entities and input bytes independently of retained history. Current workspace
+guidance refreshes for every model request. Reviewers read evidence, task status
+and configured workflows, then commit structured routing decisions. They have
+no provider execution tools and keep the configured model.
 
 One Pi transaction validates captured decision revisions, records exact version
 decisions, admits deduplicated task inputs and creates durable effect tasks.
@@ -360,13 +371,22 @@ reads and claims do not hydrate unrelated originals or copy the pending corpus.
 Idle native documents expire after one second, while attached state stays owned;
 high-rate admission does not retain ten minutes of unrelated original payloads.
 `sources --diagnostics` exposes indexed backlog counts, reviewer claims,
-collector timing and cumulative admission/decision measurements.
+collector timing and cumulative admission/decision measurements. Per-stream
+review statistics include reviewed/routed/notified records, expired/coalesced
+records, native input/output/cache-read token totals, and review wall time.
+Model-duration sampling reads at most 32 native conversation entries per
+completed claim. Its request count and complete-entry timing coverage count
+distinguish partial samples from a complete native timing history. Review wall
+time includes admission waits and tools as well as model work; neither it nor
+the token totals establish billed spend. Legacy mixed-source claims receive no
+guessed per-stream attribution.
 
 Per-account inference admission reserves request and token working-set capacity
-for foreground input, cron, fresh evidence and backfill. Weighted fair admission
-allows history to progress while preserving interactive room. These are local
-resource limits; provider quota recovery remains separate, and no monetary or
-provider token limit is guessed.
+for foreground input, email, cron, fresh evidence and backfill. Email has its own
+reservation in addition to its dedicated reviewer. Weighted fair admission
+allows history to progress while preserving interactive and email capacity.
+These are local resource limits; provider quota recovery remains separate, and
+no monetary or provider token limit is guessed.
 
 An immutable-version conflict marks only that source batch unavailable. It
 retains originals, decisions and the checkpoint while other sources continue.
@@ -381,6 +401,33 @@ Both reads are bounded. Recent reads preserve that cursor and never mark its
 scan complete; a busy recent page may still leave newer messages for the
 following scan. Provider timestamps keep later backfill admissions from
 outranking current messages in triage.
+
+A separate native Pi task bounds Slack review noise without model calls or
+provider writes. Each commit visits at most 64 pending records and 512 KiB of
+original payload; one oversized original can own a batch for progress. It
+continues after 50 milliseconds while pages remain and waits five seconds when
+idle. Failures retain originals and retry with bounded backoff, with the error
+and last successful policy check exposed in diagnostics.
+
+Only positively public, ordinary Slack evidence is eligible. DMs, explicit
+mentions, private/unknown observations, claimed entities, exact task-linked
+sources, and messages containing any recognized work URL stay protected.
+Missing, invalid or future provider times also retain their pending work.
+Eligible work expires after 24 hours, or after 15 minutes while that account's
+Slack queue exceeds 5,000 pending records. An ordinary record at least 60 seconds
+old can instead coalesce into the newest pending version in its thread.
+Every removal from pending review records an explicit expired or coalesced
+decision, including the replacement key for coalescing. Separate counters expose
+this work reduction; immutable originals remain available.
+
+Rust emits explicit ordinary, direct, mention or protected attention for current
+Slack observations. The source record keeps mutable attention separately from
+its immutable event; direct, mention and protected evidence cannot be downgraded
+by a later ordinary observation. Account/channel hints never downgrade a direct
+conversation, and current protected hints block unknown history. A legacy
+original can borrow ordinary classification only from positive public evidence
+for its exact account, native channel identity and title, with MPDM-style titles
+kept protected. GitHub and the other provider retention policies are unchanged.
 
 Messages reads use Rex Server's existing macOS permission identity. A short
 action starts a headless Rust helper; subsequent calls collect bounded chunks.

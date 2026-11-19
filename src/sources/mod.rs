@@ -33,6 +33,17 @@ pub struct SourceCheckpoint {
     pub value: String,
 }
 
+/// Provider evidence used by source policy. Missing evidence never establishes
+/// that a retained original can be discarded.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAttention {
+    Ordinary,
+    Direct,
+    Mention,
+    Protected,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SourceEvent {
     pub id: String,
@@ -49,6 +60,12 @@ pub struct SourceEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub occurred_at: Option<u64>,
+    /// A non-content hint. Slack marks only positively public, unmentioned
+    /// messages ordinary and explicitly protects unclassified observations.
+    /// Non-Slack sources and legacy originals omit the hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attention: Option<SourceAttention>,
 }
 
 /// Coverage concerns the adapter's documented polling window, not an archive of
