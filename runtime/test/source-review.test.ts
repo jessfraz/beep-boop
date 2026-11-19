@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
-import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness, type TaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
@@ -422,6 +422,43 @@ test("continuous fresh arrivals cannot starve an old original inside the same ho
     }
     assert.ok(reviewed.includes("day-old"), "Alternating indexed ends must advance history despite an arrival before every claim");
     assert.ok(reviewed.some(id => id.startsWith("fresh-"))); assert.equal(new Set(reviewed).size, reviewed.length);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("fresh stream rotation cannot reset backfill progress across providers or reopen", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-class-fairness-")), path = join(directory, "session.sqlite");
+  const options = { workers: 2, maximumEvents: 1, maximumEntities: 1 }, controller = new AbortController();
+  const legacyState = defineDoc<{ generation: number; enabled: boolean; workers: TaskId[]; due: TaskId | null;
+    slots: (string | null)[]; turn: number; after: string | null }>({ kind: "agent.source.reviews", scope: "session", version: 1,
+    initial: () => ({ generation: 0, enabled: false, workers: [], due: null, slots: [null, null], turn: 0, after: null }), checkpointWhen: () => true });
+  let app = await open(path, options);
+  try {
+    await app.session.commit(tx => tx.doc(legacyState), BACKGROUND_CONTEXT);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, options);
+    const persisted = await app.session.snapshot(legacyState, BACKGROUND_CONTEXT); assert.ok(persisted);
+    assert.equal(Object.hasOwn(persisted, "fresh_after"), false, "The existing version-one document has no fresh cursor");
+    const old = Date.now() - 86_400_000;
+    for (const provider of ["github", "slack"]) await admit(app.sources, Array.from({ length: 6 }, (_, index) =>
+      ({ ...event(provider + "-" + index, provider + "-backlog", "Older pending evidence", provider), occurred_at: old + index })));
+    const task = await app.tasks.create({ title: "Fresh local results", outcome: "Retain each newly completed result" });
+    const backfill: string[] = [], fresh: string[] = [];
+    for (let turn = 0; turn < 4; turn++) {
+      app.faux.setResponses([input => { const captured = groups(input); backfill.push(...captured.flatMap(group => group.threads));
+        return answer(dismissed(captured)); }, fauxAssistantMessage("")]);
+      assert.equal(await app.reviews.review(1, controller.signal), true);
+      await app.session.commit(tx => app.sources.recordIn(tx, { task_id: task.id, conversation_id: task.conversation_id,
+        entry_id: null, tool_call_id: null, summary: "Fresh completed result " + turn, sources: [], state: { state: "progress" } }, false), BACKGROUND_CONTEXT);
+      app.faux.setResponses([input => { const captured = groups(input); fresh.push(...captured.flatMap(group => group.threads));
+        return answer(dismissed(captured)); }, fauxAssistantMessage("")]);
+      assert.equal(await app.reviews.review(0, controller.signal), true);
+      if (turn === 0) { await app.session.close(BACKGROUND_CONTEXT); app = await open(path, options); }
+    }
+    assert.deepEqual(backfill, ["github-backlog", "slack-backlog", "github-backlog", "slack-backlog"],
+      "A fresh task_outcomes claim must not steer the next historical turn back to GitHub and starve Slack");
+    assert.deepEqual(fresh, Array.from({ length: 4 }, () => task.id));
+    assert.equal((await app.sources.events({ provider: "github", pending: true })).length, 4);
+    assert.equal((await app.sources.events({ provider: "slack", pending: true })).length, 4);
+    assert.deepEqual(await app.sources.events({ provider: "task_outcomes", pending: true }), []);
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

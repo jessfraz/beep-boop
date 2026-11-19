@@ -25,9 +25,9 @@ type Claim = { id: string; slot: number; conversation_id: string; class: ReviewC
   captures: Capture[]; keys: string[]; content: string | null; phase: "review" | "applied" | "complete";
   proposal: string | null; effects: Effect[]; effects_task: TaskId | null; effect_cursor: number };
 type ReviewState = { generation: number; enabled: boolean; workers: TaskId[]; due: TaskId | null;
-  slots: (string | null)[]; turn: number; after: string | null };
+  slots: (string | null)[]; turn: number; after: string | null; fresh_after?: string | null };
 const State = defineDoc<ReviewState>({ kind: "agent.source.reviews", scope: "session", version: 1,
-  initial: () => ({ generation: 0, enabled: false, workers: [], due: null, slots: [], turn: 0, after: null }), checkpointWhen: () => true });
+  initial: () => ({ generation: 0, enabled: false, workers: [], due: null, slots: [], turn: 0, after: null, fresh_after: null }), checkpointWhen: () => true });
 const Claims = defineDocFamily<{ value: Claim | null }, null>({ kind: "agent.source.review", scope: "session", family: true,
   version: 1, initial: () => ({ value: null }), checkpointWhen: () => false });
 const WorkOwners = defineDocFamily<{ task_id: string | null }, null>({ kind: "agent.source.work-owner", scope: "session", family: true,
@@ -230,8 +230,6 @@ export class SourceReviews {
         const left = JSON.stringify([a.provider, a.account]), right = JSON.stringify([b.provider, b.account]);
         return left < right ? -1 : left > right ? 1 : 0;
       });
-      const after = state.after === null ? -1 : order.findIndex(source => JSON.stringify([source.provider, source.account]) > state.after!);
-      const start = after < 0 ? 0 : after;
       const preference: ReviewClass = state.turn++ % 4 === 3 ? "backfill" : "fresh";
       // Reserve an actor for new evidence and one for history. Inference
       // reservations alone cannot help if every actor already holds backfill.
@@ -239,6 +237,11 @@ export class SourceReviews {
         : !explicit && this.workers > 1 && slot === this.workers - 1 ? ["backfill"]
         : [preference, preference === "fresh" ? "backfill" : "fresh"];
       for (const workClass of classes) {
+        // Fresh arrivals must not reset historical streams' rotation. Keep the
+        // existing cursor for backfill when reopening version-one state.
+        const cursor = workClass === "fresh" ? state.fresh_after ?? null : state.after;
+        const after = cursor === null ? -1 : order.findIndex(source => JSON.stringify([source.provider, source.account]) > cursor);
+        const start = after < 0 ? 0 : after;
         const captures: Capture[] = [], keys: string[] = []; let bytes = 0, attempts = 0;
         const id = randomUUID();
         for (let offset = 0; offset < order.length && captures.length < this.maximumEntities; offset++) {
@@ -262,7 +265,9 @@ export class SourceReviews {
             const owned = await this.journal.index.claimEntityIn(tx, entity.id, id, newest);
             if (owned === undefined) continue;
             captures.push({ id: entity.id, revision: owned.revision, decision_revision: owned.decision_revision, keys: selected, group: `g${captures.length}` });
-            keys.push(...selected); state.after = JSON.stringify([source.provider, source.account]);
+            keys.push(...selected);
+            const cursor = JSON.stringify([source.provider, source.account]);
+            if (workClass === "fresh") state.fresh_after = cursor; else state.after = cursor;
           }
         }
         if (keys.length === 0) continue;
