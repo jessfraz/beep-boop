@@ -22,6 +22,30 @@ worker effect. It reports native overhead separately from synthetic model
 latency. Neither benchmark predicts real model speed or provider quotas; those
 require live indexed backlog and delivery readback after rollout.
 
+A native replay retained 10,000,000 actual originals across five invented
+providers with 512-byte bodies and skewed version histories. SQLite used FULL
+synchronous writes with fullfsync enabled. After closing and reopening the
+database, bounded operations measured:
+
+| Operation | Milliseconds |
+| --- | ---: |
+| Read five source records | 1.46 |
+| Exact lookup | 0.68 |
+| Missing lookup | 0.45 |
+| Claim five records | 14.73 |
+| Decide and release five records | 38.48 |
+
+The final SQL census confirmed all 10,000,000 original documents. Exact and
+missing lookups visited four index pages. A hot Slack entity with 399,995
+pending versions fetched its oldest five, newest five and five related
+references through eight history-index pages without hydrating originals.
+
+This replay took 4 hours 39 minutes, including resumptions and qualification;
+the final admission segment averaged 589 events per second. The database
+reached 78.19 GB, process memory peaked at 947 MB, and the document cache stayed
+below 7,127 records. These are observations for this synthetic workload, not
+model-throughput guarantees or CI thresholds.
+
 The separate **CLI performance** CI job compares a change with its pull request
 base or previous main commit on the same runner. It builds both in release mode,
 alternates baseline and candidate launches, and saves every timing in JSON.

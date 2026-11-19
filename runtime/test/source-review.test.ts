@@ -185,7 +185,7 @@ test("reviewing new evidence for an existing source owner prepares serializable 
       input => {
         const prepared: unknown = JSON.parse(userText(input)); assert.ok(object(prepared) && Array.isArray(prepared.related_tasks));
         assert.deepEqual(prepared.related_tasks, [{ id: owner.id, title: owner.title, state: { state: "open" },
-          sources: [original.source], summary: "Existing verified task progress" }]);
+          sources: [original.source], source_count: 1, sources_complete: true, summary: "Existing verified task progress" }]);
         return answer(dismissed(groups(input), "The owning task already accounted for this exact evidence"));
       },
       input => { toolResult(input); return fauxAssistantMessage(""); },
@@ -198,6 +198,49 @@ test("reviewing new evidence for an existing source owner prepares serializable 
     assert.deepEqual((await app.sources.originals([pending.key]))[0]?.decision,
       { type: "dismissed", reason: "The owning task already accounted for this exact evidence" });
     assert.deepEqual((await app.tasks.get(owner.id)).sources, [original.source]);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("review context and task reads retain captured ownership without expanding unrelated historical source links", { timeout: 30_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-bounded-review-context-")), path = join(directory, "session.sqlite");
+  let app = await open(path, { workers: 2 }); const controller = new AbortController();
+  try {
+    const first = event("captured-first", "first-thread"), shared = event("captured-shared", "shared-thread"), unowned = event("captured-unowned", "unowned-thread");
+    const unrelated = Array.from({ length: 512 }, (_, index) => ({ provider: "mail", account: "retained-example",
+      thread_id: "retained-source-link-" + index + "-original-evidence" }));
+    const firstSources = [...unrelated, first.source, shared.source], secondSources = [...unrelated.slice(0, 256), shared.source];
+    const firstOwner = await app.tasks.create({ id: "context-owner-a", title: "First existing owner", outcome: "Retain its actual work", model: fixtureModel, sources: firstSources });
+    const secondOwner = await app.tasks.create({ id: "context-owner-b", title: "Second existing owner", outcome: "Keep its own scope", model: fixtureModel, sources: secondSources });
+    await admit(app.sources, [first, shared, unowned]);
+    let preparedText = "", readText = "";
+    app.faux.setResponses([
+      input => { preparedText = userText(input); return fauxAssistantMessage(fauxToolCall("read_source_task", { task_id: firstOwner.id }), { stopReason: "toolUse" }); },
+      input => { readText = toolResult(input, "read_source_task"); return answer(dismissed(groups(input))); },
+      input => { toolResult(input); return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    t.diagnostic(JSON.stringify({ captured_events: 3, retained_task_sources: [firstSources.length, secondSources.length],
+      input_bytes: Buffer.byteLength(preparedText), task_read_bytes: Buffer.byteLength(readText) }));
+    assert.ok(Buffer.byteLength(preparedText) < 12_000, "Unrelated historical task links must not inflate the captured model input");
+    assert.ok(Buffer.byteLength(readText) < 4000, "Reading a related task must not reintroduce its retained source-link corpus");
+    assert.doesNotMatch(preparedText + readText, /retained-source-link-/u);
+    const prepared: unknown = JSON.parse(preparedText); assert.ok(object(prepared) && Array.isArray(prepared.related_tasks));
+    const related = prepared.related_tasks; assert.equal(related.length, 2);
+    const firstContext = related.find((item: unknown) => object(item) && item.id === firstOwner.id);
+    const secondContext = related.find((item: unknown) => object(item) && item.id === secondOwner.id);
+    assert.ok(object(firstContext) && Array.isArray(firstContext.sources)); assert.ok(object(secondContext) && Array.isArray(secondContext.sources));
+    assert.deepEqual(firstContext.sources, [first.source, shared.source]);
+    assert.deepEqual(secondContext.sources, [shared.source]);
+    assert.equal(firstContext.source_count, firstSources.length); assert.equal(secondContext.source_count, secondSources.length);
+    assert.equal(firstContext.sources_complete, false); assert.equal(secondContext.sources_complete, false);
+    const read: unknown = JSON.parse(readText); assert.ok(object(read) && Array.isArray(read.sources));
+    assert.deepEqual(read.sources, [first.source, shared.source]);
+    assert.equal(read.source_count, firstSources.length); assert.equal(read.sources_complete, false);
+    assert.deepEqual((await app.sources.events()).map(record => record.event), [unowned, shared, first]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 2 });
+    assert.deepEqual((await app.tasks.get(firstOwner.id)).sources, firstSources);
+    assert.deepEqual((await app.tasks.get(secondOwner.id)).sources, secondSources);
+    assert.deepEqual(await app.sources.events({ pending: true }), []);
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
