@@ -26,6 +26,7 @@ const Notice = defineEntry<{ provider: string; paused: boolean }>("agent.quota_s
 const PREFIX = "beep-boop:quota:", BASE = 300_000, LIMIT = 3_600_000, PROBE_LEASE = 90_000;
 export type QuotaClock = { now?: () => number; random?: () => number; setTimer?: SetTimer };
 type InferenceAdmission = { capacity: InferenceCapacity; workClass(model: Model<Api>, options: SimpleStreamOptions): Promise<InferenceClass> };
+type RequestAccount = string | { id: string; refreshApiKey(): Promise<string> };
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 export function isQuotaExhaustion(message: string | undefined): boolean {
@@ -86,7 +87,7 @@ export class QuotaRecovery {
   private readonly random: () => number;
   private readonly probes = new Map<string, string>();
   constructor(private readonly models: MutableModels, private readonly session: Promise<Harness>,
-    private readonly account: (model: Model<Api>, options: ProviderRequestOptions) => Promise<string>, private readonly clock: QuotaClock = {},
+    private readonly account: (model: Model<Api>, options: ProviderRequestOptions) => Promise<RequestAccount>, private readonly clock: QuotaClock = {},
     private readonly admission?: InferenceAdmission) {
     this.now = clock.now ?? Date.now; this.random = clock.random ?? Math.random;
   }
@@ -157,17 +158,18 @@ export class QuotaRecovery {
   }
   private async request(provider: Provider, model: Model<Api>, id: string, context: TranscriptContext, options: SimpleStreamOptions, emit: (event: AssistantMessageEvent) => void, retained = false): Promise<AssistantMessage> {
     options.signal?.throwIfAborted();
-    const account = await this.account(model, options);
-    if (this.admission === undefined) return this.requestAdmitted(provider, model, id, context, options, emit, account, retained);
+    const owner = await this.account(model, options), account = typeof owner === "string" ? owner : owner.id;
+    const refreshApiKey = typeof owner === "string" ? undefined : owner.refreshApiKey;
+    if (this.admission === undefined) return this.requestAdmitted(provider, model, id, context, options, emit, account, retained, refreshApiKey);
     const workClass = await this.admission.workClass(model, options);
     // Resource waits are outside Pi's mutation line. Recheck the durable quota
     // gate only after admission, so a queued request cannot use an old permit
     // to send traffic after another request exhausted the account.
     return this.admission.capacity.run(account, workClass, estimatedInferenceTokens(model, context, options),
-      () => this.requestAdmitted(provider, model, id, context, options, emit, account, retained), options.signal);
+      () => this.requestAdmitted(provider, model, id, context, options, emit, account, retained, refreshApiKey), options.signal);
   }
   private async requestAdmitted(provider: Provider, model: Model<Api>, id: string, context: TranscriptContext, options: SimpleStreamOptions,
-    emit: (event: AssistantMessageEvent) => void, account: string, retained: boolean): Promise<AssistantMessage> {
+    emit: (event: AssistantMessageEvent) => void, account: string, retained: boolean, refreshApiKey?: () => Promise<string>): Promise<AssistantMessage> {
     options.signal?.throwIfAborted();
     const session = await this.session;
     await session.root(BACKGROUND_CONTEXT);
@@ -193,7 +195,10 @@ export class QuotaRecovery {
     let response: ProviderResponse | undefined;
     let message: AssistantMessage;
     try {
-      const stream = provider.streamSimple(model, context, { ...options,
+      // Models resolves auth before this wrapper. A queued bearer may expire
+      // during admission; renew its same configured owner only at dispatch.
+      const apiKey = await refreshApiKey?.(); options.signal?.throwIfAborted();
+      const stream = provider.streamSimple(model, context, { ...options, ...(apiKey === undefined ? {} : { apiKey }),
         onResponse: async (value, actual) => { response = value; await options.onResponse?.(value, actual); } });
       for await (const event of stream) if (event.type !== "done" && event.type !== "error") emit(event);
       message = await stream.result();

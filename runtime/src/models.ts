@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderRequestOptions, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
+import { operationSignal, raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
 import { AgentDoc, configure, defineDoc, defineDocFamily, ProviderDoc, type AgentChange, type Conversation, type Harness, type Registry, type Tx } from "@earendil-works/pi-durable";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
@@ -12,6 +13,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
 import type { InferenceClass } from "./generated/InferenceClass.js";
+import type { AuthStatus } from "./generated/AuthStatus.js";
 import { withWebSearch } from "./web-search.js";
 import { QuotaRecovery } from "./quota.js";
 import { createCompaction, guardCompactionRequests } from "./compaction.js";
@@ -21,6 +23,8 @@ import { InferenceCapacity } from "./inference-capacity.js";
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
+const configuredAuth = Symbol("configuredAuth");
+type ConfiguredAuthOptions = ProviderRequestOptions & { [configuredAuth]?: Promise<AuthStatus> };
 
 /** Classify known provider failures without exposing their raw responses. */
 export async function modelFailureMessage(conversation: Conversation, fallback: string): Promise<string> {
@@ -130,15 +134,43 @@ export class ConversationModels {
         }),
       });
     }
-    const quota = new QuotaRecovery(models, this.session, async (model, options) => {
-      let identity = options?.apiKey ?? "ambient";
-      if (model.provider === "openai" && auth !== undefined) {
-        const status = await auth.status();
-        if (status.state === "connected") identity = `${status.account.issuer}:${status.account.subject}`;
+    if (auth !== undefined) {
+      // Capture ownership before Models resolves a bearer or pauses in caller
+      // hooks. Explicit keys retain their own intent; metadata stays ephemeral.
+      const mark = <T extends ProviderRequestOptions>(model: Model<Api>, options: T | undefined) => {
+        const owner = model.provider === "openai" && options?.apiKey === undefined ? auth.status() : undefined;
+        // Upstream auth can fail before the provider consumes this snapshot.
+        void owner?.catch(() => {});
+        return { ...options, ...(owner === undefined ? {} : { [configuredAuth]: owner }) };
+      };
+      const stream = models.streamSimple.bind(models), deferred = models.streamDeferred.bind(models);
+      models.streamSimple = (model, context, options) => stream(model, context, mark(model, options));
+      models.streamDeferred = (model, handle, options) => deferred(model, handle, mark(model, options));
+    }
+    const quota = new QuotaRecovery(models, this.session, async (model, options: ConfiguredAuthOptions) => {
+      const account = (identity: string) => createHash("sha256").update(JSON.stringify([model.provider, model.baseUrl, identity])).digest("hex");
+      const status = await options[configuredAuth];
+      if (model.provider === "openai" && auth !== undefined && status !== undefined) {
+        const verifyOwner = async () => {
+          const current = await auth.status();
+          if (current.state !== status.state || status.state === "connected" && (current.state !== "connected" ||
+              current.account.issuer !== status.account.issuer || current.account.subject !== status.account.subject)) {
+            throw new AuthError("refresh", "The configured ChatGPT account changed before dispatch; work is retained.");
+          }
+        };
+        await verifyOwner();
+        if (status.state === "connected") {
+          return { id: account(`${status.account.issuer}:${status.account.subject}`), refreshApiKey: () => raceWithAbortSignal((async () => {
+            await verifyOwner();
+            const credential = await auth.credential();
+            await verifyOwner();
+            return credential.access;
+          })(), operationSignal(options.signal)) };
+        }
       }
       // Access-token refreshes keep the account's cooldown; credentials never
       // enter durable request state or notices.
-      return createHash("sha256").update(JSON.stringify([model.provider, model.baseUrl, identity])).digest("hex");
+      return account(options.apiKey ?? "ambient");
     }, {}, { capacity, workClass: async (_model, options) => {
       return options.sessionId === undefined ? "foreground" : (await this.policy(options.sessionId))?.work_class ?? "foreground";
     } });
