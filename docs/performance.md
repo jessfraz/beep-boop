@@ -46,6 +46,23 @@ reached 78.19 GB, process memory peaked at 947 MB, and the document cache stayed
 below 7,127 records. These are observations for this synthetic workload, not
 model-throughput guarantees or CI thresholds.
 
+A separate native task-store replay retained 7,124 invented source references
+and 345 pending inputs on one task. Repeated source-membership scans had made
+ordinary task updates quadratic. Keyed membership preserves the same source
+identity and durable links while making these comparisons linear:
+
+| Task operation | Before, milliseconds | After, milliseconds |
+| --- | ---: | ---: |
+| Update metadata | 10,000 | 42 |
+| Admit a review input | 22,505 | 32 |
+| Relink sources | 12,615 | 47 |
+
+The native regression exercises those three operations after setup, with an
+independent 30-second admission watchdog. The original implementation exceeded
+that aggregate deadline; the fixed sequence completed in about 121 milliseconds.
+Separate native checks preserve duplicate references and their order, overlap
+semantics, ownership indexes, transactional rollback and reopen behavior.
+
 The separate **CLI performance** CI job compares a change with its pull request
 base or previous main commit on the same runner. It builds both in release mode,
 alternates baseline and candidate launches, and saves every timing in JSON.

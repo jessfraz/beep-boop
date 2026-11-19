@@ -226,17 +226,18 @@ export class TaskStore {
   }
   private async indexTaskIn(tx: Tx, task: TaskRecord, previous: readonly SourceRef[] = []): Promise<void> {
     const transitional = !(await tx.doc(RoutingMigration)).complete;
-    for (const source of previous) if (!task.sources.some(saved => related(saved, source))) {
-      await this.sourceOwners.deleteIn(tx, sourceReference(source), task.id);
+    const before = new Set(previous.map(sourceReference)), current = new Set(task.sources.map(sourceReference));
+    for (const reference of before) if (!current.has(reference)) {
+      await this.sourceOwners.deleteIn(tx, reference, task.id);
       if (transitional) {
-        const owners = await tx.doc(SourceOwners, sourceReference(source), null), index = owners.ids.indexOf(task.id);
+        const owners = await tx.doc(SourceOwners, reference, null), index = owners.ids.indexOf(task.id);
         if (index >= 0) owners.ids.splice(index, 1);
       }
     }
-    for (const source of task.sources) {
-      if (!previous.some(saved => related(saved, source))) await this.sourceOwners.setIn(tx, sourceReference(source), task.id, { id: task.id });
+    for (const reference of current) {
+      if (!before.has(reference)) await this.sourceOwners.setIn(tx, reference, task.id, { id: task.id });
       if (transitional) {
-        const owners = await tx.doc(SourceOwners, sourceReference(source), null);
+        const owners = await tx.doc(SourceOwners, reference, null);
         if (!owners.ids.includes(task.id)) owners.ids.push(task.id);
       }
     }
@@ -926,12 +927,15 @@ export class TaskStore {
   async relinkSourcesIn(tx: Tx, id: string, add: readonly SourceRef[], remove: readonly SourceRef[]): Promise<void> {
     const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
-    const added = add.filter((source, index) => !task.sources.some((saved) => related(saved, source)) &&
-      add.findIndex((other) => related(other, source)) === index).map((source) => ({ ...source }));
-    const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
-      .map((source) => ({ ...source }));
+    const existing = new Set(task.sources.map(sourceReference)), removals = new Set(remove.map(sourceReference));
+    const added = add.filter(source => {
+      const reference = sourceReference(source);
+      if (existing.has(reference)) return false;
+      existing.add(reference); return true;
+    }).map(source => ({ ...source }));
+    const sources: SourceRef[] = [], removed: SourceRef[] = [];
+    for (const source of task.sources) (removals.has(sourceReference(source)) ? removed : sources).push({ ...source });
     if (added.length === 0 && removed.length === 0) return;
-    const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);
     // Child records inherit their parent's source references. Each native tail

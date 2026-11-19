@@ -280,6 +280,13 @@ online host. Failed inspection and offline machines never prove closure.
 
 ## Sources and follow-through
 
+Staged queues and explicit resource controls are developed in
+[SEDA](https://www.sosp.org/2001/papers/welsh.pdf).
+[MillWheel](https://research.google/pubs/millwheel-fault-tolerant-stream-processing-at-internet-scale/)
+describes persistent state and record flow across a processing graph. The
+application keeps these stage boundaries within Pi's state and transaction
+ownership.
+
 ```text
   per-account page collectors -> originals + cursor compare-and-swap
                                         |
