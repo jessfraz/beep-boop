@@ -14,7 +14,7 @@ import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
-import { Executions } from "./tools.js";
+import { Executions, reviewSourceReferences, reviewTaskState, reviewTaskStatus } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 import { SourceIndex, type SourceRecord } from "./source-index.js";
 import { SourceMetrics } from "./source-metrics.js";
@@ -61,6 +61,22 @@ function sameEvent(left: SourceEvent, right: SourceEvent): boolean {
   // Provider time enriches scheduling; it does not change immutable source content.
   return left.id === right.id && left.version === right.version && sameSource(left.source, right.source) &&
     left.source.thread_id === right.source.thread_id && left.title === right.title && left.text === right.text;
+}
+
+/** Outcome references are retained in full in the journal. Reviewers need the
+ * published result and provenance, not every source ever linked to its actor. */
+export function sourceReviewRecord(record: StoredEvent): StoredEvent {
+  const outcome = record.outcome;
+  if (outcome === undefined) return record;
+  const references = reviewSourceReferences(outcome.sources);
+  const reconciliation = outcome.reconciliation;
+  const recovery = reconciliation?.recovery_inputs.slice(0, 16);
+  const view = { ...outcome, ...references, summary: outcome.summary.slice(-4000), summary_complete: outcome.summary.length <= 4000,
+    ...reviewTaskState(outcome.state),
+    ...(reconciliation === undefined ? {} : { reconciliation: { ...reconciliation, recovery_inputs: recovery ?? [] },
+      recovery_input_count: reconciliation.recovery_inputs.length, recovery_inputs_complete: reconciliation.recovery_inputs.length <= 16 }),
+    original_bytes: Buffer.byteLength(record.event.text), view: "task_outcome" };
+  return { ...record, outcome: view, event: { ...record.event, text: JSON.stringify(view) } };
 }
 
 /** Reclaim only this triage run after its execution context is bound. Pi owns
@@ -601,7 +617,7 @@ export class SourceJournal {
             if (newest) stream.newest = selected.order; else stream.oldest = selected.order;
             stream.remaining -= 1; continue;
           }
-          const size = Buffer.byteLength(JSON.stringify({ key: record.key, event: record.event }));
+          const size = Buffer.byteLength(JSON.stringify({ key: record.key, event: sourceReviewRecord(record).event }));
           if (events.length > 0 && bytes + size > maximumBytes) {
             blocked.add(id); deferred ??= id; return;
           }
@@ -695,10 +711,10 @@ export class SourceJournal {
           records.map((record) => record.event.title).join(" "), records.map((record) => record.event.source), 8,
           this.executions?.search(conversation.id.toString()));
         const prepared = "Continue this admitted source work; do not repeat completed actions.\n" + JSON.stringify({
-          observed_at: new Date().toISOString(), events: records.map((record) => ({ key: record.key, event: record.event })),
-          due_followups: due.map(task => ({ id: task.id, title: task.title, state: task.state, sources: task.sources,
-            summary_preview: task.summary.slice(0, 1200), summary_truncated: task.summary.length > 1200 })),
-          related_tasks: related.matches.map(match => ({ ...match, excerpt: match.excerpt.slice(0, 1200),
+          observed_at: new Date().toISOString(), events: records.map((record) => ({ key: record.key, event: sourceReviewRecord(record).event })),
+          due_followups: due.map(reviewTaskStatus),
+          related_tasks: related.matches.map(match => ({ ...match, title: match.title.slice(0, 4000), title_complete: match.title.length <= 4000,
+            excerpt: match.excerpt.slice(0, 1200),
             excerpt_truncated: match.excerpt.length > 1200 })), retrieval_gaps: related.gaps,
         });
         await this.session.commit(async (tx) => {
@@ -768,11 +784,14 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
     return execution;
   }
   const read = defineTool({ name: "read_source_events", replay: "safe",
-    description: "Read one bounded page of retained source originals and task links. Follow cursor while complete is false, including empty filtered pages. Completion describes this retained scan, not upstream provider coverage. Filter by account/thread or exact keys before acting.",
+    description: "Read one bounded page of retained evidence and task links. Review views bound task-outcome references with source_count/sources_complete; exact originals remain retained. Follow cursor while complete is false, including empty filtered pages. Completion describes this retained scan, not upstream provider coverage. Filter by account/thread or exact keys before acting.",
     parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })), provider: Type.Optional(Type.String()),
       account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),
       pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), cursor: Type.Optional(Type.String()) }),
-    async execute(args) { return output(await journal.eventPage(args)); } });
+    async execute(args, api) {
+      const page = await journal.eventPage(args), role = executions.role(api.conversationId.toString());
+      return output(role === "triage" || role === "review" ? { ...page, events: page.events.map(sourceReviewRecord) } : page);
+    } });
   const notifyUser = defineTool({ name: "notify_user", replay: "safe",
     description: "Publish a brief useful update or necessary user question to the main chat while work continues. Stay quiet for routine progress or receipts; do not request approval again for already authorized work.",
     parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: 4000 }) }, { additionalProperties: false }),

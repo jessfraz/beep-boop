@@ -18,6 +18,7 @@ import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { TaskInputReconciliation } from "./generated/TaskInputReconciliation.js";
 import type { TaskInputReceipt } from "./generated/TaskInputReceipt.js";
+import type { TaskInput } from "./generated/TaskInput.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
@@ -73,6 +74,7 @@ export type WorkerSession = {
 };
 type AttachedWorker = { revision: number; busy: boolean; admissions: number; attached: boolean; fenced: boolean; nativeActive: boolean; observer?: WorkerSession;
   conversation?: Conversation; call?: HostCall; finished: Promise<void>; finish(): void; wake?: () => void; drained?: () => void; input: ActorInput;
+  configuration?: { model: ModelSelection; prompt: string; cwd: string; instructions: string };
   controller?: AbortController };
 const Tasks = defineDoc<TaskIndex>({
   kind: "agent.tasks", scope: "session", version: 1,
@@ -275,7 +277,7 @@ export class TaskStore {
     const configured = await this.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
     const parent = agentId === undefined ? configured : await this.session.snapshot(AgentDoc,
       (await this.conversation(task.conversation_id)).id, BACKGROUND_CONTEXT);
-    const cwd = actor.pending[0]?.scheduled?.job.cwd ?? configured?.cwd ?? parent?.cwd ??
+    const cwd = configured?.cwd ?? actor.pending[0]?.scheduled?.job.cwd ?? parent?.cwd ??
       (task.worker.state === "unassigned" ? "/" : task.worker.host.cwd);
     const host = await this.environment.defaultHost(await this.environment.hosts(cwd, null, []));
     if (host === null) throw new TaskError("The task's coordinator execution host is offline; its input is retained");
@@ -404,7 +406,7 @@ export class TaskStore {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
     return this.attachments.input("", await this.attachmentRefs([id]), call);
   }
-  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender, noticeOrigin?: NoticeOrigin): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     let prepared: Awaited<ReturnType<AttachmentStore["input"]>>;
     if (refs === undefined || refs.length === 0) prepared = { content: text,
       ...(inputOrigin === undefined ? {} : { entry: { kind: "agent.input", data: { text, origin: inputOrigin } } }) };
@@ -412,7 +414,7 @@ export class TaskStore {
       if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
       prepared = await this.attachments.input(text, refs, call, inputOrigin);
     }
-    const origin = (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
+    const origin = noticeOrigin ?? (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
     if (sender === undefined && (origin === undefined || origin === null)) return prepared;
     const metadata = prepared.entry?.data;
     const context = sender?.type === "task" ? peerContext(text, sender) : undefined;
@@ -1073,6 +1075,10 @@ export class TaskStore {
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
       }, BACKGROUND_CONTEXT));
       if (mode !== undefined && active !== undefined) await this.admitActiveInputs(active);
+      else if (scheduled !== undefined && active !== undefined) {
+        try { await this.admitScheduledInput(active, await this.get(id)); }
+        catch { /* The committed outbox retains normal admission after a native gap. */ }
+      }
     } finally {
       if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
     }
@@ -1080,13 +1086,56 @@ export class TaskStore {
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
   }
+  /** Identical workflow snapshots need no idle configuration transition. Pi's
+   * steering boundary can place this new occurrence without moving or replacing
+   * any already admitted follow-up. A changed snapshot remains a hard barrier. */
+  private async admitScheduledInput(active: AttachedWorker, task: TaskRecord): Promise<void> {
+    const conversation = active.conversation, configuration = active.configuration;
+    if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted ||
+        active.input.agent_id !== undefined || conversation === undefined || configuration === undefined) return;
+    const input: TaskInput | undefined = task.pending.find(input => input.scheduled !== undefined);
+    if (input?.scheduled === undefined) return;
+    const job = input.scheduled.job;
+    if (!task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id) ||
+        configuration.prompt !== job.prompt || configuration.cwd !== job.cwd) return;
+    const matches = (model: ModelSelection) => model.provider === job.model.provider && model.model_id === job.model.model_id &&
+      model.reasoning === job.model.reasoning && model.fast === job.model.fast;
+    if (!matches(configuration.model) || !matches(await this.inference.peek(conversation, configuration.model))) return;
+    const origin = readNoticeOrigin({ job_id: job.id, title: job.title });
+    if (origin === undefined) return;
+    const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin, input.sender, origin);
+    const content = typeof prepared.content === "string" ? prepared.content : prepared.content.map(part => part.type === "image"
+      ? { type: part.type, data: part.data, mimeType: part.mimeType }
+      : { type: part.type, text: part.text, ...(part.textSignature === undefined ? {} : { textSignature: part.textSignature }) });
+    const entry = prepared.entry === undefined ? undefined : { kind: prepared.entry.kind,
+      ...(prepared.entry.data === undefined ? {} : { data: copyJson(prepared.entry.data, { omitUndefinedProperties: true }) }) };
+    await this.session.commit(async tx => {
+      // Only the busy queueing case is owned here. Pi places and settles this
+      // receipt at its normal boundary; idle admission keeps using submit().
+      // The model/settings check must share that commit with the receipt.
+      if (await tx.submissionByRequest(conversation.id, input.id) !== undefined) return;
+      const current = await this.taskIn(tx, task.id);
+      if (current === undefined || !current.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id) ||
+          JSON.stringify(current.pending.find(input => input.scheduled !== undefined)) !== JSON.stringify(input)) return;
+      const native = await tx.doc(AgentDoc, conversation.id);
+      if (native.cwd !== configuration.cwd || native.instructions !== configuration.instructions ||
+          !matches(await this.inference.peekIn(tx, conversation, configuration.model)) ||
+          (await tx.doc(LiveDoc, conversation.id)).run === undefined) return;
+      const inbox = await tx.doc(InboxDoc, conversation.id);
+      if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted || active.configuration !== configuration) return;
+      const receipt = await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId: input.id, status: "queued" });
+      inbox.items.push({ id: receipt.id, mode: "steer", content, ...(entry === undefined ? {} : { entry }) });
+    }, BACKGROUND_CONTEXT);
+  }
   private async admitActiveInputs(active: AttachedWorker): Promise<void> {
     const conversation = active.conversation;
     if (!active.nativeActive || !active.attached || active.fenced || active.observer?.signal.aborted || conversation === undefined) return;
     // The outbox is committed first. A crash between these commits retries
     // the same native request ID instead of injecting the input twice.
     try {
-      const queued = this.actor(await this.get(active.input.task_id), active.input.agent_id).pending;
+      const task = await this.get(active.input.task_id);
+      await this.admitScheduledInput(active, task);
+      const queued = this.actor(task, active.input.agent_id).pending;
       let scheduled = false;
       for (const input of queued) {
         // Scheduled turns and later follow-ups wait for their captured
@@ -1100,7 +1149,8 @@ export class TaskStore {
       }
     } catch { /* The durable outbox still owns admission through this actor. */ }
   }
-  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
+  async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] },
+    provenance?: { conversation_id: string; call_id: string }): Promise<TaskAgentRecord> {
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
         input.outcome.length > 4000) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
@@ -1113,10 +1163,16 @@ export class TaskStore {
     }
     const selected = input.model ?? await this.selection(taskId, DEFAULT_MODEL);
     const owner = await this.get(taskId);
+    if (provenance !== undefined) {
+      if (provenance.conversation_id !== owner.conversation_id) throw new TaskError("An agent must inherit its owning parent's native invocation");
+      this.assertSource(provenance.conversation_id);
+    }
     const previous = owner.agents.find(agent => agent.id === input.id);
     if (previous !== undefined) return previous;
     if (owner.agents.filter(agent => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
     const parent = await this.conversation(owner.conversation_id);
+    const invocationOrigin = provenance === undefined ? undefined
+      : await this.noticeOrigin(parent, (await this.origin(parent, provenance.call_id)).id);
     if (owner.worker.state === "bound") await this.workerHost(taskId);
     await this.resources?.attach(taskId);
     const native = await this.admit(input.attachments, () => this.session.commit(async (tx) => {
@@ -1127,8 +1183,10 @@ export class TaskStore {
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent));
-      const lineage = await tx.doc(NoticeLineage, parent.id);
-      if (lineage.origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...lineage.origin };
+      // Tool-created children follow their actual placed input. A future queued
+      // occurrence cannot retag an earlier invocation through the actor default.
+      const origin = provenance === undefined ? (await tx.doc(NoticeLineage, parent.id)).origin : invocationOrigin;
+      if (origin !== undefined && origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...origin };
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
         pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
@@ -1585,6 +1643,7 @@ export class TaskStore {
         (await tx.doc(LiveDoc, conversation.id)).run === undefined &&
         (await tx.doc(InboxDoc, conversation.id)).items.every((item) => item.mode === "write") &&
         await tx.submissionByRequest(conversation.id, pending.id) === undefined, BACKGROUND_CONTEXT) ? pending.scheduled : undefined;
+      if (bootstrap !== undefined) executionHost = { ...executionHost, cwd: bootstrap.job.cwd };
       const fallback = input.type === "background" ? await this.environment?.model(null) ?? DEFAULT_MODEL : input.model;
       let selected = bootstrap?.job.model ?? await this.selection(input.task_id, fallback, input.agent_id);
       await prepare?.(selected);
@@ -1607,6 +1666,8 @@ export class TaskStore {
       };
       if (bootstrap === undefined) selected = await this.inference.configureCurrent(conversation, selected, initial);
       else await this.inference.configure(conversation, selected, initial);
+      active.configuration = { model: { ...selected }, prompt: bootstrap?.job.prompt ?? actor.outcome,
+        cwd: initial.cwd, instructions: initial.instructions };
       unbind = bind(conversation, executionHost, selected);
       active.attached = true;
       if (controller?.signal.aborted) { abort(); throw new TaskError("Background execution stopped; its native input is retained"); }
@@ -1704,6 +1765,15 @@ export class TaskStore {
         await this.resources?.attach(input.task_id);
         await observer?.beforeTurn?.();
         if (active.fenced || observer?.signal.aborted) break;
+        if (next.scheduled !== undefined && queued?.receipt === undefined) {
+          // Recovered native work may have consumed its app outbox, and a new
+          // occurrence can arrive after binding. Try its unchanged snapshot
+          // before entering the idle-only configuration path in either case.
+          active.nativeActive = true;
+          try { await this.admitScheduledInput(active, task); }
+          catch { /* Normal admission retains the captured configuration boundary. */ }
+          finally { active.nativeActive = false; }
+        }
         if (next.scheduled !== undefined && await this.session.commit(
           (tx) => tx.submissionByRequest(conversation.id, next.id), BACKGROUND_CONTEXT) === undefined) {
           // One workflow chat can outlive many revisions of its file. Apply
@@ -1712,7 +1782,9 @@ export class TaskStore {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           await prepare?.(job.model);
           if (controller?.signal.aborted) break;
-          await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions });
+          const configuredInstructions = await instructions(job.prompt);
+          delete active.configuration;
+          await this.inference.configure(conversation, job.model, { instructions: configuredInstructions, cwd: job.cwd, extensions });
           await this.session.commit(async (tx) => {
             (await tx.doc(NoticeLineage, conversation.id)).origin = readNoticeOrigin({ job_id: job.id, title: job.title }) ?? null;
             await this.updateIn(tx, task.id, (current) => {
@@ -1726,6 +1798,7 @@ export class TaskStore {
           task = await this.get(task.id);
           selected = { ...job.model };
           executionHost = { ...executionHost, cwd: job.cwd };
+          active.configuration = { model: { ...selected }, prompt: job.prompt, cwd: job.cwd, instructions: configuredInstructions };
           unbind?.(); unbind = bind(conversation, executionHost, selected);
           await observer?.configured?.(conversation, task.title);
         }

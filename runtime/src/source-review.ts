@@ -11,10 +11,10 @@ import type { SourceRef } from "./generated/SourceRef.js";
 import type { SourceKey } from "./generated/SourceKey.js";
 import type { ScheduledJobStatus } from "./generated/ScheduledJobStatus.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
-import { SourceJournal, recoverSourceRun, type StoredEvent } from "./sources.js";
+import { SourceJournal, recoverSourceRun, sourceReviewRecord, type StoredEvent } from "./sources.js";
 import { SourceMetrics, SourceStatistics, emptySourceMetrics, emptyReviewStatistics } from "./source-metrics.js";
 import { SourceNoisePolicy, sourceStatisticsKey } from "./source-policy.js";
-import { Executions } from "./tools.js";
+import { Executions, reviewSourceReferences, reviewTaskState, reviewTaskStatus } from "./tools.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore } from "./tasks.js";
 import { scheduledTaskId } from "./scheduled.js";
 import { sourceWorkResource, sourceWorkResources } from "./source-work.js";
@@ -73,7 +73,8 @@ function taskSources(sources: readonly SourceRef[], captured: readonly SourceRef
     selected.push(source);
     if (remaining.size === 0) break;
   }
-  return { sources: selected, source_count: sources.length, sources_complete: selected.length === sources.length };
+  const view = reviewSourceReferences(selected);
+  return { ...view, source_count: sources.length, sources_complete: view.sources.length === sources.length };
 }
 function detachedClaim(value: Readonly<Claim>): Claim {
   return { ...value, model: value.model === null ? null : { ...value.model }, keys: [...value.keys],
@@ -177,15 +178,14 @@ export class SourceReviews {
     });
     registry.install({ name: "source-review", tasks: [this.workerTask, this.effectTask, this.dueTask, this.policyTask] });
     this.tools = defineExtension({ name: "source-review-tools", tools: [
-      defineTool({ name: "read_source_events", replay: "safe", description: "Read original evidence in bounded pages. Continue with cursor when complete is false; an empty partial page does not establish absence.",
-        parameters: Type.Object({ provider: Type.Optional(Type.String()), account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()),
+      defineTool({ name: "read_source_events", replay: "safe", description: "Read evidence in bounded pages. Task-outcome views expose source_count/sources_complete while retaining exact entry provenance and canonical originals. Continue with cursor when complete is false; an empty partial page does not establish absence.",
+        parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })), provider: Type.Optional(Type.String()), account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()),
           query: Type.Optional(Type.String()), pending: Type.Optional(Type.Boolean()), cursor: Type.Optional(Type.String()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
-        execute: async args => result(await journal.eventPage(args)) }),
+        execute: async args => { const page = await journal.eventPage(args); return result({ ...page, events: page.events.map(sourceReviewRecord) }); } }),
       defineTool({ name: "read_source_task", replay: "safe", description: "Read current task ownership, progress, pending inputs and state. Sources show only references captured by this review; source_count counts all retained links and sources_complete reports whether all links are shown.",
         parameters: Type.Object({ task_id: Type.String() }), execute: async (args, api) => {
           const [task, captured] = await Promise.all([tasks.get(args.task_id), this.capturedSources(api.conversationId.toString())]);
-          return result({ id: task.id, title: task.title, outcome: task.outcome, state: task.state, ...taskSources(task.sources, captured),
-            pending: task.pending.map(input => ({ id: input.id })), summary: task.summary.slice(-4000) }); } }),
+          return result({ ...reviewTaskStatus(task), ...taskSources(task.sources, captured) }); } }),
       defineTool({ name: "list_source_workflows", replay: "safe", description: "List configured standing workflows and their owning task IDs. Read applicable workflows before dismissing potentially authorized work.",
         parameters: Type.Object({ after: Type.Optional(Type.String()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
         execute: async args => { const all = (await callbacks.workflows()).sort((a, b) => a.job.id.localeCompare(b.job.id));
@@ -298,8 +298,10 @@ export class SourceReviews {
                 attempts++;
                 const record = await this.journal.sourceRecordIn(tx, item.key);
                 if (record === undefined) throw new TaskError("Claimed source evidence is unavailable");
-                if (record.outcome !== undefined && this.tasks.isRunning(record.outcome.task_id)) continue;
-                const size = Buffer.byteLength(JSON.stringify(record.event));
+                // A published entry is immutable even while its actor drains
+                // later inputs. Only entry-less in-flight failures must wait.
+                if (record.outcome !== undefined && record.outcome.entry_id === null && this.tasks.isRunning(record.outcome.task_id)) continue;
+                const size = Buffer.byteLength(JSON.stringify(sourceReviewRecord(record).event));
                 if (keys.length + selected.length > 0 && bytes + size > maximumBytes) break;
                 selected.push(item.key); bytes += size;
               }
@@ -372,9 +374,10 @@ export class SourceReviews {
         const workflows = await this.callbacks.workflows();
         content = JSON.stringify({ observed_at: new Date().toISOString(), groups: claim.captures.map(capture => ({ id: capture.group,
           revision: capture.revision, events: capture.keys.map(key => { const record = records.get(key); if (record === undefined) throw new TaskError("Captured source original is unavailable");
-            return { key, event: record.event }; }) })),
-          related_tasks: (await this.tasks.findBySources(refs, 8)).map(task => ({ id: task.id, title: task.title, state: task.state,
-            ...taskSources(task.sources, refs), summary: task.summary.slice(-1200) })),
+            return { key, event: sourceReviewRecord(record).event }; }) })),
+          related_tasks: (await this.tasks.findBySources(refs, 8)).map(task => ({ id: task.id, title: task.title.slice(0, 4000),
+            title_complete: task.title.length <= 4000, ...reviewTaskState(task.state),
+            ...taskSources(task.sources, refs), summary: task.summary.slice(-1200), summary_complete: task.summary.length <= 1200 })),
           workflows: workflows.slice(0, 100).map(item => ({ id: item.job.id, title: item.job.title, task_id: item.task_id ?? null })),
           more_workflows: workflows.length > 100 });
         await this.session.commit(async tx => { const saved = (await tx.doc(Claims, claim.id, null)).value;
@@ -529,6 +532,13 @@ export class SourceReviews {
             outcome: job?.job.prompt ?? proposal.outcome,
             ...(job !== undefined ? { model: job.job.model } : claim.model === null ? {} : { model: claim.model }),
             execution: "coordinator", sources: [...refs, ...(job === undefined ? [] : [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }])] });
+          // Root progress is already in its own actor history. Child results
+          // and evidence from other actors remain valid continuation inputs.
+          const target = await this.tasks.findIn(tx, created.id);
+          if (target !== undefined && this.tasks.isRunning(target.id) && records.every(record =>
+            record.outcome?.task_id === target.id && record.outcome.conversation_id === target.conversation_id)) {
+            throw new TaskError("This running actor already owns its published progress; notify or dismiss it instead of feeding it back as new input");
+          }
           owner.task_id = created.id;
           const inputId = `source-review:${digest([created.id, [...keys].sort()])}`;
           const input = [proposal.input, job === undefined ? "" : `Configured workflow authorization and instructions:\n${job.job.prompt}`,

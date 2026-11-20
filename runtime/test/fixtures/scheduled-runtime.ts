@@ -35,7 +35,8 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }, { id: "fixture-updated" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
   const registry = createRegistry();
-  const session = await Harness.open(await SqliteStorage.open(database), { models, registry,
+  const storage = await SqliteStorage.open(database);
+  const session = await Harness.open(storage, { models, registry,
     ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }),
     identity: { attribution: null }, settings: { retry: { enabled: false } } }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models), tasks = new TaskStore(session, inference);
@@ -84,5 +85,5 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     const detached = tasks.detachBackground();
     await session.close(BACKGROUND_CONTEXT); await detached;
   };
-  return { session, tasks, sources, environment, call, commands, faux, executions, registry, sourceTools, configureBackground, views, close };
+  return { session, storage, tasks, sources, environment, call, commands, faux, executions, registry, sourceTools, configureBackground, views, close };
 }

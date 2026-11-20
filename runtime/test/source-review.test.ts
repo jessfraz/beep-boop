@@ -248,8 +248,8 @@ test("reviewing new evidence for an existing source owner prepares serializable 
     app.faux.setResponses([
       input => {
         const prepared: unknown = JSON.parse(userText(input)); assert.ok(object(prepared) && Array.isArray(prepared.related_tasks));
-        assert.deepEqual(prepared.related_tasks, [{ id: owner.id, title: owner.title, state: { state: "open" },
-          sources: [original.source], source_count: 1, sources_complete: true, summary: "Existing verified task progress" }]);
+        assert.deepEqual(prepared.related_tasks, [{ id: owner.id, title: owner.title, title_complete: true, state: { state: "open" }, state_complete: true,
+          sources: [original.source], source_count: 1, sources_complete: true, summary: "Existing verified task progress", summary_complete: true }]);
         return answer(dismissed(groups(input), "The owning task already accounted for this exact evidence"));
       },
       input => { toolResult(input); return fauxAssistantMessage(""); },

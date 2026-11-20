@@ -9,6 +9,8 @@ import { DEFAULT_MODEL } from "./models.js";
 import { agentPresentation, commandPresentation, outputPreview, type MessageContent } from "./message-presentation.js";
 import type { ToolCall } from "@earendil-works/pi-ai";
 import type { TaskRecord } from "./generated/TaskRecord.js";
+import type { SourceRef } from "./generated/SourceRef.js";
+import type { TaskOutcomeState } from "./generated/TaskOutcomeState.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import { recordDelegation } from "./delegation.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -74,6 +76,7 @@ export class Executions {
     return execution.hosts;
   }
   search(id: string): SearchQuery | undefined { return this.attached.get(id)?.search; }
+  role(id: string): Execution["role"] { return this.attached.get(id)?.role; }
   model(id: string): ModelSelection | undefined { return this.attached.get(id)?.model; }
   setModel(id: string, model: ModelSelection): void {
     const execution = this.attached.get(id);
@@ -83,6 +86,37 @@ export class Executions {
 
 function output(value: unknown, isError = false): ToolExecutionResult {
   return { output: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) ?? "" }], isError };
+}
+
+/** Review context is a bounded view; canonical source identities stay complete. */
+export function reviewSourceReferences(sources: readonly SourceRef[]) {
+  const selected: SourceRef[] = []; let bytes = 0;
+  for (const source of sources) {
+    const size = Buffer.byteLength(JSON.stringify(source));
+    if (selected.length >= 64 || bytes + size > 8192) break;
+    selected.push({ ...source }); bytes += size;
+  }
+  return { sources: selected, source_count: sources.length, sources_complete: selected.length === sources.length };
+}
+
+export function reviewTaskState(state: TaskOutcomeState): { state: TaskOutcomeState; state_complete: boolean };
+export function reviewTaskState(state: TaskRecord["state"]): { state: TaskRecord["state"]; state_complete: boolean };
+export function reviewTaskState(state: TaskRecord["state"] | TaskOutcomeState): { state: TaskRecord["state"] | TaskOutcomeState; state_complete: boolean } {
+  if (state.state === "waiting") return { state: { ...state, actor: state.actor.slice(0, 4000),
+    next_check: state.next_check?.slice(0, 4000) ?? null }, state_complete: state.actor.length <= 4000 && (state.next_check?.length ?? 0) <= 4000 };
+  if (state.state === "resolved") return { state: { ...state, evidence: state.evidence.slice(0, 4000) }, state_complete: state.evidence.length <= 4000 };
+  if (state.state === "failed") return { state: { ...state, reason: state.reason.slice(0, 4000) }, state_complete: state.reason.length <= 4000 };
+  return { state, state_complete: true };
+}
+
+export function reviewTaskStatus(task: TaskRecord) {
+  return { id: task.id, conversation_id: task.conversation_id, title: task.title.slice(0, 4000), title_complete: task.title.length <= 4000,
+    ...reviewTaskState(task.state),
+    outcome: task.outcome.slice(0, 4000), outcome_complete: task.outcome.length <= 4000,
+    summary: task.summary.slice(-4000), summary_complete: task.summary.length <= 4000,
+    worker: { state: task.worker.state }, ...reviewSourceReferences(task.sources),
+    pending: task.pending.slice(0, 32).map(input => ({ id: input.id })),
+    pending_count: task.pending.length, pending_complete: task.pending.length <= 32, agent_count: task.agents.length };
 }
 function agentOutput(name: string, args: ToolCall["arguments"], sender: string, value: TaskRecord | TaskAgentRecord[], targetAgentId?: string): ToolExecutionResult {
   const details: MessageContent = { role: "tool", text: "", presentation: agentPresentation({ name, arguments: args }, sender, value, targetAgentId) };
@@ -316,7 +350,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         if (!Check(readTaskParameters, prepared)) throw new TaskError("Invalid task read arguments");
         return prepared;
       },
-      async execute(args) {
+      async execute(args, api) {
         if ((args.task_id === undefined) === (args.conversation_id === undefined)) throw new TaskError("Choose a task_id or conversation_id");
         // An already checkpointed call resumes without prepareArguments.
         const includeHistory = args.include_history !== false;
@@ -328,7 +362,9 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
             originals: includeHistory && args.entry_ids !== undefined ? await tasks.originals(args.conversation_id, args.entry_ids, args.offset) : undefined });
         }
         if (args.task_id === undefined) throw new TaskError("Choose a task");
-        return output({ task: await tasks.get(args.task_id), history: includeHistory ? await tasks.history(args.task_id, 120_000, args.agent_id) : undefined });
+        const task = await tasks.get(args.task_id), role = executions.role(api.conversationId.toString());
+        return output({ task: role === "triage" || role === "review" ? reviewTaskStatus(task) : task,
+          history: includeHistory ? await tasks.history(args.task_id, 120_000, args.agent_id) : undefined });
       } });
   const main = defineExtension({ name: "task-main", tools: [searchTask, readTask,
     defineTool({ name: "revoke_allocation", description: "Cancel one exact unresolved new allocation with no known Rex session. Preserves input and history; known sessions must be reconciled.",
@@ -446,7 +482,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         if (owner.agent !== undefined) throw new TaskError("Only the parent worker may spawn task agents");
         const id = await api.memo("agent_id", randomUUID(), context);
         const inputId = await api.memo("agent_input_id", randomUUID(), context);
-        await tasks.createAgent(owner.task.id, { ...args, id, inputId, attachments: await tasks.attachmentRefs(args.attachments) });
+        await tasks.createAgent(owner.task.id, { ...args, id, inputId, attachments: await tasks.attachmentRefs(args.attachments) },
+          { conversation_id: api.conversationId.toString(), call_id: api.callId });
         return agentOutput("spawn_agent", args, api.conversationId.toString(), await tasks.dispatchAgent(owner.task.id, id, execution.call), id);
       } });
   const readAgents = defineTool({ name: "read_agents", description: "Read this task's agent progress and results.", replay: "safe",

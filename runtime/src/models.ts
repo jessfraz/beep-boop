@@ -261,7 +261,8 @@ export class ConversationModels {
       if (!extensions.includes(this.compaction.name)) extensions.push(this.compaction.name);
     } else agent.extensions = { ...extensions, add: [...new Set([...(extensions?.add ?? []), this.compaction.name])] };
   }
-  private async currentIn(tx: Tx, conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
+  /** Native model and application policy from the caller's admission commit. */
+  async peekIn(tx: Tx, conversation: Pick<Conversation, "id">, fallback: ModelSelection): Promise<ModelSelection> {
     const native = await tx.doc(AgentDoc, conversation.id);
     if (native.model === undefined) return { ...fallback };
     if (!provider(native.model.provider)) throw new ModelError("The saved provider is unavailable; its conversation was retained.");
@@ -274,7 +275,7 @@ export class ConversationModels {
   async configureCurrent(conversation: Conversation, fallback: ModelSelection, change: AgentChange): Promise<ModelSelection> {
     const session = await this.session;
     return session.commit(async (tx) => {
-      const selected = await this.currentIn(tx, conversation, fallback); this.validate(selected);
+      const selected = await this.peekIn(tx, conversation, fallback); this.validate(selected);
       await this.configureIn(tx, conversation, selected, change); return selected;
     }, BACKGROUND_CONTEXT);
   }
@@ -302,7 +303,7 @@ export class ConversationModels {
     const resolved = change.type === "set_model" ? { ...change, provider: change.provider ?? current.provider } : change;
     if (resolved.type === "set_model" || resolved.type === "set_selection") await this.preflight(this.changed(current, resolved));
     return session.commit(async (tx) => {
-      const current = await this.currentIn(tx, conversation, fallback);
+      const current = await this.peekIn(tx, conversation, fallback);
       const selected = this.changed(current, resolved); this.validate(selected);
       await this.configureIn(tx, conversation, selected, {});
       await save?.(tx, selected); return selected;
@@ -310,7 +311,7 @@ export class ConversationModels {
   }
   async legacy(conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
     const session = await this.session;
-    return session.commit((tx) => this.currentIn(tx, conversation, fallback), BACKGROUND_CONTEXT);
+    return session.commit((tx) => this.peekIn(tx, conversation, fallback), BACKGROUND_CONTEXT);
   }
   /** Presentation must not create native provider or configuration documents. */
   async peek(conversation: Conversation, fallback: ModelSelection): Promise<ModelSelection> {
