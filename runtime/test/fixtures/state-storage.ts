@@ -47,6 +47,7 @@ export class SqlTrace {
     return {
       async exec(sql) { record(sql, []); return executor.exec(sql); },
       async run(sql, ...params) { record(sql, params); return executor.run(sql, ...params); },
+      async runCounted(sql, ...params) { record(sql, params); return executor.runCounted(sql, ...params); },
       async get<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T | undefined> {
         const sample = record(sql, params), value = await executor.get<T>(sql, ...params); rows(sample, value === undefined ? [] : [value]); return value;
       },
