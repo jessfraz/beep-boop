@@ -2481,12 +2481,19 @@ fn run(
         if inputs.is_closed() {
             return screen.finish(&mut state);
         }
+        // A retained-history burst can fill the update queue. Bound each
+        // batch by frame time so its first page and input remain responsive.
+        let updates_started = Instant::now();
+        let mut updates_pending = true;
         for _ in 0..256 {
             match updates.try_recv() {
                 Ok(Update::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
                     return screen.finish(&mut state);
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    updates_pending = false;
+                    break;
+                }
                 Ok(Update::Event(event)) => state.event(*event),
                 Ok(Update::ToolDetails { request, result }) => {
                     state.activity.receive(&request, result);
@@ -2547,6 +2554,9 @@ fn run(
                     state.reset_conversation(info);
                 }
             }
+            if updates_started.elapsed() >= Duration::from_millis(8) {
+                break;
+            }
         }
         if state.working && tick.elapsed() >= Duration::from_secs(1) {
             state.changed = true;
@@ -2555,8 +2565,11 @@ fn run(
         if state.changed {
             screen.draw(&mut state)?;
         }
-        if event::poll(Duration::from_millis(40))?
-            && let Some(input) = state.input(event::read()?)
+        if event::poll(if updates_pending {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(40)
+        })? && let Some(input) = state.input(event::read()?)
         {
             inputs
                 .send(input)
