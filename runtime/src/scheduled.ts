@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Conversation, ConversationId, Cursor, EntryRecord, Harness } from "@earendil-works/pi-durable";
+import { defineDocFamily, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { ScheduledJob } from "./generated/ScheduledJob.js";
+import type { TaskRecord } from "./generated/TaskRecord.js";
+import type { ToolCall } from "@earendil-works/pi-ai";
 import { SourceJournal } from "./sources.js";
 import { publishMainNotice, TaskError, TaskStore } from "./tasks.js";
 import { isQuotaExhaustion } from "./quota.js";
@@ -34,36 +36,83 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore): Promise
   return owners[0]?.id;
 }
 
+function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function recordedResult(call: ToolCall, task: TaskRecord): string | undefined {
+  const state = call.arguments.state, summary = call.arguments.summary;
+  if (call.arguments.task_id !== undefined && call.arguments.task_id !== task.id || typeof summary !== "string" ||
+      !object(state)) return;
+  const current = task.state;
+  const matches = current.state === "resolved" ? state.state === "resolved" && state.evidence === current.evidence
+    : current.state === "waiting" && state.state === "waiting" && state.actor === current.actor && state.next_check === current.next_check;
+  // record_task stores the bounded tail. Match the actual saved outcome rather
+  // than borrowing metadata that another input or an earlier run supplied.
+  return matches && task.summary === summary.slice(-4000) && task.summary.trim().length > 0 ? task.summary : undefined;
+}
+
+type ManualResult = { entry_id: EntryId; text: string; fulfilled: boolean };
+const ManualResults = defineDocFamily<{ result: ManualResult | null }, null>({
+  kind: "agent.job.manual-result", scope: "conversation", family: true, version: 1, history: "latest", fork: "initial",
+  initial: () => ({ result: null }), checkpointWhen: () => true,
+});
+
 async function requestedResult(occurrence: ScheduledOccurrence, conversation: Conversation, tasks: TaskStore, id: string): Promise<void> {
   if (occurrence.manual === undefined) return;
-  let cursor: Cursor | undefined, answer: EntryRecord | undefined;
-  const publishedCalls = new Set<string>(), notifications = new Map<string, string>();
-  for (;;) {
-    const page = await conversation.entries({ order: "descending" }, 64, cursor, BACKGROUND_CONTEXT);
-    for (const entry of page.items) for (const message of entry.model ?? []) {
-      if (message.role === "toolResult" && message.toolName === "notify_user" && !message.isError &&
-          message.content.some(part => part.type === "text" && part.text === "Published to the main chat.")) publishedCalls.add(message.toolCallId);
-      if (message.role === "assistant") for (const part of message.content) {
-        if (part.type === "toolCall" && part.name === "notify_user" && typeof part.arguments.text === "string") {
-          notifications.set(part.id, part.arguments.text.trim());
+  let receipt = (await tasks.session.snapshot(ManualResults, conversation.id, occurrence.id, BACKGROUND_CONTEXT))?.result;
+  if (receipt?.fulfilled) return;
+  let task: TaskRecord | undefined;
+  if (receipt == null) {
+    let cursor: Cursor | undefined, answer: EntryRecord | undefined;
+    const publishedCalls = new Set<string>(), notifications = new Map<string, string>();
+    let recordedCall: string | undefined;
+    let recorded: { entry: EntryRecord; call: ToolCall } | undefined;
+    for (;;) {
+      const page = await conversation.entries({ order: "descending" }, 64, cursor, BACKGROUND_CONTEXT);
+      for (const entry of page.items) for (const message of entry.model ?? []) {
+        if (message.role === "toolResult" && message.toolName === "notify_user" && !message.isError &&
+            message.content.some(part => part.type === "text" && part.text === "Published to the main chat.")) publishedCalls.add(message.toolCallId);
+        if (message.role === "toolResult" && message.toolName === "record_task" && !message.isError) recordedCall ??= message.toolCallId;
+        if (message.role === "assistant") for (const part of message.content) {
+          if (part.type === "toolCall" && part.name === "notify_user" && typeof part.arguments.text === "string") {
+            notifications.set(part.id, part.arguments.text.trim());
+          }
+          if (part.type === "toolCall" && part.name === "record_task" && part.id === recordedCall && recorded === undefined) recorded = { entry, call: part };
         }
+        if (answer === undefined && message.role === "assistant" && message.stopReason === "stop") answer = entry;
       }
-      if (answer === undefined && message.role === "assistant" && message.stopReason === "stop") answer = entry;
+      if (page.next === undefined) break;
+      cursor = page.next;
     }
-    if (page.next === undefined) break;
-    cursor = page.next;
+    if (answer === undefined) throw new TaskError("The requested job has no completed result; its reply obligation remains open");
+    task = await tasks.get(id);
+    let text = answer.model?.flatMap(message => message.role === "assistant"
+      ? message.content.flatMap(part => part.type === "text" ? [part.text] : []) : []).join("\n").trim() ?? "";
+    if (text.length === 0) {
+      const outcome = recorded === undefined ? undefined : recordedResult(recorded.call, task);
+      if (recorded === undefined || outcome === undefined) throw new TaskError("The requested job returned an empty result; its reply obligation remains open");
+      text = outcome; answer = recorded.entry;
+    }
+    // Capture the original result before publishing. A crash after display or
+    // a later owned input must retry this same entry/text, never select again.
+    const candidate: ManualResult = { entry_id: answer.id, text,
+      fulfilled: [...publishedCalls].some(call => notifications.get(call) === text.trim()) };
+    receipt = await tasks.session.commit(async tx => {
+      const saved = await tx.doc(ManualResults, conversation.id, occurrence.id, null);
+      saved.result ??= candidate;
+      return { ...saved.result };
+    }, BACKGROUND_CONTEXT);
   }
-  if (answer === undefined) throw new TaskError("The requested job has no completed result; its reply obligation remains open");
-  const text = answer.model?.flatMap(message => message.role === "assistant"
-    ? message.content.flatMap(part => part.type === "text" ? [part.text] : []) : []).join("\n").trim() ?? "";
-  if (text.length === 0) throw new TaskError("The requested job returned an empty result; its reply obligation remains open");
-  // A progress update does not discharge the result obligation. Suppress only
-  // the exact final result that this occurrence has already delivered.
-  if ([...publishedCalls].some(call => notifications.get(call) === text)) return;
-  const task = await tasks.get(id);
-  const published = await publishMainNotice(tasks.session, conversation, answer, id, task.sources,
-    { key: "manual-job-result:" + occurrence.id, text, events: [], origin: { job_id: occurrence.job.id, title: occurrence.job.title } });
+  if (receipt.fulfilled) return;
+  const selected = receipt, source = await tasks.session.commit(tx => tx.entry(selected.entry_id), BACKGROUND_CONTEXT);
+  if (source === undefined || source.conversationId !== conversation.id) throw new TaskError("The admitted manual result's provenance is unavailable");
+  task ??= await tasks.get(id);
+  const published = await publishMainNotice(tasks.session, conversation, source, id, task.sources,
+    { key: "manual-job-result:" + occurrence.id, text: selected.text, events: [], origin: { job_id: occurrence.job.id, title: occurrence.job.title } });
   if (published !== "published") throw new TaskError("The requested result is queued for the main chat but is not delivered yet");
+  await tasks.session.commit(async tx => {
+    const saved = await tx.doc(ManualResults, conversation.id, occurrence.id, null);
+    if (saved.result?.entry_id !== selected.entry_id || saved.result.text !== selected.text) throw new TaskError("The admitted manual result changed before fulfillment");
+    saved.result.fulfilled = true;
+  }, BACKGROUND_CONTEXT);
 }
 
 async function reconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
