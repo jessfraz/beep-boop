@@ -146,6 +146,7 @@ pub enum InferenceClass {
     Foreground,
     Critical,
     Email,
+    Review,
     Fresh,
     Cron,
     Backfill,

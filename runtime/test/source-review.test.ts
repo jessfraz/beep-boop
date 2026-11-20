@@ -19,7 +19,7 @@ import { ConversationModels } from "../src/models.js";
 import { createGuidance } from "../src/guidance.js";
 import { SourceReviews, type SourceReviewOptions } from "../src/source-review.js";
 import { SourceJournal } from "../src/sources.js";
-import { TaskStore, type HostCall } from "../src/tasks.js";
+import { TaskStore, type HostCall, type SearchQuery } from "../src/tasks.js";
 import { UserNoticeEntry } from "../src/transcript.js";
 import { Executions } from "../src/tools.js";
 import { fixtureModel } from "./model.js";
@@ -78,7 +78,7 @@ async function admit(journal: SourceJournal, events: SourceEvent[]): Promise<voi
   await journal.admit({ source, events, checkpoint: null, coverage: { status: "complete" } }, previous?.checkpoint ?? null);
 }
 async function open(path: string, options: SourceReviewOptions = {}, workflows: ScheduledJobStatus[] = [], clock?: FakeClock,
-  guidance?: HostCall, ready?: (signal: AbortSignal) => Promise<void>) {
+  guidance?: HostCall, ready?: (signal: AbortSignal) => Promise<void>, search?: SearchQuery) {
   const models = createModels(), registry = createRegistry();
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const inference = new ConversationModels(models, undefined, registry);
@@ -100,6 +100,7 @@ async function open(path: string, options: SourceReviewOptions = {}, workflows: 
     bind(conversation, model) {
       const id = conversation.id.toString(); assert.equal(bound.has(id), false); bound.add(id);
       const unbind = executions.bind(id, { model, cwd: "/workspace/example", hosts: [], role: "review",
+        ...(search === undefined ? {} : { search }),
         call: guidance ?? (async () => { throw new Error("A source reviewer cannot perform provider effects"); }) });
       return () => { bound.delete(id); unbind(); };
     },
@@ -308,6 +309,120 @@ test("review context and task reads retain captured ownership without expanding 
     assert.deepEqual((await app.tasks.get(firstOwner.id)).sources, firstSources);
     assert.deepEqual((await app.tasks.get(secondOwner.id)).sources, secondSources);
     assert.deepEqual(await app.sources.events({ pending: true }), []);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("source ownership lookup uses current indexes when semantic history is unavailable", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-indexed-source-lookup-")), path = join(directory, "session.sqlite");
+  let searches = 0;
+  const search: SearchQuery = async () => { searches++; return { candidates: [], gaps: ["Semantic history is unavailable"] }; };
+  const app = await open(path, {}, [], undefined, undefined, undefined, search), controller = new AbortController();
+  app.tasks.wakeBackground = id => app.tasks.get(id);
+  try {
+    const original = event("current-direct-mention", "owned-thread", "A direct message mentions <@EXAMPLE> and needs its existing owner.");
+    const owner = await app.tasks.create({ id: "current-owner", title: "Current authorized owner", outcome: "Continue the authorized work", sources: [original.source] });
+    const unrelated = await app.tasks.create({ id: "text-only-match", title: "Current authorized owner in unrelated history", outcome: original.text });
+    await admit(app.sources, [original]);
+    let lookup: unknown;
+    app.faux.setResponses([
+      () => fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: "Current authorized owner", limit: 8 }), { stopReason: "toolUse" }),
+      input => { lookup = JSON.parse(toolResult(input, "find_source_tasks")); return answer([routed(groups(input), { task_id: owner.id })]); },
+      input => { toolResult(input); return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.ok(object(lookup) && Array.isArray(lookup.tasks));
+    assert.deepEqual(lookup.tasks.map((item: unknown) => object(item) ? item.id : null), [owner.id],
+      "A linked current owner must remain discoverable without semantic history");
+    assert.equal(searches, 0, "Source triage must not queue semantic history or embedding work");
+    assert.equal(lookup.owners_complete, true); assert.equal(lookup.history_searched, false);
+    assert.ok(Array.isArray(lookup.gaps)); assert.match(lookup.gaps.join(" "), /absence is not established/u);
+    assert.equal((await app.tasks.get(owner.id)).pending.length, 1); assert.equal((await app.tasks.get(unrelated.id)).pending.length, 0);
+    await app.session.close(BACKGROUND_CONTEXT);
+    const reopened = await open(path);
+    try {
+      assert.deepEqual((await reopened.sources.events())[0]?.decision, { type: "task", task_id: owner.id });
+      assert.deepEqual((await reopened.sources.events())[0]?.event, original);
+      assert.equal((await reopened.tasks.get(owner.id)).pending.length, 1);
+    } finally { await reopened.session.close(BACKGROUND_CONTEXT); }
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("indexed ownership lookup reports truncation and narrows only to captured groups", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-scoped-source-lookup-")), app = await open(join(directory, "session.sqlite"), { maximumEntities: 3 });
+  const controller = new AbortController();
+  try {
+    const crowded = event("crowded", "crowded-thread"), independent = event("independent", "independent-thread"), unknown = event("unknown", "unowned-thread");
+    for (const id of ["owner-a", "owner-b", "owner-c"]) await app.tasks.create({ id, title: id, outcome: "Retain this source ownership", sources: [crowded.source] });
+    await app.tasks.create({ id: "independent-owner", title: "Independent owner", outcome: "Retain its separate work", sources: [independent.source] });
+    await admit(app.sources, [crowded, independent, unknown]);
+    let bounded: unknown, narrowed: unknown, absent: unknown, denied = "", deniedError = false;
+    app.faux.setResponses([
+      input => { const group = groups(input).find(item => item.threads.includes(crowded.source.thread_id)); assert.ok(group);
+        return fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: "legacy hint", groups: [group.id], limit: 2 }), { stopReason: "toolUse" }); },
+      input => { bounded = JSON.parse(toolResult(input, "find_source_tasks"));
+        const group = groups(input).find(item => item.threads.includes(independent.source.thread_id)); assert.ok(group);
+        return fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: "legacy hint", groups: [group.id], limit: 2 }), { stopReason: "toolUse" }); },
+      input => { narrowed = JSON.parse(toolResult(input, "find_source_tasks"));
+        const group = groups(input).find(item => item.threads.includes(unknown.source.thread_id)); assert.ok(group);
+        return fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: "legacy hint", groups: [group.id] }), { stopReason: "toolUse" }); },
+      input => { absent = JSON.parse(toolResult(input, "find_source_tasks"));
+        return fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: "legacy hint", groups: ["outside-this-claim"] }), { stopReason: "toolUse" }); },
+      input => { const reply = input.messages.findLast(message => message.role === "toolResult" && message.toolName === "find_source_tasks"); assert.ok(reply?.role === "toolResult");
+        deniedError = reply.isError === true; denied = reply.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n");
+        return answer(dismissed(groups(input))); },
+      input => { toolResult(input); return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.ok(object(bounded) && Array.isArray(bounded.tasks));
+    assert.equal(bounded.tasks.length, 2); assert.equal(bounded.owners_complete, false); assert.equal(bounded.history_searched, false);
+    assert.deepEqual(bounded.tasks.map((item: unknown) => object(item) ? item.id : null), ["owner-a", "owner-b"]);
+    assert.ok(Array.isArray(bounded.gaps)); assert.match(bounded.gaps.join(" "), /More current owners/u);
+    assert.ok(object(narrowed) && Array.isArray(narrowed.tasks));
+    assert.deepEqual(narrowed.tasks.map((item: unknown) => object(item) ? item.id : null), ["independent-owner"]);
+    assert.equal(narrowed.owners_complete, true);
+    assert.ok(object(absent) && Array.isArray(absent.tasks) && Array.isArray(absent.gaps));
+    assert.deepEqual(absent.tasks, []); assert.equal(absent.history_searched, false); assert.match(absent.gaps.join(" "), /absence is not established/u);
+    assert.equal(deniedError, true); assert.match(denied, /outside this claim/u);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("indexed ownership lookup recovers tracked cross-source resources after reopen without history research", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-source-lookup-")), path = join(directory, "session.sqlite");
+  let app = await open(path); const controller = new AbortController();
+  const resource = "https://github.com/example/project/issues/42", ownerId = "retained-resource-owner";
+  try {
+    await app.tasks.create({ id: ownerId, title: "Tracked issue", outcome: "Continue its existing work" });
+    await app.tasks.create({ id: "previous-thread-owner", title: "Previous thread work", outcome: "Keep its own authorized scope" });
+    await admit(app.sources, [event("original-notification", "notification-42", "Subject API: https://api.github.com/repos/example/project/issues/42", "github")]);
+    const retained = (await app.sources.events())[0]; assert.ok(retained);
+    await app.sources.decide([retained.key], { type: "task", task_id: ownerId });
+    await admit(app.sources, [event("previous-thread-evidence", "new-thread", "Earlier unrelated work in the same thread")]);
+    const previous = (await app.sources.events({ provider: "slack" }))[0]; assert.ok(previous);
+    await app.sources.decide([previous.key], { type: "task", task_id: "previous-thread-owner" });
+    await app.session.close(BACKGROUND_CONTEXT);
+    let searches = 0;
+    const search: SearchQuery = async () => { searches++; return { candidates: [], gaps: ["Semantic history is unavailable"] }; };
+    app = await open(path, {}, [], undefined, undefined, undefined, search);
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    await admit(app.sources, [event("new-slack-mention", "new-thread", "New evidence about " + resource)]);
+    let lookup: unknown, denied = "", deniedError = false;
+    app.faux.setResponses([
+      () => fauxAssistantMessage(fauxToolCall("find_source_tasks", { query: resource, work_url: resource, limit: 1 }), { stopReason: "toolUse" }),
+      input => { lookup = JSON.parse(toolResult(input, "find_source_tasks")); return fauxAssistantMessage(fauxToolCall("find_source_tasks", {
+        query: "unrelated resource", work_url: "https://github.com/example/project/issues/99" }), { stopReason: "toolUse" }); },
+      input => { const reply = input.messages.findLast(message => message.role === "toolResult" && message.toolName === "find_source_tasks"); assert.ok(reply?.role === "toolResult");
+        deniedError = reply.isError === true; denied = reply.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n");
+        return answer([routed(groups(input), { work_url: resource })]); },
+      input => { toolResult(input); return fauxAssistantMessage(""); },
+    ]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    assert.ok(object(lookup) && Array.isArray(lookup.tasks));
+    assert.deepEqual(lookup.tasks.map((item: unknown) => object(item) ? item.id : null), [ownerId]);
+    assert.equal(searches, 0); assert.equal(lookup.history_searched, false); assert.equal(lookup.owners_complete, false);
+    assert.equal(deniedError, true); assert.match(denied, /outside the selected captured evidence/u);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal((await app.tasks.get(ownerId)).pending.length, 1);
+    assert.equal((await app.tasks.get("previous-thread-owner")).pending.length, 0);
+    assert.equal((await app.sources.events()).filter(record => record.decision?.type === "task" && record.decision.task_id === ownerId).length, 2);
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

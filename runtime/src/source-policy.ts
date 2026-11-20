@@ -46,7 +46,7 @@ export class SourceNoisePolicy {
   private readonly batch: number;
   constructor(private readonly journal: SourceJournal, options: SourceNoisePolicyOptions = {}) {
     this.age = options.maximumAgeMs ?? 24 * 60 * 60_000;
-    this.maximum = options.maximumPending ?? 5000;
+    this.maximum = options.maximumPending ?? 256;
     this.batch = options.batchSize ?? 64;
     if (![this.age, this.maximum, this.batch].every(value => Number.isSafeInteger(value) && value > 0) || this.batch > 256) {
       throw new Error("Slack policy limits must be positive safe integers, with at most 256 records per batch");

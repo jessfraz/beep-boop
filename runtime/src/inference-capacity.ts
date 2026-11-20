@@ -20,9 +20,10 @@ type Account = {
   cursor: number; enter: boolean; exclusive: boolean; waiting: Waiter | undefined; pumping: boolean;
   criticalGroups: Map<string, number>;
 };
-const classes: readonly InferenceClass[] = ["foreground", "critical", "email", "cron", "fresh", "backfill"];
-const weights: Counters = { foreground: 4, critical: 5, email: 4, cron: 3, fresh: 3, backfill: 1 };
-function counters(): Counters { return { foreground: 0, critical: 0, email: 0, cron: 0, fresh: 0, backfill: 0 }; }
+const classes: readonly InferenceClass[] = ["foreground", "critical", "email", "cron", "review", "fresh", "backfill"];
+const protectedClasses: readonly InferenceClass[] = ["critical", "email", "review"];
+const weights: Counters = { foreground: 4, critical: 5, email: 4, cron: 3, review: 3, fresh: 3, backfill: 1 };
+function counters(): Counters { return { foreground: 0, critical: 0, email: 0, cron: 0, review: 0, fresh: 0, backfill: 0 }; }
 function integer(value: number, name: string, minimum = 1): number {
   if (!Number.isSafeInteger(value) || value < minimum) throw new RangeError(`${name} must be a safe integer >= ${minimum}`);
   return value;
@@ -66,8 +67,10 @@ export class InferenceCapacity {
       };
       return { requests: integer(value.requests, "Reserved inference requests", 0), tokens: integer(value.tokens, "Reserved inference tokens", 0) };
     };
+    // Source admission owns the former fresh-work reserve. Spawned workflows
+    // retain fair shared capacity without taking their own reviewer's lane.
     this.reserved = { foreground: reservation("foreground", 8), critical: reservation("critical", 4), email: reservation("email", 8), cron: reservation("cron", 8, 16),
-      fresh: reservation("fresh", 8), backfill: reservation("backfill", Infinity) };
+      review: reservation("review", 8), fresh: reservation("fresh", Infinity), backfill: reservation("backfill", Infinity) };
     this.shared = {
       requests: this.maxConcurrent - classes.reduce((sum, workClass) => sum + this.reserved[workClass].requests, 0),
       tokens: this.maxTokens - classes.reduce((sum, workClass) => sum + this.reserved[workClass].tokens, 0),
@@ -84,9 +87,11 @@ export class InferenceCapacity {
   }
   async acquire(accountId: string, workClass: InferenceClass, tokens: number, signal?: AbortSignal, group?: string): Promise<() => void> {
     signal?.throwIfAborted(); integer(tokens, "Estimated inference tokens");
-    // Ordinary oversized work may borrow ordinary reservations, never the
-    // critical reserve. Impossible requests fail visibly instead of waiting.
-    if (this.reserved.critical.requests > 0 && workClass !== "critical" && tokens > this.maxTokens - this.reserved.critical.tokens) {
+    // Oversized work may borrow ordinary reservations, never the independent
+    // workflow and source-admission reserves. A reviewer can borrow ordinary space.
+    const protectedTokens = protectedClasses.reduce((sum, reserved) => sum +
+      (reserved === workClass || this.reserved[reserved].requests === 0 ? 0 : this.reserved[reserved].tokens), 0);
+    if (protectedTokens > 0 && workClass !== "critical" && tokens > this.maxTokens - protectedTokens) {
       throw new RangeError("Model context exceeds ordinary capacity; compact retained work before retrying");
     }
     const otherCriticalReserve = group === undefined || this.reserved.critical.requests < 2 ? 0
@@ -96,7 +101,7 @@ export class InferenceCapacity {
     }
     let account = this.accounts.get(accountId);
     if (account === undefined) {
-      account = { active: counters(), tokens: counters(), queues: { foreground: [], critical: [], email: [], cron: [], fresh: [], backfill: [] },
+      account = { active: counters(), tokens: counters(), queues: { foreground: [], critical: [], email: [], cron: [], review: [], fresh: [], backfill: [] },
         deficits: counters(), cursor: 0, enter: true, exclusive: false, waiting: undefined, pumping: false, criticalGroups: new Map() };
       this.accounts.set(accountId, account);
     }
@@ -130,17 +135,22 @@ export class InferenceCapacity {
     }, { requests: 0, tokens: 0 });
   }
   private fits(account: Account, waiter: Waiter): boolean {
-    if (account.exclusive && waiter.workClass !== "critical") return false;
+    if (account.exclusive && !protectedClasses.includes(waiter.workClass)) return false;
     // One request per critical workflow leaves the other workflow's reserved
     // request available. Other items still execute tools concurrently.
     if (waiter.workClass === "critical" && waiter.group !== undefined && account.criticalGroups.has(waiter.group)) return false;
     const active = classes.reduce((sum, workClass) => sum + account.active[workClass], 0);
     if (active >= this.maxConcurrent) return false;
-    if (this.oversized(waiter)) return classes.every(workClass => workClass === "critical" || account.active[workClass] === 0) &&
-      (active === 0 || classes.reduce((sum, workClass) => sum + account.tokens[workClass], waiter.tokens) <= this.maxTokens);
+    if (this.oversized(waiter)) {
+      const protectedPeers = protectedClasses.filter(workClass => workClass !== waiter.workClass && this.reserved[workClass].requests > 0);
+      const reserved = protectedPeers.reduce((sum, workClass) => sum + this.reserved[workClass].tokens, 0);
+      const borrowed = protectedPeers.reduce((sum, workClass) => sum + Math.max(0, account.tokens[workClass] - this.reserved[workClass].tokens), 0);
+      return classes.every(workClass => protectedPeers.includes(workClass) || account.active[workClass] === 0) &&
+        (active === 0 && reserved === 0 || waiter.tokens + borrowed <= this.maxTokens - reserved);
+    }
     if (active >= this.maxConcurrent || waiter.workClass === "backfill" && account.active.backfill >= this.maxBackfill) return false;
-    if (account.exclusive) return account.active.critical < this.reserved.critical.requests &&
-      account.tokens.critical + waiter.tokens <= this.reserved.critical.tokens;
+    if (account.exclusive) return account.active[waiter.workClass] < this.reserved[waiter.workClass].requests &&
+      account.tokens[waiter.workClass] + waiter.tokens <= this.reserved[waiter.workClass].tokens;
     const shared = this.sharedUse(account, waiter);
     return shared.requests <= this.shared.requests && shared.tokens <= this.shared.tokens;
   }
@@ -213,7 +223,7 @@ export class InferenceCapacity {
           const available = workClass === "critical" ? account.queues.critical.find(waiter => this.fits(account, waiter)) : first;
           if (available === undefined || available === selected || !this.fits(account, available)) return [];
           if (workClass === "critical") return [available];
-          if (this.oversized(selected)) return [];
+          if (this.oversized(selected) && !protectedClasses.includes(workClass)) return [];
           const next = this.sharedUse(account, available);
           return next.requests <= used.requests && next.tokens <= used.tokens ? [available] : [];
         })[0];

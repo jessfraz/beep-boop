@@ -2751,6 +2751,7 @@
         "foreground",
         "critical",
         "email",
+        "review",
         "fresh",
         "cron",
         "backfill"
