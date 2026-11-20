@@ -61,6 +61,7 @@ class ObservedDatabase implements SqliteDatabase {
     return {
       exec: sql => base.exec(sql),
       run: async (sql, ...params) => { this.observation?.write(params); await base.run(sql, ...params); },
+      runCounted: async (sql, ...params) => { this.observation?.write(params); return base.runCounted(sql, ...params); },
       get: async <T extends object>(sql: string, ...params: SqliteValue[]) => {
         const began = performance.now(), result = await base.get<T>(sql, ...params);
         this.observation?.read(sql, params, result === undefined ? 0 : 1, performance.now() - began); return result;
@@ -73,6 +74,7 @@ class ObservedDatabase implements SqliteDatabase {
   }
   exec(sql: string): Promise<void> { return this.base.exec(sql); }
   run(sql: string, ...params: SqliteValue[]): Promise<void> { return this.executor(this.base).run(sql, ...params); }
+  runCounted(sql: string, ...params: SqliteValue[]): Promise<number> { return this.executor(this.base).runCounted(sql, ...params); }
   get<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T | undefined> { return this.executor(this.base).get<T>(sql, ...params); }
   all<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T[]> { return this.executor(this.base).all<T>(sql, ...params); }
   transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {

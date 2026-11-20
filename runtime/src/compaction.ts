@@ -41,14 +41,14 @@ function addUsage(total: Usage, usage: Usage): void {
   total.cacheWrite += usage.cacheWrite; total.totalTokens += usage.totalTokens;
   if (usage.cacheWrite1h !== undefined) total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
   if (usage.reasoning !== undefined) total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
-  const keys: (keyof Usage["cost"])[] = ["input", "output", "cacheRead", "cacheWrite", "total"];
+  const keys: ("input" | "output" | "cacheRead" | "cacheWrite" | "total")[] = ["input", "output", "cacheRead", "cacheWrite", "total"];
   for (const key of keys) total.cost[key] += usage.cost[key];
 }
 function truncated(text: string): boolean {
   return text.includes("[Tool result]:") && /\[\.\.\. \d+ more characters truncated\]/u.test(text);
 }
 
-/** Pi 1.4 swallows a beforeCompact failure and tries its ordinary summary.
+/** Pi can fall back from a beforeCompact failure to its ordinary summary.
  * Preserve native failure handling without sending that oversized fallback. */
 export function guardCompactionRequests(models: MutableModels): void {
   const complete = models.completeSimple.bind(models);

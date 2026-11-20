@@ -1,9 +1,9 @@
 import { taskMessageSender } from "./task-messages.js";
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
+import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type Observation, type EntryId, type EntryRecord,
   type DocumentReader, type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
 import { readNoticeOrigin } from "./notice_origin.js";
 import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
@@ -287,7 +287,7 @@ export async function toolDetails(conversation: Conversation, value: string, cal
 /** Forward live state and new native entries without mounting historical model context. */
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
   message?: (message: HistoryMessage) => void, text?: (delta: string) => void,
-  observer?: { includeFinal: true; working(value: boolean): void }): Promise<() => Promise<void>> {
+  observer?: { includeFinal: true; working(value: boolean): void; failed?(message: string): void }): Promise<() => Promise<void>> {
   const visibility = await observeTranscriptVisibility(session, conversation.id);
   const thinking = new Map<number, string>(), responding = new Map<number, string>();
   // Retain only typed headings while their native calls are pending, never arguments.
@@ -345,6 +345,13 @@ export async function activity(session: Harness, conversation: Conversation, emi
     }
     const failure = value?.compactionFailure?.taskId;
     compaction((value?.compactions?.length ?? 0) > 0, initialized && failure !== undefined && failure !== previous?.compactionFailure?.taskId);
+    const runFailure = value?.runFailure;
+    if (runFailure !== undefined && runFailure.taskId !== previous?.runFailure?.taskId &&
+        runFailure.reason !== "aborted" && runFailure.reason !== "reset") {
+      observer?.failed?.(runFailure.reason === "restart_limit"
+        ? "The previous run stopped after repeated interruptions. Its unanswered inputs and completed effects are retained; send a new continuation to resume."
+        : `The previous run stopped (${runFailure.reason}). Its saved history and unanswered inputs are retained.`);
+    }
     if (value?.generation?.message !== undefined) partial(value.generation.message.content);
     previous = value; initialized = true;
     return idle;
@@ -352,7 +359,8 @@ export async function activity(session: Harness, conversation: Conversation, emi
 
   type Frame = { entries: EntryRecord[]; expected?: JsonObject | null };
   const pending: Frame[] = [];
-  let watch: DocumentWatch<LiveState> | undefined, acquiring: Promise<void> | undefined;
+  let watch: Observation<Readonly<LiveState>> | undefined, acquiring: Promise<void> | undefined;
+  let currentLive: Readonly<LiveState> | null = null;
   let ready = false, stopped = false, failure: unknown, cutoff = 0;
   const drain = () => {
     if (!ready || stopped) return;
@@ -363,11 +371,18 @@ export async function activity(session: Harness, conversation: Conversation, emi
   };
   const accept = (value: Readonly<LiveState> | null, initial = false) => {
     if (stopped) return;
-    // Pinned Pi 1.4 publishes the same immutable value to commit subscribers
-    // and typed document watches. Joining those identities keeps final thinking
-    // ahead of its canonical entry without decoding or casting Pi's state.
+    currentLive = value;
+    // Join stored commit frames to their typed document values so final
+    // reasoning reaches the renderer with its canonical entry identity.
     const index = pending.findIndex((frame) => frame.expected === value);
-    if (index < 0) { if (initial && live(value)) observer?.working(false); return; }
+    if (index < 0) {
+      // Native partials are visible before their storage deadline. Only an idle
+      // transition waits for its canonical entries to join the stored frame.
+      if (initial || value?.run !== undefined || previous?.run === undefined) {
+        if (live(value) && initial) observer?.working(false);
+      }
+      return;
+    }
     for (const frame of pending.splice(0, index + 1)) {
       const idle = frame.expected === value && live(value);
       for (const entry of frame.entries) if (entry.id > cutoff) committed(entry);
@@ -382,7 +397,7 @@ export async function activity(session: Harness, conversation: Conversation, emi
     if (stopped) return;
     stopped = true; unsubscribe(); unsubscribeClose(); visibility.close(); pending.length = 0; tools.clear();
     const owned = watch, loading = acquiring; watch = undefined;
-    await owned?.stop();
+    owned?.detach();
     await loading?.catch(() => {});
     compaction(false);
   };
@@ -390,8 +405,11 @@ export async function activity(session: Harness, conversation: Conversation, emi
   const acquire = (): Promise<void> => {
     if (acquiring !== undefined) return acquiring;
     const operation = (async () => {
-      const owned = await session.watchDoc(LiveDoc, conversation.id, BACKGROUND_CONTEXT);
-      if (stopped) { await owned?.stop(); return; }
+      const owned = await session.observeDoc(LiveDoc, conversation.id, {
+        advance: (call) => { if (call.kind === "value") accept(call.retired ? null : call.value); },
+        end: (result) => { if (result.kind === "listener_error" || result.kind === "failed") failed(result.error); },
+      }, BACKGROUND_CONTEXT);
+      if (stopped) { owned?.detach(); return; }
       watch = owned;
       if (owned === undefined) {
         // Creation and retirement may both precede acquisition. Canonical
@@ -399,14 +417,6 @@ export async function activity(session: Harness, conversation: Conversation, emi
         accept(null, true); drain(); return;
       }
       accept(owned.value, true);
-      owned.start(async (value) => {
-        accept(value);
-        if (value === null && watch === owned) {
-          watch = undefined;
-          queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
-        }
-      });
-      void owned.closed.then((result) => { if (result.reason === "listener_error") failed(result.error); });
     })();
     acquiring = operation;
     void operation.finally(() => {
@@ -417,18 +427,24 @@ export async function activity(session: Harness, conversation: Conversation, emi
     }).catch(() => {});
     return operation;
   };
-  unsubscribe = session.subscribeCommits((publication) => {
+  const observation = session.observeCommits({ advance: (publication) => {
     const entries = publication.changes.flatMap((change) => change.type === "entry" && change.value.conversationId === conversation.id ? [change.value] : []);
     const changed = publication.changes.find((change) => change.type === "document" && change.record.kind === LiveDoc.definition.kind && change.conversationId === conversation.id);
     if (entries.length === 0 && changed === undefined) return;
     if (pending.length >= 512) { failed(new Error("Activity observation fell behind; reconnect to recover saved history.")); return; }
-    const expected = changed?.type === "document" && (changed.ops.length > 0 || changed.value === null || changed.record.createdAt === publication.seq) ? changed.value : undefined;
+    const expected = changed?.type !== "document" ? undefined : changed.kind === "retire" ? null
+      : changed.ops.length > 0 || changed.record.createdAt === publication.seq ? changed.value : undefined;
     pending.push({ entries, ...(expected === undefined ? {} : { expected }) });
-    drain();
-    if (watch === undefined && acquiring === undefined && expected !== undefined && expected !== null) {
-      queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
-    }
-  });
+    // Placement observers run on this same publication. Deliver canonical
+    // rows after their receipts, independent of observer registration order.
+    queueMicrotask(() => {
+      if (stopped) return;
+      if (expected !== undefined && expected === currentLive) accept(currentLive);
+      drain();
+      if (watch === undefined && acquiring === undefined && expected !== undefined && expected !== null) void acquire().catch(failed);
+    });
+  }, end: (result) => { if (result.kind === "listener_error" || result.kind === "failed") failed(result.error); } });
+  unsubscribe = () => observation.detach();
   unsubscribeClose = session.subscribeClose(() => { void close(); });
   try {
     // One bounded native tail, not the active transcript/model-context mount.

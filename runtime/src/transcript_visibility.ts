@@ -64,17 +64,18 @@ export async function observeTranscriptVisibility(session: Session, conversation
   }> {
   let state: Readonly<TranscriptVisibilityState> | undefined, observed = false, ready = false;
   const pending: EntryRecord[] = [];
-  const stop = session.subscribeCommits((publication) => {
+  const observation = session.observeCommits({ advance: (publication) => {
     for (const change of publication.changes) if (change.type === "document" && change.record.kind === TranscriptVisibility.definition.kind &&
       change.conversationId === conversation) {
       observed = true;
-      state = visibilityState(change.value) ? change.value : undefined;
+      state = change.kind === "change" && visibilityState(change.value) ? change.value : undefined;
     }
     if (onEntry !== undefined) for (const change of publication.changes) if (change.type === "entry" && change.value.conversationId === conversation) {
       if (ready) onEntry(change.value, state);
       else pending.push(change.value);
     }
-  });
+  }, end: () => {} });
+  const stop = () => observation.detach();
   try {
     const initial = await readTranscriptVisibility(session, conversation);
     if (!observed) state = initial;

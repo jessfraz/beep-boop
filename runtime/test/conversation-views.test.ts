@@ -273,7 +273,7 @@ test("a stopped worker keeps its placed input on retry and SQLite reopen while i
     await view.detach(); view = undefined;
     app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT);
     app = await open(directory);
-    let writes = 0; const stop = app.harness.subscribeCommits((commit) => { writes += commit.changes.length; });
+    let writes = 0; const observation = app.harness.observeCommits({ advance: (commit) => { writes += commit.changes.length; }, end() {} });
     view = observe(app, 2, task.conversation_id, ["placed-worker", "queued-worker", "unknown-worker"]);
     await view.until(() => view?.frames.some((event) => event.type === "input_rejected" && event.input_id === "queued-worker") ?? false);
     assert.deepEqual(view.frames.filter((event) => event.type === "input_accepted" || event.type === "input_placed"), expected);
@@ -281,7 +281,7 @@ test("a stopped worker keeps its placed input on retry and SQLite reopen while i
     const retry: RuntimeEventKind[] = [];
     await app.views.input(input(task.conversation_id, "placed-worker", "Already saved worker request"), noDispatch, (event) => retry.push(event));
     assert.deepEqual(retry, expected);
-    stop(); assert.equal(writes, 0); assert.equal(app.faux.state.callCount, 0);
+    observation.detach(); assert.equal(writes, 0); assert.equal(app.faux.state.callCount, 0);
     const reopened = await app.tasks.conversation(task.conversation_id);
     assert.deepEqual((await reopened.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.map((entry) => entry.id), entries);
   } finally { app.views.close(); await view?.running; app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -331,10 +331,10 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
     const saved = await app.imported(), conversation = await app.tasks.conversation(saved.conversation_id);
     const initialAgent = await app.harness.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
     const initialRoot = await app.harness.commit((tx) => tx.conversation(ROOT_CONVERSATION_ID), BACKGROUND_CONTEXT);
-    let changes = 0; const unsubscribe = app.harness.subscribeCommits((commit) => { changes += commit.changes.length; });
+    let changes = 0; const observation = app.harness.observeCommits({ advance: (commit) => { changes += commit.changes.length; }, end() {} });
     const view = observe(app, 1, saved.conversation_id); viewHandles.push(view);
     await view.until(() => view.frames.some((event) => event.type === "conversation_ready"));
-    assert.equal(changes, 0); unsubscribe();
+    assert.equal(changes, 0); observation.detach();
     assert.deepEqual(await app.tasks.list(), []); assert.equal(app.faux.state.callCount, 0);
     assert.deepEqual(await app.harness.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT), initialAgent);
     assert.deepEqual(await app.harness.commit((tx) => tx.conversation(ROOT_CONVERSATION_ID), BACKGROUND_CONTEXT), initialRoot);

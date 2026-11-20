@@ -265,14 +265,13 @@ export class SourceCollectors {
       if (this.callbacks.enabled?.() === false) { await this.stop(); return; }
       const reconciled = await this.session.commit(async tx => {
         active.throwIfAborted();
-        const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [], retained: TaskId<null>[] = [];
+        const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [];
         for (const id of [...saved.members]) {
           if (sources.has(id)) continue;
           const slot = await tx.doc(Slots, id, null);
           // Unknown account coverage retains its previously authorized reader.
           if (reads.some(read => read.batch.source.provider === slot.source.provider &&
             (read.batch.source.account === "discovery" || read.batch.source.account === slot.source.account))) {
-            if (slot.enabled && slot.task !== null) retained.push(slot.task);
             continue;
           }
           slot.enabled = false; slot.generation += 1;
@@ -280,10 +279,9 @@ export class SourceCollectors {
           slot.task = null; slot.next_at = null;
           saved.members.splice(saved.members.indexOf(id), 1);
         }
-        active.throwIfAborted(); return { cancelled, retained };
+        active.throwIfAborted(); return { cancelled };
       }, BACKGROUND_CONTEXT);
       for (const task of reconciled.cancelled) await this.session.abortTask(task, BACKGROUND_CONTEXT);
-      for (const task of reconciled.retained) await this.session.retryTask(task, BACKGROUND_CONTEXT);
       this.session.resume();
     } finally {
       accepting = false;
@@ -293,25 +291,28 @@ export class SourceCollectors {
   private async activate(sources: readonly { source: SourceConfig; key: SourceKey }[], intervalMs: number, signal: AbortSignal): Promise<void> {
     const activated = await this.session.commit(async tx => {
       signal.throwIfAborted();
-      const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [], owned: TaskId<null>[] = [];
-      for (const { source, key } of sources) {
+      const saved = await tx.doc(Catalog), cancelled: TaskId<null>[] = [];
+      const slots = await Promise.all(sources.map(async item => ({ ...item, slot: await tx.doc(Slots, identity(item.key), null) })));
+      const live = new Set<TaskId>();
+      await Promise.all(slots.map(async ({ slot }) => {
+        if (slot.task === null) return;
+        const task = await tx.task(slot.task);
+        if (task !== undefined && task.state.status !== "terminal") live.add(slot.task);
+      }));
+      for (const { source, key, slot } of slots) {
         const id = identity(key);
-        const slot = await tx.doc(Slots, id, null);
         const revision = createHash("sha256").update(JSON.stringify({ source, intervalMs })).digest("hex");
-        if (slot.enabled && slot.task !== null && slot.revision === revision) { owned.push(slot.task); continue; }
+        if (slot.enabled && slot.task !== null && live.has(slot.task) && slot.revision === revision) continue;
         if (slot.task !== null) cancelled.push(slot.task);
         slot.source = key; slot.revision = revision; slot.enabled = true; slot.generation += 1; slot.error = null;
         const task = await tx.createTask(this.task, { source, key, generation: slot.generation, interval_ms: intervalMs },
           { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
-        slot.task = task; slot.next_at = null; owned.push(task);
+        slot.task = task; slot.next_at = null;
         if (!saved.members.includes(id)) saved.members.push(id);
       }
-      signal.throwIfAborted(); return { cancelled, owned };
+      signal.throwIfAborted(); return { cancelled };
     }, BACKGROUND_CONTEXT);
     for (const task of activated.cancelled) await this.session.abortTask(task, BACKGROUND_CONTEXT);
-    // Pi checks its restart fence for the exact owned task; no global native
-    // task inventory is needed to recover a collector.
-    for (const task of activated.owned) await this.session.retryTask(task, BACKGROUND_CONTEXT);
     this.session.resume();
   }
   async stop(): Promise<void> {

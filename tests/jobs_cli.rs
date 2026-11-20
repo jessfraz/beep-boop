@@ -192,7 +192,7 @@ impl Fixture {
         self.events(&["jobs", "get", JOB_ID])
             .into_iter()
             .find_map(|event| match event {
-                RuntimeEventKind::ScheduledJob { job } => Some(job),
+                RuntimeEventKind::ScheduledJob { job } => Some(*job),
                 _ => None,
             })
             .expect("Get must return the applied job definition")
@@ -262,6 +262,62 @@ impl Fixture {
                 _ => None,
             })
             .expect("Tasks must return the ordinary task inventory")
+    }
+
+    fn assert_run_actors(&self, runs: &[&JobRunReceipt]) -> Vec<TaskRecord> {
+        let tasks = self.tasks();
+        assert_eq!(
+            tasks.len(),
+            runs.len() + 1,
+            "Each admitted run has one execution actor and shares one canonical owner"
+        );
+        let owners: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.workflow.is_none())
+            .collect();
+        assert_eq!(owners.len(), 1);
+        let owner = owners[0];
+        assert!(owner.scheduled_run.is_none());
+        assert!(owner.pending.is_empty());
+        assert!(owner.sources.iter().any(|source| {
+            source.provider == "scheduled_jobs"
+                && source.account == "local"
+                && source.thread_id == JOB_ID
+        }));
+        let mut conversations = std::collections::BTreeSet::new();
+        conversations.insert(owner.conversation_id.as_str());
+        for run in runs {
+            let matching: Vec<_> = tasks.iter().filter(|task| task.id == run.task_id).collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "An exact receipt owns one execution actor"
+            );
+            let actor = matching[0];
+            assert_eq!(actor.scheduled_run.as_ref(), Some(*run));
+            let workflow = actor
+                .workflow
+                .as_ref()
+                .expect("Runs capture their workflow");
+            assert_eq!(workflow.owner_task_id, owner.id);
+            assert_eq!(workflow.job.id, run.job_id);
+            assert_eq!(workflow.job.revision, run.revision);
+            assert_eq!(
+                workflow.work_key,
+                format!("occurrence:manual:{}", run.request_id)
+            );
+            assert!(
+                conversations.insert(actor.conversation_id.as_str()),
+                "Every new run keeps a separate conversation"
+            );
+            assert!(
+                !actor
+                    .sources
+                    .iter()
+                    .any(|source| source.provider == "scheduled_jobs")
+            );
+        }
+        tasks
     }
 
     fn run(&self, args: &[&str]) -> JobRunReceipt {
@@ -375,6 +431,7 @@ fn replay(run: &JobRunReceipt, schedule_id: Option<&str>) -> RuntimeCommand {
         job_id: run.job_id.clone(),
         schedule_id: schedule_id.map(|id| ScheduleId::try_from(id.to_owned()).unwrap()),
         request_id: run.request_id.clone(),
+        input: run.manual.as_ref().and_then(|manual| manual.input.clone()),
     }
 }
 
@@ -501,10 +558,9 @@ fn direct_task_messages_survive_offline_delivery_and_never_post_to_main() {
             .collect();
         assert!(events.iter().any(|event| matches!(event,
             RuntimeEventKind::InputAccepted { input_id: accepted, .. } if accepted == input_id)));
-        let tasks = fixture.tasks();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, run.task_id);
-        let retained: Vec<_> = tasks[0]
+        let tasks = fixture.assert_run_actors(&[&run]);
+        let actor = tasks.iter().find(|task| task.id == run.task_id).unwrap();
+        let retained: Vec<_> = actor
             .pending
             .iter()
             .filter(|input| input.id == input_id)
@@ -522,9 +578,10 @@ fn direct_task_messages_survive_offline_delivery_and_never_post_to_main() {
     }
     server.stop();
     let _reopened = fixture.start();
-    let tasks = fixture.tasks();
+    let tasks = fixture.assert_run_actors(&[&run]);
+    let actor = tasks.iter().find(|task| task.id == run.task_id).unwrap();
     assert_eq!(
-        tasks[0]
+        actor
             .pending
             .iter()
             .filter(|input| input.id == input_id)
@@ -583,13 +640,17 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
         fixture.get().schedules[0].next_at,
         before.schedules[0].next_at
     );
-    let tasks = fixture.tasks();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].id, first.task_id);
-    assert_eq!(tasks[0].model, Some(before.job.model.clone()));
+    let tasks = fixture.assert_run_actors(&[&first]);
+    let first_actor = tasks.iter().find(|task| task.id == first.task_id).unwrap();
+    let first_conversation = first_actor.conversation_id.clone();
+    assert_eq!(first_actor.model, Some(before.job.model.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if fixture.tasks()[0]
+        if fixture
+            .tasks()
+            .iter()
+            .find(|task| task.id == first.task_id)
+            .unwrap()
             .pending
             .iter()
             .any(|input| input.id == format!("manual:{}", first.request_id))
@@ -611,25 +672,33 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
     fs::write(&file, multiple).unwrap();
     fixture.sync();
     let scheduled = fixture.planned();
-    let output = fixture.cli(&["jobs", "run", JOB_ID]);
-    assert!(
-        !output.status.success(),
-        "Multiple schedules require an explicit selection"
+    let neutral = fixture.run(&["jobs", "run", JOB_ID]);
+    assert_eq!(
+        neutral.schedule_id.as_str(),
+        "Morning.v1",
+        "The neutral schedule remains the default beside a focused schedule"
     );
-    assert_eq!(fixture.tasks().len(), 1);
+    fixture.assert_run_actors(&[&first, &neutral]);
 
     let second = fixture.run(&["jobs", "run", JOB_ID, "--schedule", "Evening.v1"]);
     let third = fixture.run(&["chat", "/run-job Daily_Review.v2 --schedule Morning.v1"]);
     assert_eq!(second.schedule_id.as_str(), "Evening.v1");
     assert_eq!(third.schedule_id.as_str(), "Morning.v1");
-    assert_eq!(first.task_id, second.task_id);
+    assert_ne!(first.task_id, second.task_id);
     assert_ne!(first.request_id, second.request_id);
-    assert_eq!(second.task_id, third.task_id);
+    assert_ne!(second.task_id, third.task_id);
+    assert_ne!(first.task_id, third.task_id);
     assert_ne!(second.request_id, third.request_id);
+    let runs = [&first, &neutral, &second, &third];
+    let tasks = fixture.assert_run_actors(&runs);
     assert_eq!(
-        fixture.tasks().len(),
-        1,
-        "Distinct run requests share the job conversation"
+        tasks
+            .iter()
+            .find(|task| task.id == first.task_id)
+            .unwrap()
+            .conversation_id,
+        first_conversation,
+        "A later run may not replace the first run's conversation"
     );
     let current = fixture.get();
     let schedule_state = |job: &ScheduledJobStatus| {
@@ -657,11 +726,13 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
             job_id: JobId::try_from("Other.v1".to_owned()).unwrap(),
             schedule_id: None,
             request_id: first.request_id.clone(),
+            input: None,
         },
         RuntimeCommand::RunJob {
             job_id: first.job_id.clone(),
             schedule_id: Some(first.schedule_id.clone()),
             request_id: String::new(),
+            input: None,
         },
     ] {
         assert!(
@@ -671,15 +742,20 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
                 .any(|event| matches!(event, RuntimeEventKind::Failure { .. })),
             "A conflicting or empty request identity must fail before admission"
         );
-        assert_eq!(fixture.tasks().len(), 1);
+        fixture.assert_run_actors(&runs);
     }
     server.stop();
     server = fixture.start();
     assert_eq!(admitted_run(fixture.rpc(replay(&first, None))), first);
+    let reopened = fixture.assert_run_actors(&runs);
     assert_eq!(
-        fixture.tasks().len(),
-        1,
-        "Restart must retain the shared job task"
+        reopened
+            .iter()
+            .find(|task| task.id == first.task_id)
+            .unwrap()
+            .conversation_id,
+        first_conversation,
+        "Restart must retain the exact original run conversation"
     );
     let read = fixture.events(&["tasks", "read", &first.task_id.to_string()]);
     assert!(
@@ -696,7 +772,7 @@ fn manual_job_runs_admit_durably_without_moving_timers_and_reject_invalid_select
         "The task receipt survives removal of its source job"
     );
     assert!(!fixture.cli(&["jobs", "run", JOB_ID]).status.success());
-    assert_eq!(fixture.tasks().len(), 1);
+    fixture.assert_run_actors(&runs);
     assert!(!fixture.directory.path().join("external-calls").exists());
     server.stop();
 }
@@ -729,24 +805,33 @@ fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
     let first = admitted_run(fixture.rpc(produce(control)));
     assert_eq!(first.request_id, format!("native-job:{input_id}"));
     assert_eq!(admitted_run(fixture.rpc(produce(control))), first);
-    assert_eq!(
-        fixture.tasks().len(),
-        1,
-        "Retrying the same native Submit must not create another manual run"
-    );
+    let admitted = fixture.assert_run_actors(&[&first]);
+    let conversation = admitted
+        .iter()
+        .find(|task| task.id == first.task_id)
+        .unwrap()
+        .conversation_id
+        .clone();
     assert!(
         fixture
             .rpc(produce("/run-job Daily_Review.v2 --schedule Different.v1"))
             .iter()
             .any(|event| matches!(event, RuntimeEventKind::Failure { .. }))
     );
-    assert_eq!(fixture.tasks().len(), 1);
+    fixture.assert_run_actors(&[&first]);
     server.stop();
     server = fixture.start();
     assert_eq!(admitted_run(fixture.rpc(produce(control))), first);
-    let tasks = fixture.tasks();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].id, first.task_id);
+    let tasks = fixture.assert_run_actors(&[&first]);
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.id == first.task_id)
+            .unwrap()
+            .conversation_id,
+        conversation,
+        "Native replay after restart keeps the exact original run conversation"
+    );
     assert!(!fixture.directory.path().join("external-calls").exists());
     server.stop();
 }
@@ -914,7 +999,7 @@ fn remote_sync_rejects_client_paths_before_connecting() {
 }
 
 #[test]
-fn retry_jobs_reaches_the_coordinator_without_launching_unparked_work() {
+fn retry_jobs_reaches_the_coordinator_without_admitting_uninterrupted_work() {
     let fixture = Fixture::new();
     let _server = fixture.start();
     fs::write(
@@ -925,7 +1010,10 @@ fn retry_jobs_reaches_the_coordinator_without_launching_unparked_work() {
     fixture.sync();
     let before = fixture.planned();
     let triggers = fixture.status().triggers;
-    for (id, reason) in [(JOB_ID, "parked"), ("missing", "unknown scheduled job")] {
+    for (id, reason) in [
+        (JOB_ID, "no interrupted run or timer"),
+        ("missing", "unknown scheduled job"),
+    ] {
         let output = fixture.cli(&["jobs", "retry", id]);
         assert!(!output.status.success());
         assert!(
@@ -966,7 +1054,7 @@ fn history_index_recovery_reports_native_state_without_starting_an_import() {
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .to_lowercase()
-            .contains("parked"),
+            .contains("no interrupted work or timer"),
         "Recovery must reach the coordinator's native-state guard: {}",
         String::from_utf8_lossy(&output.stderr)
     );

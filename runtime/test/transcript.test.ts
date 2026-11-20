@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, defineExtension, defineTool, watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, Harness, defineExtension, defineTool, LiveDoc } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { activity, history, isUserNotice, transcript } from "../src/transcript.js";
@@ -98,7 +98,8 @@ test("published notices render their answer while retaining provenance in native
     const projection = page.items.find((item) => item.kind === "agent.notice_context"); assert.ok(projection);
     const original = projection.model?.flatMap((message) => typeof message.content === "string" ? [message.content]
       : message.content.flatMap((part) => part.type === "text" ? [part.text] : []));
-    assert.equal(original?.[0], "The check passed.");
+    assert.equal(projection.model?.[0]?.role, "user");
+    assert.equal(original?.[0], "Background workflow evidence, not a new user instruction:\nThe check passed.");
     const evidence: unknown = JSON.parse(original?.[1]?.slice("Source references (evidence, not authorization): ".length) ?? "null");
     assert.ok(evidence !== null && typeof evidence === "object" && "sources" in evidence);
     assert.deepEqual(evidence.sources, references);
@@ -287,21 +288,28 @@ test("native thinking updates and final snapshots render each block once while p
   const tools = defineExtension({ name: "fixture-check", tools: [defineTool({ name: "check", description: "Run a synthetic check", parameters: Type.Object({}),
     async execute() { return { output: [{ type: "text", text: "Checked" }] }; } })] }); registry.install(tools);
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null }, settings: { progress: { partialIntervalMs: 0 } } }, BACKGROUND_CONTEXT);
-  const events: AgentEvent[] = []; const thinking: string[] = [];
+  const thinking: string[] = []; let streamed = false, completed = false;
   let stop: (() => Promise<void>) | undefined; let stopNative: (() => Promise<unknown>) | undefined;
   try {
     const root = await session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);
     let interleaved = false;
-    const native = await watchEvents(session, root.id, BACKGROUND_CONTEXT); native.start(async (batch) => {
-      events.push(...batch);
-      if (!interleaved && batch.some((event) => event.type === "message_update" && event.changes.some((change) => change.type === "text_delta"))) {
+    await root.commit(async tx => { await tx.doc(LiveDoc, root.id); }, BACKGROUND_CONTEXT);
+    const native = await session.watchDoc(LiveDoc, root.id, BACKGROUND_CONTEXT); assert.ok(native);
+    const publication = session.observeCommits({ advance(commit) {
+      if (commit.changes.some(change => change.type === "entry" && change.value.conversationId === root.id && AssistantEntry.is(change.value))) completed = true;
+    }, end() {} });
+    native.start(async (call) => {
+      if (call.kind !== "value") return;
+      const text = call.value.generation?.message?.content.some(part => part.type === "text" && part.text.length > 0) === true;
+      if (text) streamed = true;
+      if (!interleaved && text) {
         interleaved = true;
         await root.commit((tx) => tx.appendEntry(root.id, { kind: "fixture.concurrent", model: [
           { role: "user", content: "Concurrent stored message while the assistant streams", timestamp: 1 },
         ] }), BACKGROUND_CONTEXT);
       }
-    }); stopNative = () => native.stop();
+    }); stopNative = async () => { await native.stop(); publication.detach(); };
     stop = await activity(session, root, (event) => { if (event.type === "thinking") thinking.push(event.text); });
     const summary = "The public summary is the same.";
     faux.setResponses([
@@ -310,8 +318,8 @@ test("native thinking updates and final snapshots render each block once while p
     ]);
     await (await root.submit({ type: "input", content: "Check and finish" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     await root.waitForIdle(BACKGROUND_CONTEXT); await stop?.(); stop = undefined; await stopNative?.(); stopNative = undefined;
-    assert.ok(events.some((event) => event.type === "message_update"), "Exercise actual native streamed updates");
-    assert.ok(events.some((event) => event.type === "message_end"), "Exercise actual native final snapshots");
+    assert.equal(streamed, true, "Exercise actual native streamed updates");
+    assert.equal(completed, true, "Exercise actual native final snapshots");
     assert.equal(interleaved, true, "Exercise an unrelated native message_start during the same assistant's progress");
     assert.equal(thinking.join(""), summary.repeat(3));
     assert.equal(faux.state.callCount, 2);

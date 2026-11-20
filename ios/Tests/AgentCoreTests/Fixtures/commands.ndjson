@@ -59,6 +59,7 @@
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"qwen-token-plan","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"qwen-token-plan-cn","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"qwen-token-plan-individual","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
+{"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"qwen-token-plan-individual-cn","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"xiaomi","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"xiaomi-token-plan-cn","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_selection","model":{"provider":"xiaomi-token-plan-ams","model_id":"example","reasoning":"off","fast":false}},"catalog":false}}
@@ -108,6 +109,7 @@
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"qwen-token-plan","model_id":"example"},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"qwen-token-plan-cn","model_id":"example"},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"qwen-token-plan-individual","model_id":"example"},"catalog":false}}
+{"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"qwen-token-plan-individual-cn","model_id":"example"},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"xiaomi","model_id":"example"},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"xiaomi-token-plan-cn","model_id":"example"},"catalog":false}}
 {"type":"native","request":{"type":"settings","change":{"type":"set_model","provider":"xiaomi-token-plan-ams","model_id":"example"},"catalog":false}}

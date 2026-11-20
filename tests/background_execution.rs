@@ -83,6 +83,7 @@ async fn task(runtime: &Runtime, id: &TaskId) -> (TaskRecord, String) {
 
 fn job(id: &str, prompt: &str, directory: &Path) -> ScheduledJob {
     ScheduledJob {
+        priority: agent_cli::jobs::JobPriority::Normal,
         id: id.to_owned().try_into().unwrap(),
         title: format!("Background {id}"),
         prompt: prompt.into(),
@@ -276,6 +277,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
                         job_id: name.to_owned().try_into().unwrap(),
                         schedule_id: None,
                         request_id: format!("manual-{name}"),
+                        input: None,
                     })
                     .await
                     .unwrap(),

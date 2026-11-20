@@ -2749,6 +2749,7 @@
       "type": "string",
       "enum": [
         "foreground",
+        "critical",
         "email",
         "fresh",
         "cron",
@@ -2758,6 +2759,13 @@
     "InputBlockReason": {
       "type": "string",
       "enum": [
+        "faulted",
+        "interrupted",
+        "model_error",
+        "no_model",
+        "nothing_to_answer",
+        "orphaned",
+        "turn_limit",
         "missing_task",
         "task_too_old",
         "migration_failed",
@@ -3037,6 +3045,72 @@
     "JobId": {
       "type": "string"
     },
+    "JobManualRequest": {
+      "description": "Presence records a directly requested run and its obligation to publish the\nactual result or blocker, even when no additional input was supplied.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "JobPriority": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "critical"
+      ]
+    },
+    "JobProgress": {
+      "description": "Observation of existing work, not another execution state machine.",
+      "type": "object",
+      "properties": {
+        "blocker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checked_at": {
+          "$ref": "#/$defs/UtcMillis"
+        },
+        "last_progress_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UtcMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending_work": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/JobProgressStatus"
+        }
+      },
+      "required": [
+        "status",
+        "checked_at",
+        "pending_work"
+      ]
+    },
+    "JobProgressStatus": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "overdue",
+        "unavailable"
+      ]
+    },
     "JobRunReceipt": {
       "description": "Durable admission of one requested run, independent of its execution result.",
       "type": "object",
@@ -3046,6 +3120,16 @@
         },
         "job_id": {
           "$ref": "#/$defs/JobId"
+        },
+        "manual": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobManualRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "request_id": {
           "type": "string"
@@ -3693,6 +3777,7 @@
         "qwen-token-plan",
         "qwen-token-plan-cn",
         "qwen-token-plan-individual",
+        "qwen-token-plan-individual-cn",
         "xiaomi",
         "xiaomi-token-plan-cn",
         "xiaomi-token-plan-ams",
@@ -5148,6 +5233,16 @@
         "model": {
           "$ref": "#/$defs/ModelSelection"
         },
+        "priority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPriority"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "prompt": {
           "type": "string"
         },
@@ -5195,6 +5290,16 @@
             }
           ]
         },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "schedules": {
           "type": "array",
           "items": {
@@ -5226,11 +5331,32 @@
         "job": {
           "$ref": "#/$defs/ScheduledJob"
         },
+        "manual": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobManualRequest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "schedule_id": {
           "$ref": "#/$defs/ScheduleId"
         },
         "scheduled_at": {
           "$ref": "#/$defs/UtcMillis"
+        },
+        "task_id": {
+          "description": "New admissions capture a fresh task; older retained work keeps its\noriginal actor and receipts when this field is absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -6335,6 +6461,16 @@
         },
         "worker": {
           "$ref": "#/$defs/WorkerState"
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskWorkflow"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -6403,6 +6539,27 @@
             "evidence"
           ]
         }
+      ]
+    },
+    "TaskWorkflow": {
+      "description": "A work item's captured authorization, separate from the canonical job's\nsource ownership and execution history.",
+      "type": "object",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/ScheduledJob"
+        },
+        "owner_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "work_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job",
+        "owner_task_id",
+        "work_key"
       ]
     },
     "TelemetryStatus": {

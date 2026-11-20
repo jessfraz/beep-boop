@@ -37,6 +37,8 @@ test("quota recovery retains the same scheduled input and completed tool across 
     const deferred = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.kind === "pi.generation");
     assert.equal(deferred?.state.kind, "sleeping");
     clock.advance(60_000); t.mock.timers.tick(60_000);
+    await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(task =>
+      task.record.kind === "pi.generation" && task.state.kind === "sleeping" && task.state.until !== undefined && task.state.until > clock.value));
     assert.equal(app.faux.state.callCount, 2, "The account must stay quiet during cooldown");
     controller.abort(); await running.catch(() => {}); running = undefined;
     await app.close();
@@ -48,6 +50,7 @@ test("quota recovery retains the same scheduled input and completed tool across 
     controller = new AbortController();
     running = runScheduled(scheduledOccurrence, controller.signal, app, task.id);
     void running.catch(() => {});
+    await pump(() => app.tasks.hasExecutionOwner(task.id, conversation.id));
     clock.advance(3_600_000); t.mock.timers.tick(3_600_000);
     await pump(async () => (await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT))?.status === "done");
     await running; running = undefined;
@@ -55,7 +58,10 @@ test("quota recovery retains the same scheduled input and completed tool across 
     assert.equal(restored?.id, original?.id);
     assert.equal(app.faux.state.callCount, 1);
     assert.equal(app.commands.filter(command => command.type === "exec" && command.program === "perform-once").length, 0);
-    assert.equal((await app.tasks.list()).length, 1);
+    const retainedTasks = await app.tasks.list();
+    assert.deepEqual(retainedTasks.filter(record => record.workflow?.work_key === "occurrence:" + scheduledOccurrence.id).map(record => record.id), [task.id],
+      "Recovery must keep exactly one execution for the admitted occurrence");
+    assert.equal(retainedTasks.length, 2, "The canonical workflow owner is separate from its occurrence execution");
   } finally {
     controller.abort();
     await app.close(); await running?.catch(() => {});

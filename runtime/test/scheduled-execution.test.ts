@@ -36,7 +36,7 @@ test("background children execute, report and continue through their original sa
     };
     app.faux.setResponses(Array.from({ length: 12 }, () => respond));
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
-    await pump(async () => { const tasks = await app.tasks.list(); return tasks.length === 1 && !app.tasks.isRunning(tasks[0]?.id ?? ""); });
+    await pump(async () => { const tasks = await app.tasks.list(); return tasks.length === 2 && !app.tasks.isRunning(tasks[0]?.id ?? ""); });
     const parent = (await app.tasks.list())[0]; assert.ok(parent);
     assert.equal(parent.state.state, "resolved"); assert.equal(parent.summary, "The parent verified the child result.");
     const child = parent.agents[0]; assert.ok(child); assert.equal(child.state.state, "done");
@@ -76,7 +76,7 @@ test("an offline registered host retains the scheduled input and resumes it once
     app.environment.setConnected([node.host_id]);
     app.faux.setResponses([fauxAssistantMessage("The restored owning host completed the original input.")]);
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
     const restored = await app.tasks.get(original.id); assert.equal(restored.conversation_id, original.conversation_id);
     assert.deepEqual(restored.pending, []); assert.equal(app.faux.state.callCount, 1);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -203,7 +203,7 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
       const conversation = await app.tasks.conversation(actor.conversation_id);
       const inputId = phase === "child" ? "child-input" : "continuation-input";
       const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT);
-      assert.equal(original?.status, "placed");
+      assert.ok(original?.type === "input" && original.status === "placed");
       const history = await app.tasks.history(task.id, 120_000, phase === "child" ? actor.id : undefined);
       if (shutdown === "graceful") {
         const live = await app.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT); assert.ok(live?.run);
@@ -219,25 +219,46 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
         assert.equal(bindings, 0); assert.equal(app.faux.state.callCount, 0);
         app.configureBackground();
       }
-      app.faux.setResponses([(context) => {
-        assert.ok(context.messages.some((message) => message.role === "toolResult" && message.content.some((part) =>
-          part.type === "text" && part.text.includes("owned host tool output"))));
-        // Exercise native timer-driven streaming beyond a one-line answer.
+      const respond: FauxResponseFactory = context => {
+        const retainedTool = context.messages.some(message => message.role === "toolResult" && message.content.some(part =>
+          part.type === "text" && part.text.includes("owned host tool output")));
+        if (!retainedTool) return fauxAssistantMessage("The parent retained its recovered child result.");
+        const reported = context.messages.some(message => message.role === "toolResult" && !message.isError && message.toolName === "report_result");
+        if (phase === "child" && !reported) return fauxAssistantMessage(fauxToolCall("report_result", {
+          summary: "Recovered the original placed work without replaying its retained host result.",
+        }), { stopReason: "toolUse" });
+        const recovering = context.messages.some(message => message.role === "user" && typeof message.content === "string" &&
+          message.content.includes("Recover the interrupted owned inputs"));
+        const reconciled = context.messages.some(message => message.role === "toolResult" && !message.isError && message.toolName === "record_task");
+        if (phase === "continuation" && recovering && !reconciled) return fauxAssistantMessage(fauxToolCall("record_task", {
+          summary: "The retained host result was verified without replay.", reconciles_input: inputId,
+          state: { state: "resolved", evidence: "The original host tool completed once; the retained result was inspected." },
+        }), { stopReason: "toolUse" });
         return fauxAssistantMessage("Recovered the original placed work. " + "The retained host result was checked without replaying the owned tool. ".repeat(20));
-      }, fauxAssistantMessage("The parent retained its recovered child result.")]);
+      };
+      app.faux.setResponses(Array.from({ length: 6 }, () => respond));
       await app.tasks.resumeBackground();
       const restored = app;
+      const recoveryId = "background-recovery:" + original.id;
       // Native streaming uses timers. A count of immediate turns can expire
       // before those timers; retain the test's existing total deadline instead.
-      while (restored.tasks.isRunning(task.id) ||
-        (await restored.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT))?.status !== "done") {
+      while (restored.tasks.isRunning(task.id) || await restored.session.commit(async tx => {
+        const receipt = await tx.submissionByRequest(conversation.id, inputId);
+        return receipt?.status !== "done" && (await tx.submissionByRequest(conversation.id, recoveryId))?.status !== "done";
+      }, BACKGROUND_CONTEXT)) {
         await setImmediate(undefined, { signal: t.signal });
       }
       const current = await app.tasks.get(task.id);
       assert.equal(current.conversation_id, task.conversation_id);
       if (phase === "child") { assert.equal(current.agents[0]?.state.state, "done"); assert.equal(current.agents[0]?.conversation_id, actor.conversation_id); }
       const recovered = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT);
-      assert.equal(recovered?.id, original?.id);
+      assert.equal(recovered?.id, original.id);
+      if (recovered?.status === "unanswered") {
+        assert.equal(recovered.entry, original.entry);
+        assert.ok(["interrupted", "restart_limit", "faulted", "orphaned"].includes(recovered.reason));
+        const receipts = await app.storage.scanSubmissions({ conversationId: conversation.id }, 100, undefined, BACKGROUND_CONTEXT);
+        assert.equal(receipts.items.filter(input => input.requestId === recoveryId && input.status === "done").length, 1);
+      } else assert.equal(recovered?.status, "done");
       const full = await app.tasks.history(task.id, 120_000, phase === "child" ? actor.id : undefined);
       assert.ok(full.startsWith(history)); assert.match(full, /Recovered the original placed work/);
       assert.equal(app.commands.filter((command) => command.type === "exec").length, 0, "The prior host result is consumed, not executed again");

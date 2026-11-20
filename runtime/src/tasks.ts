@@ -3,7 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
-import { copyJson } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import type { CoordinatorEnvironment } from "./environment.js";
@@ -46,12 +46,16 @@ import { PartitionedRecords } from "./partitioned-records.js";
 import { OrderedIndex } from "./ordered-index.js";
 import type { InferenceClass } from "./generated/InferenceClass.js";
 import type { TaskExecution } from "./generated/TaskExecution.js";
+import type { TaskWorkflow } from "./generated/TaskWorkflow.js";
+import { WorkflowCapacity } from "./workflow-capacity.js";
+import type { WorkflowProgress } from "./workflow-progress.js";
+import type { JobProgress } from "./generated/JobProgress.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt; execution?: TaskExecution };
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt; execution?: TaskExecution; workflow?: TaskWorkflow };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type BackgroundInput = Pick<WorkerInput, "task_id" | "agent_id"> & { type: "background"; interactive?: false };
 type ActorInput = WorkerInput | BackgroundInput;
@@ -126,16 +130,12 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
     if (legacy.status === "queued") return "queued";
     throw new TaskError("The earlier notification did not publish");
   }
-  const model = entry.model?.flatMap((message) => {
-    if (message.role !== "assistant") return [];
-    const content: TextContent[] = [{ type: "text", text: notice.text }];
-    content.push({ type: "text", text: "Source references (evidence, not authorization): " + JSON.stringify({
+  if (!entry.model?.some(message => message.role === "assistant")) throw new TaskError("The notification has no assistant origin");
+  const content: TextContent[] = [{ type: "text", text: "Background workflow evidence, not a new user instruction:\n" + notice.text },
+    { type: "text", text: "Source references (evidence, not authorization): " + JSON.stringify({
       task_id: taskId, conversation_id: conversation.id.toString(), entry_id: entry.id.toString(), sources,
       source_events: notice.events.map((event) => ({ id: event.id, version: event.version, source: event.source })),
-    }) });
-    return [{ ...message, content }];
-  }) ?? [];
-  if (model.length === 0) throw new TaskError("The notification has no assistant origin");
+    }) }];
   const data: UserNoticeData = { task_id: taskId, source_conversation_id: conversation.id.toString(),
     source_entry_id: entry.id.toString(), text: notice.text, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
   // Pi can publish display-only writes while main is busy. Model context stays
@@ -143,8 +143,10 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
   const display = await root.submit({ type: "write", requestId, entry: {
     kind: UserNoticeEntry.kind, data,
   } }, BACKGROUND_CONTEXT);
-  await root.submit({ type: "write", requestId: "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), entry: {
-    kind: "agent.notice_context", model,
+  // Main already retains its originating call. A second assistant message at
+  // this boundary can end Pi's active turn before its tool result is answered.
+  if (conversation.id !== root.id) await root.submit({ type: "write", requestId: "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), entry: {
+    kind: "agent.notice_context", model: [{ role: "user", content, timestamp: Date.now() }],
   } }, BACKGROUND_CONTEXT);
   const status = await display.status(BACKGROUND_CONTEXT);
   if (status.status === "done") return "published";
@@ -177,6 +179,9 @@ export class TaskStore {
   private readonly deadlines = new OrderedIndex<{ id: string; next_check: string }>("agent.task.due");
   private routingPreparing: Promise<void> | undefined;
   private readonly running = new Map<string, AttachedWorker>();
+  private readonly workflowCapacity = new WorkflowCapacity();
+  private readonly workflowAdmissions = new Map<string, { controller: AbortController; finished: Promise<void> }>();
+  private readonly recoveringBackground = new Set<string>();
   private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
   private resources: { attach(taskId: string): Promise<void> } | undefined;
@@ -185,7 +190,22 @@ export class TaskStore {
   private histories: HistoryStore | undefined;
   private attachments: AttachmentStore | undefined;
   private background: BackgroundExecution | undefined;
+  private monitor: WorkflowProgress | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
+  useMonitor(monitor: WorkflowProgress): void { this.monitor = monitor; }
+  async monitorJobs(jobs: readonly ScheduledOccurrence["job"][]): Promise<void> { await this.monitor?.adoptJobs(jobs); }
+  async trackScheduledProgress(id: string, occurrence: ScheduledOccurrence): Promise<void> {
+    if (this.monitor === undefined) return;
+    await this.session.commit(async tx => {
+      const task = await this.taskIn(tx, id);
+      if (task === undefined) throw new TaskError("The retained scheduled actor is unavailable");
+      await this.monitor?.trackScheduledIn(tx, task, occurrence);
+    }, BACKGROUND_CONTEXT);
+  }
+  async workflowProgress(jobId: string): Promise<JobProgress> {
+    return this.monitor?.status(jobId) ?? { status: "unavailable", checked_at: Date.now(), last_progress_at: null, pending_work: 0,
+      blocker: "Workflow progress monitoring is unavailable; coverage is incomplete" };
+  }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
       (tx, task) => this.indexTaskIn(tx, task));
@@ -252,6 +272,7 @@ export class TaskStore {
       owner.task_id = task.id; owner.agent_id = agentId;
     }
     await this.indexDueIn(tx, task);
+    await this.monitor?.trackIn(tx, task);
   }
   private async taskIn(tx: Tx, id: string): Promise<TaskRecord | undefined> {
     const saved = await this.recordsStore.valueIn(tx, id);
@@ -277,7 +298,7 @@ export class TaskStore {
     const configured = await this.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT);
     const parent = agentId === undefined ? configured : await this.session.snapshot(AgentDoc,
       (await this.conversation(task.conversation_id)).id, BACKGROUND_CONTEXT);
-    const cwd = configured?.cwd ?? actor.pending[0]?.scheduled?.job.cwd ?? parent?.cwd ??
+    const cwd = configured?.cwd ?? actor.pending[0]?.scheduled?.job.cwd ?? task.workflow?.job.cwd ?? parent?.cwd ??
       (task.worker.state === "unassigned" ? "/" : task.worker.host.cwd);
     const host = await this.environment.defaultHost(await this.environment.hosts(cwd, null, []));
     if (host === null) throw new TaskError("The task's coordinator execution host is offline; its input is retained");
@@ -285,13 +306,31 @@ export class TaskStore {
   }
   /** Background jobs use the same actor and native outbox, without a terminal transport. */
   async runBackground(id: string, signal?: AbortSignal, agentId?: string): Promise<void> {
+    const task = await this.get(id);
+    if (agentId !== undefined || task.workflow === undefined) return this.runBackgroundActor(id, signal, agentId);
+    const existing = this.workflowAdmissions.get(id);
+    if (existing !== undefined) return existing.finished;
+    // Own cancellation while waiting for an actor slot, before execution has
+    // an AttachedWorker. Stop and shutdown must also fence unplaced effects.
+    const controller = new AbortController(), aborted = () => controller.abort();
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) controller.abort();
+    const finished = this.workflowCapacity.run(id, task.workflow, () => this.runBackgroundActor(id, controller.signal), controller.signal);
+    const admission = { controller, finished }; this.workflowAdmissions.set(id, admission);
+    try { await finished; }
+    finally {
+      signal?.removeEventListener("abort", aborted);
+      if (this.workflowAdmissions.get(id) === admission) this.workflowAdmissions.delete(id);
+    }
+  }
+  private async runBackgroundActor(id: string, signal?: AbortSignal, agentId?: string): Promise<void> {
     const key = this.actorKey(id, agentId), active = this.running.get(key);
     if (active !== undefined) {
       // A previously attached interactive worker already owns this conversation.
       // Its durable outbox drains normally; no replacement terminal is launched.
       if (active.input.type === "run_task") return;
       await active.finished;
-      if (this.actor(await this.get(id), agentId).pending.length > 0) await this.runBackground(id, signal, agentId);
+      if (this.actor(await this.get(id), agentId).pending.length > 0) await this.runBackgroundActor(id, signal, agentId);
       return;
     }
     const execution = this.background;
@@ -345,29 +384,91 @@ export class TaskStore {
       if (!this.isBackgroundTask(task)) continue;
       for (const agentId of [undefined, ...task.agents.map((agent) => agent.id)]) {
         const actor = this.actor(task, agentId);
-        if (this.running.has(this.actorKey(task.id, agentId))) continue;
+        const key = this.actorKey(task.id, agentId);
+        if (this.running.has(key) || this.recoveringBackground.has(key)) continue;
         const conversation = await this.conversation(actor.conversation_id);
         const admitted = await this.session.commit(async (tx) => {
-          if ((await tx.doc(LiveDoc, conversation.id)).run !== undefined ||
+          const live = await tx.doc(LiveDoc, conversation.id);
+          if (live.run !== undefined ||
               (await tx.doc(InboxDoc, conversation.id)).items.some((item) => item.mode !== "write")) return true;
+          if (live.runFailure !== undefined && ["interrupted", "restart_limit", "faulted", "orphaned"].includes(live.runFailure.reason)) return true;
           for (const input of actor.pending) {
             const native = await tx.submissionByRequest(conversation.id, input.id);
             if (native === undefined || native.status === "queued" || native.status === "placed") return true;
           }
           return false;
         }, BACKGROUND_CONTEXT);
-        if (admitted) await this.dispatchBackground(task.id, agentId);
+        if (admitted) void this.resumeBackgroundActor(task.id, agentId).catch(() => {});
       }
     }
+  }
+  /** Resume one recorded workflow without scanning unrelated retained actors. */
+  async resumeWorkflow(id: string): Promise<void> {
+    const task = await this.get(id);
+    if (task.workflow === undefined && await this.monitor?.ownsLegacy(task) !== true) throw new TaskError("Only a captured workflow can request workflow recovery");
+    await this.resumeBackgroundActor(id);
+  }
+  private async resumeBackgroundActor(id: string, agentId?: string): Promise<void> {
+    const key = this.actorKey(id, agentId);
+    if (this.recoveringBackground.has(key)) return;
+    this.recoveringBackground.add(key);
+    try {
+      const recovered = await this.recoverBackgroundInput(id, agentId);
+      let failed: unknown;
+      try { await this.runBackground(id, undefined, agentId); } catch (error) { failed = error; }
+      // Native recovery first settles a generation cut off during a request.
+      // Its ended input remains evidence; a new domain turn owns unfinished work.
+      if (!recovered && await this.recoverBackgroundInput(id, agentId)) await this.runBackground(id, undefined, agentId);
+      else if (failed !== undefined) throw failed;
+    } finally { this.recoveringBackground.delete(key); }
+  }
+  private async recoverBackgroundInput(id: string, agentId?: string): Promise<boolean> {
+    const task = await this.get(id), actor = this.actor(task, agentId), conversation = await this.conversation(actor.conversation_id);
+    return this.session.commit(async (tx) => {
+      const live = await tx.doc(LiveDoc, conversation.id), failure = live.runFailure;
+      if (live.run !== undefined || failure === undefined || !["interrupted", "restart_limit", "faulted", "orphaned"].includes(failure.reason)) return false;
+      const originals: TaskInputReceipt[] = [];
+      for (const inputId of failure.inputs) {
+        const original = await tx.submission(inputId);
+        if (original?.type === "input" && original.status === "unanswered" && original.entry !== undefined &&
+            original.requestId !== undefined && !["background-recovery:", "workflow-reconcile:", "scheduled-recovery:", "quota-recovery:"]
+              .some(prefix => original.requestId?.startsWith(prefix))) {
+          originals.push({ request_id: original.requestId, submission_id: original.id.toString() });
+        }
+      }
+      const first = originals[0];
+      if (first === undefined) return false;
+      const inputId = "background-recovery:" + first.submission_id;
+      if (await tx.submissionByRequest(conversation.id, inputId) !== undefined) return false;
+      let admitted = false;
+      await this.updateIn(tx, id, (current) => {
+        const retained = this.actor(current, agentId);
+        if (current.state.state === "resolved" || retained.state.state === "resolved") return;
+        if (current.state.state === "waiting" && current.state.next_check !== null &&
+            Date.parse(current.state.next_check) > Date.now()) return;
+        if (retained.pending.some(input => input.id === inputId)) { admitted = true; return; }
+        retained.pending.push({ id: inputId, mode: "follow_up", content:
+          `Recover the interrupted owned inputs ${JSON.stringify(originals.map(input => input.request_id))}. ` +
+          "Their original inputs, completed tools and uncertain effects remain in this conversation. Inspect those receipts and current evidence before continuing only unfinished work. " +
+          "Never repeat a completed action or rerun an uncertain tool without reconciling its actual outcome first. Preserve existing authorization and waiting decisions. " +
+          (agentId === undefined
+            ? "Before finishing, use record_task with reconciles_input for each exact original request ID, the verified summary, and actual task state."
+            : "Report the verified remaining result with report_result; retain the interrupted original as evidence for the parent.") });
+        retained.state = { state: "open" }; current.state = { state: "open" }; admitted = true;
+      });
+      return admitted;
+    }, BACKGROUND_CONTEXT);
   }
   async interruptBackground(conversationId: string): Promise<boolean> {
     for (const task of await this.list()) {
       const agent = task.agents.find((actor) => actor.conversation_id === conversationId);
       if (task.conversation_id !== conversationId && agent === undefined) continue;
       const active = this.running.get(this.actorKey(task.id, agent?.id));
-      if (active?.controller === undefined) return false;
+      const admission = agent === undefined ? this.workflowAdmissions.get(task.id) : undefined;
+      const controller = admission?.controller ?? active?.controller;
+      if (controller === undefined) return false;
       const pending = this.actor(task, agent?.id).pending;
-      active.controller.abort();
+      controller.abort();
       const conversation = await this.conversation(conversationId);
       await this.session.commit(async (tx) => {
         const withdrawn: string[] = [];
@@ -384,18 +485,26 @@ export class TaskStore {
           actor.pending = actor.pending.filter((input) => !withdrawn.includes(input.id));
         });
       }, BACKGROUND_CONTEXT);
-      await active.finished; return true;
+      if (admission !== undefined) await admission.finished.catch(() => {});
+      else await active?.finished;
+      return true;
     }
     return false;
   }
   /** Fence app bindings before Harness.close checkpoints native work for its next owner. */
   async detachBackground(): Promise<void> {
+    const admissions = [...this.workflowAdmissions.values()];
     const active = [...this.running.values()].filter((actor) => actor.controller !== undefined);
     for (const actor of active) {
       actor.fenced = true; actor.attached = false;
+    }
+    // Admission cancellation propagates synchronously to an attached actor.
+    // Fence every actor before either controller can cancel its native run.
+    for (const admission of admissions) admission.controller.abort();
+    for (const actor of active) {
       actor.controller?.abort(); actor.wake?.();
     }
-    await Promise.all(active.map((actor) => actor.finished));
+    await Promise.all([...active.map((actor) => actor.finished), ...admissions.map(admission => admission.finished.catch(() => {}))]);
   }
   async attachmentRefs(ids: readonly string[] = []): Promise<AttachmentRef[]> {
     if (ids.length === 0) return [];
@@ -436,7 +545,7 @@ export class TaskStore {
    * Stop at unknown legacy input rather than borrowing an earlier job's name. */
   async noticeOrigin(conversation: Conversation, at: EntryId): Promise<NoticeOrigin | undefined> {
     for await (const entries of this.historyPages(conversation, { order: "descending", maxEntryId: at }, 32)) {
-      for (const entry of entries) if (entry.kind === "agent.input" || entry.model?.some((message) => message.role === "user")) {
+      for (const entry of entries) if (entry.kind !== "agent.notice_context" && (entry.kind === "agent.input" || entry.model?.some((message) => message.role === "user"))) {
         if (entry.kind !== "agent.input") return undefined;
         const data = entry.data;
         return readNoticeOrigin(data !== null && typeof data === "object" && !Array.isArray(data) ? data.notice_origin : undefined);
@@ -548,6 +657,7 @@ export class TaskStore {
       task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
       await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
       await this.indexDueIn(tx, task);
+      await this.monitor?.trackIn(tx, task, true);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
       await this.outcomes?.recordIn(tx, outcome, provenance.settled);
@@ -555,7 +665,7 @@ export class TaskStore {
     return this.get(id);
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
-  isRunning(id: string): boolean { return [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }
+  isRunning(id: string): boolean { return this.workflowAdmissions.has(id) || [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }
   /** A root worker becomes busy after guidance and its execution binding are
    * ready. A saved allocation or a running child cannot own a model retry. */
   hasExecutionOwner(id: string, conversationId: ConversationId): boolean {
@@ -902,6 +1012,11 @@ export class TaskStore {
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
     if (input.execution !== undefined) task.execution = input.execution;
+    if (input.workflow !== undefined) {
+      const workflow = input.workflow;
+      task.workflow = { owner_task_id: workflow.owner_task_id, work_key: workflow.work_key,
+        job: { ...workflow.job, model: { ...workflow.job.model }, schedules: workflow.job.schedules.map(schedule => ({ ...schedule })) } };
+    }
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     return { id, native: conversation.id };
   }
@@ -977,6 +1092,12 @@ export class TaskStore {
   async enqueue(id: string, content: string, inputId: string = randomUUID(), delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     return this.enqueueActor(id, content, inputId, undefined, delivered, mode, attachments, undefined, origin, sender);
   }
+  /** Recovery admission rechecks its owned deadline after resource attachment,
+   * on the same mutation line that would append and reopen the task. */
+  async enqueueWorkflowRecovery(id: string, content: string, inputId: string,
+    current: (tx: Tx, task: TaskRecord) => Promise<boolean>): Promise<TaskRecord> {
+    return this.enqueueActor(id, content, inputId, undefined, undefined, "follow_up", undefined, undefined, undefined, undefined, current);
+  }
   /** The dedicated request namespace and exact receipt survive outbox
    * consumption. Reopening or another reviewer cannot reinterpret an admitted
    * intent as a different body, sender or inference budget. */
@@ -1008,9 +1129,8 @@ export class TaskStore {
     }
     if (previous === undefined) task.pending.push({ id: input.input_id, content: input.content, mode: "follow_up", sender });
     task.state = { state: "open" }; task.updated_at = Date.now();
-    const workClass = task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local") ? "cron"
-      : input.work_class;
-    await this.inference.assignClassIn(tx, { id: native }, workClass);
+    const workClass = task.workflow?.job.priority === "critical" ? "critical" : input.work_class;
+    await this.inference.assignClassIn(tx, { id: native }, workClass, task.workflow?.job.id);
     await this.indexTaskIn(tx, task, task.sources);
     receipt.receipt = { hash, sender: input.sender_conversation_id, work_class: input.work_class };
   }
@@ -1031,7 +1151,8 @@ export class TaskStore {
     const current = this.running.get(this.actorKey(id, agentId));
     return (current?.attached === true && current.observer?.signal.aborted !== true) || call === undefined ? task : this.dispatchAgent(id, agentId, call);
   }
-  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
+  private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender,
+    current?: (tx: Tx, task: TaskRecord) => Promise<boolean>): Promise<TaskRecord> {
     validateInput(content, attachments);
     const store = this.attachments;
     if (attachments !== undefined && attachments.length > 0) {
@@ -1054,6 +1175,10 @@ export class TaskStore {
     try {
       await this.resources?.attach(id);
       await this.admit(attachments, () => this.session.commit(async (tx) => {
+      if (current !== undefined) {
+        const task = await this.taskIn(tx, id);
+        if (task === undefined || !await current(tx, task)) return;
+      }
       await this.updateIn(tx, id, async (task) => {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
         const actor = this.actor(task, agentId);
@@ -1069,7 +1194,7 @@ export class TaskStore {
           if (!conversationIdentity(native) || native.toString() !== actor.conversation_id ||
               !conversationIdentity(parent) || parent.toString() !== task.conversation_id) throw new TaskError("Task conversation identity is invalid");
           if (origin !== undefined) await this.inference.promoteForegroundIn(tx, { id: native });
-          else await this.inference.assignClassIn(tx, { id: native }, await this.inference.workClassIn(tx, { id: parent }));
+          else await this.inference.assignClassIn(tx, { id: native }, await this.inference.workClassIn(tx, { id: parent }), await this.inference.workGroupIn(tx, { id: parent }));
         }
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
@@ -1182,7 +1307,7 @@ export class TaskStore {
       if (task.agents.some((agent) => agent.id === input.id)) return;
       if (task.agents.filter((agent) => agent.state.state === "open").length >= 8) throw new TaskError("This task already has eight unfinished agents");
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
-      await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent));
+      await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent), await this.inference.workGroupIn(tx, parent));
       // Tool-created children follow their actual placed input. A future queued
       // occurrence cannot retag an earlier invocation through the actor default.
       const origin = provenance === undefined ? (await tx.doc(NoticeLineage, parent.id)).origin : invocationOrigin;
@@ -1628,7 +1753,7 @@ export class TaskStore {
         const parent = input.agent_id === undefined ? conversation : await this.conversation(task.conversation_id);
         await this.session.commit(async tx => {
           if (input.interactive === true) await this.inference.promoteForegroundIn(tx, conversation);
-          else await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent));
+          else await this.inference.assignClassIn(tx, conversation, await this.inference.workClassIn(tx, parent), await this.inference.workGroupIn(tx, parent));
         }, BACKGROUND_CONTEXT);
       }
       if (input.type === "background") active.conversation = conversation;
@@ -1716,6 +1841,8 @@ export class TaskStore {
             await this.admitActiveInputs(active);
             await conversation.waitForIdle(BACKGROUND_CONTEXT);
           } finally { active.nativeActive = false; }
+          if (input.type === "background" && this.recoveringBackground.has(actorKey) &&
+              await this.recoverBackgroundInput(task.id, input.agent_id)) continue;
           if (active.revision !== revision) continue;
           task = await this.get(input.task_id);
           actor = this.actor(task, input.agent_id);
@@ -1851,10 +1978,12 @@ export class TaskStore {
       if (active.fenced) return { conversation_id: this.actor(await this.get(input.task_id), input.agent_id).conversation_id, text: "" };
       const preparing = input.type === "background" && !active.attached && controller?.signal.aborted !== true;
       if (preparing) childResultPending = false;
-      // Native failures retain queued inbox inputs. Withdraw them explicitly
-      // rather than leaving an admitted follow-up waiting without an executor.
-      // A host/auth preparation gap has not acquired that native execution yet.
-      if (!preparing) await active.conversation?.abort(BACKGROUND_CONTEXT);
+      // An ended native run retains its queued inbox for the next bound owner.
+      // Only a still-live run needs cancellation of this failed execution.
+      if (!preparing && active.conversation !== undefined &&
+          (await this.session.snapshot(LiveDoc, active.conversation.id, BACKGROUND_CONTEXT))?.run !== undefined) {
+        await active.conversation.abort(BACKGROUND_CONTEXT);
+      }
       if (attached) {
         if (input.agent_id !== undefined && !preparing) {
           childResultPending = true;

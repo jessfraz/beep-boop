@@ -215,9 +215,10 @@ export class Notifications {
         if (active === undefined || active.state.status === "terminal") state.active = null;
       }
     }, BACKGROUND_CONTEXT);
-    this.stop = this.session.subscribeCommits((publication) => {
+    const observation = this.session.observeCommits({ advance: (publication) => {
       if (publication.changes.some((change) => change.type === "entry" && change.value.conversationId === ROOT_CONVERSATION_ID)) this.schedule();
-    });
+    }, end: () => {} });
+    this.stop = () => observation.detach();
     await this.reconcile();
     return this.configured;
   }

@@ -231,18 +231,28 @@ export function createJobTools(jobs: BackgroundScheduler, executions: Executions
         control(api.conversationId.toString()); return output(await jobs.getJob(args.job_id));
       } }),
     defineTool({ name: "run_job", replay: "safe", description: "Admit one immediate run of a configured job and return its durable task ID. Choose a schedule when the job has several. Read the task to follow progress; admission is not completion.",
-      parameters: Type.Object({ job_id: Type.String({ minLength: 1 }), schedule_id: Type.Optional(Type.String({ minLength: 1 })) }),
+      parameters: Type.Object({ job_id: Type.String({ minLength: 1 }), schedule_id: Type.Optional(Type.String({ minLength: 1 })),
+        input: Type.Optional(Type.String({ maxLength: 16000 })) }),
       async execute(args, api, context) {
         control(api.conversationId.toString());
         const request_id = await api.memo("job_run_request", randomUUID(), context);
-        return output(await jobs.runJob({ type: "run_job", job_id: args.job_id, schedule_id: args.schedule_id ?? null, request_id }));
+        return output(await jobs.runJob({ type: "run_job", job_id: args.job_id, schedule_id: args.schedule_id ?? null, request_id, ...(args.input === undefined ? {} : { input: args.input }) }));
       } }),
   ] });
 }
 
-export function createAppTools(tasks: TaskStore, executions: Executions): {
+export function createAppTools(tasks: TaskStore, executions: Executions, jobs?: () => BackgroundScheduler): {
   host: Extension; main: Extension; worker: Extension; agent: Extension; legacy: Extension;
 } {
+  async function workflowRequest(task: TaskRecord, input: string, requestId: string, attachments: string[] | undefined) {
+    const owners = task.sources.filter(source => source.provider === "scheduled_jobs" && source.account === "local");
+    if (owners.length === 0) return undefined;
+    const job = owners[0];
+    if (owners.length !== 1 || job === undefined) throw new TaskError("Choose the exact configured workflow");
+    if (attachments !== undefined && attachments.length > 0) throw new TaskError("Use a separate task for attachment work; workflow requests need current text evidence");
+    if (jobs === undefined) throw new TaskError("Run this workflow through the coordinator's run_job control");
+    return jobs().runJob({ type: "run_job", job_id: job.thread_id, schedule_id: null, request_id: requestId, input });
+  }
   const host = defineExtension({ name: "host-tools", tools: [
     defineTool({ name: "read_attachment", replay: "safe", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
       parameters: Type.Object({ id: Type.String() }), async execute(args, api) {
@@ -424,6 +434,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
           task = await tasks.create({ id, title: args.title, outcome: args.outcome, sources: args.sources ?? [], model });
           action = "create";
         } else task = await tasks.get(args.task_id);
+        const workflow = await workflowRequest(task, args.input, await api.memo("workflow_request", randomUUID(), context), args.attachments);
+        if (workflow !== undefined) return output(workflow);
         if (task.model === null) { await tasks.selection(task.id, execution.model ?? DEFAULT_MODEL); task = await tasks.get(task.id); }
         const known = task.worker.state === "bound" || task.worker.state === "resuming" || task.worker.state === "resume_uncertain" ? task.worker : undefined;
         if (known !== undefined && args.cwd !== undefined && args.cwd !== known.host.cwd) {
@@ -455,6 +467,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       const sender = await executions.sender(tasks, api.conversationId.toString());
       const task = await tasks.get(args.task_id);
       if (sender.type === "task" && sender.task_id === task.id) throw new TaskError("Use this task's existing child-agent tools");
+      const workflow = await workflowRequest(task, args.input, await api.memo("workflow_request", randomUUID(), context), args.attachments);
+      if (workflow !== undefined) return output(workflow);
       const inputId = await api.memo("input_id", randomUUID(), context);
       await tasks.enqueue(task.id, args.input, inputId, undefined, args.mode ?? "steer",
         await tasks.attachmentRefs(args.attachments), undefined, sender);

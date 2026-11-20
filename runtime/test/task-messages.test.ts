@@ -1,3 +1,4 @@
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,7 +20,7 @@ import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { history, transcript } from "../src/transcript.js";
-import { FakeClock, pump } from "./fixtures/background-runtime.js";
+import { exampleJob, openBackground, FakeClock, pump } from "./fixtures/background-runtime.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
   session_id: "session:22222222-2222-4222-8222-222222222222", window_id: "window:33333333-3333-4333-8333-333333333333",
@@ -84,7 +85,7 @@ test("peer messages retain their sender through native steering and reopening wi
   const noHost: HostCall = async command => assert.fail(`Coordination must not launch host effects: ${command.type}`);
   try {
     const owner = await app.tasks.create({ title: "Delivery job", outcome: "Save and verify the existing delivery records.",
-      model: DEFAULT_MODEL, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "delivery-review" }] });
+      model: DEFAULT_MODEL, sources: [{ provider: "google", account: "example", thread_id: "delivery-review" }] });
     const sender = await app.tasks.create({ title: "Morning review", outcome: "Review useful changes.", model: DEFAULT_MODEL });
     const host: WorkerHost = { host_id: binding.host_id, name: "fixture", rex_server: null, coordinator: null,
       agent_program: process.execPath, cwd: directory };
@@ -98,13 +99,13 @@ test("peer messages retain their sender through native steering and reopening wi
       const assistant = await tx.appendEntry(AssistantEntry, conversation!.id, { model: [] });
       const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
       const live = await tx.doc(LiveDoc, conversation!.id);
-      live.run = { taskId: generation, inputs: [submission.id] }; live.tools = [];
+      live.run = { turns: 0, taskId: generation, inputs: [submission.id] }; live.tools = [];
       return { generation, assistant: assistant.id };
     }, BACKGROUND_CONTEXT);
     const record = await app.session.getTask(native.generation, BACKGROUND_CONTEXT); assert.ok(record);
     const deadline = clock.value + 3_600_000;
     const checkpoint: GenerationCheckpoint = { phase: "tools", assistant: native.assistant, tools: [], pending: [] };
-    await app.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
+    await commitWrites(app.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, clock);
     app.registry.install(boundary);
     conversation = await app.tasks.conversation(owner.conversation_id);
@@ -174,4 +175,32 @@ test("peer messages retain their sender through native steering and reopening wi
     controller.abort(); releaseSender(); await conversation?.abort(BACKGROUND_CONTEXT).catch(() => {}); await worker?.catch(() => {});
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
   }
+});
+
+
+test("native task tools redirect workflow owner requests into fresh runs with the current question", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-workflow-request-tools-")), clock = new FakeClock();
+  const app = await openBackground(directory, clock), executions = new Executions();
+  const tools = createAppTools(app.tasks, executions, () => app.scheduler);
+  app.registry.install(tools.main); app.registry.install(tools.worker);
+  const root = await app.session.root(BACKGROUND_CONTEXT);
+  const unbind = executions.bind(root.id.toString(), { cwd: directory, hosts: [], call: async command => assert.fail(`A workflow request must not dispatch an old worker: ${command.type}`) });
+  try {
+    const job = exampleJob(); await app.scheduler.syncJobs([job]);
+    const owner = await app.tasks.create({ title: job.title, outcome: job.prompt,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    await app.tasks.update(owner.id, task => { task.summary = "OLD_BLOCKED_CONTEXT"; });
+    for (const name of ["message_task", "delegate_task"]) {
+      const result = await invoke(app.session, root, { type: "toolCall", id: name, name,
+        arguments: { task_id: owner.id, input: "List the current inbox spam candidates" } });
+      assert.ok(object(result) && typeof result.task_id === "string");
+      assert.notEqual(result.task_id, owner.id);
+      const run = await app.tasks.get(result.task_id);
+      assert.equal(run.scheduled_run?.manual?.input, "List the current inbox spam candidates");
+      assert.equal(run.workflow?.owner_task_id, owner.id);
+      assert.notEqual(run.conversation_id, owner.conversation_id);
+    }
+    const unchanged = await app.tasks.get(owner.id);
+    assert.equal(unchanged.pending.length, 0); assert.equal(unchanged.summary, "OLD_BLOCKED_CONTEXT");
+  } finally { unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

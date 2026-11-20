@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, type Harness, type JsonObject, type Tx } from "@earendil-works/pi-durable";
 import { setImmediate } from "node:timers/promises";
 import { createHash } from "node:crypto";
-import type { Draft } from "@earendil-works/chord";
+import type { Draft } from "@earendil-works/chord/delta";
 import { OrderedIndex } from "./ordered-index.js";
 
 const PAGE_SIZE = 128;

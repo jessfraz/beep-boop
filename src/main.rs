@@ -5046,7 +5046,7 @@ esac
         let mut cases = Vec::new();
         for (flags, expected, valid) in [
             (vec![], Some(Reasoning::Xhigh), true),
-            (vec!["--model", "gpt-6.1-sol"], Some(Reasoning::Xhigh), true),
+            (vec!["--model", "gpt-6.2-sol"], Some(Reasoning::Xhigh), true),
             (vec!["--model", "gpt-5.5"], Some(Reasoning::Xhigh), true),
             (vec!["--model", "gpt-4.1"], Some(Reasoning::Xhigh), false),
             (vec!["--model", "gpt-5"], Some(Reasoning::Xhigh), false),

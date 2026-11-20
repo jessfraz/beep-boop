@@ -1,3 +1,4 @@
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
@@ -69,12 +70,12 @@ test("native job and saved-work inspection uses the production coordinator witho
           status: "placed", entry: entry.id });
         const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
         const live = await tx.doc(LiveDoc, conversation.id);
-        live.run = { taskId: generation, inputs: [input.id] }; live.generation = { attempt: 1 };
+        live.run = { turns: 0, taskId: generation, inputs: [input.id] }; live.generation = { attempt: 1 };
         return generation;
       }, BACKGROUND_CONTEXT);
       const record = await seeded.harness.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
       const until = Date.now() + 3_600_000;
-      await seeded.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until,
+      await commitWrites(seeded.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until,
         checkpoint: { phase: "retry", attempt: 1, until } } } }], BACKGROUND_CONTEXT);
       generationIDs.push(generation);
     }

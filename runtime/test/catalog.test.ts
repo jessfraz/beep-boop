@@ -48,8 +48,8 @@ test("native catalog preserves imported clocks and provenance beside task, child
     await root.submit({ type: "write", entry: { kind: "fixture.main", model: [{ role: "user", content: "Main transcript is not catalog metadata", timestamp: rootTime }] } }, BACKGROUND_CONTEXT);
     const hidden = await app.session.commit((tx) => tx.createConversation({ ownership: { kind: "ownerless" } }), BACKGROUND_CONTEXT);
     let changed = 0;
-    const unsubscribe = app.session.subscribeCommits((publication) => { changed += publication.changes.length; });
-    const first = await app.catalog.list("", null, 100); unsubscribe();
+    const observation = app.session.observeCommits({ advance: (publication) => { changed += publication.changes.length; }, end() {} });
+    const first = await app.catalog.list("", null, 100); observation.detach();
     assert.ok(validEvent({ version: 1, id: 1, event: { type: "conversations", ...first } }), "Catalog output must satisfy the generated Rust wire contract");
     assert.equal(changed, 0, "Browsing the catalog must not create tasks, executions, or transcript entries");
     assert.equal(first.items.length, 5);

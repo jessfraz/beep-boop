@@ -3238,7 +3238,7 @@ mod tests {
         let after = rendered(&mut state, 110, 30);
         assert_eq!(after.matches("First second").count(), 1);
         assert!(after.contains("• fixed it"));
-        assert!(after.contains("gpt-6.1-sol high"));
+        assert!(after.contains("gpt-6.2-sol high"));
         assert!(after.contains("/workspace/example"));
         assert!(after.contains("let ready = true;"));
     }
@@ -3254,7 +3254,7 @@ mod tests {
         });
         let compacting = rendered(&mut state, 110, 24);
         assert_eq!(compacting.matches("Compacting context").count(), 1);
-        assert!(compacting.contains("gpt-6.1-sol high"));
+        assert!(compacting.contains("gpt-6.2-sol high"));
         assert!(
             compacting.contains("/workspace/example") && compacting.contains("Compacting context")
         );
@@ -3345,7 +3345,7 @@ mod tests {
             "The worker connection closed",
             "Hardware review",
             "/workspace/board",
-            "openai/gpt-6.1-sol",
+            "openai/gpt-6.2-sol",
             "/feedback Investigate this error",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
@@ -4063,7 +4063,7 @@ mod tests {
             .map(|x| buffer[(x, 22)].symbol())
             .collect::<String>();
         for (text, color) in [
-            ("gpt-6.1-sol", Color::Cyan),
+            ("gpt-6.2-sol", Color::Cyan),
             ("high", Color::Cyan),
             ("fast", Color::Cyan),
             ("/workspace/example", Color::Green),
@@ -5378,7 +5378,7 @@ mod tests {
         for row in &rows[composer - 1..] {
             assert!(!row.contains(['┌', '┐', '└', '┘', '─', '│']));
         }
-        assert!(rows[30].contains("gpt-6.1-sol high · /workspace/example"));
+        assert!(rows[30].contains("gpt-6.2-sol high · /workspace/example"));
         assert_eq!(buffer[(2, 30)].fg, Color::Cyan);
         assert!(!buffer[(2, 30)].modifier.contains(Modifier::DIM));
         assert!(!rows.iter().any(|line| line.contains("Activity ·")

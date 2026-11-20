@@ -19,10 +19,41 @@ import { FakeClock, pump, START } from "./fixtures/background-runtime.js";
 import { fixtureModel } from "./model.js";
 
 const zeroReservations = {
-  foreground: { requests: 0, tokens: 0 }, email: { requests: 0, tokens: 0 }, cron: { requests: 0, tokens: 0 },
+  foreground: { requests: 0, tokens: 0 }, critical: { requests: 0, tokens: 0 }, email: { requests: 0, tokens: 0 }, cron: { requests: 0, tokens: 0 },
   fresh: { requests: 0, tokens: 0 }, backfill: { requests: 0, tokens: 0 },
 };
 const context = (text = "Review the new evidence.") => ({ messages: [{ role: "user", content: text, timestamp: START }] }) satisfies Parameters<ReturnType<typeof createModels>["streamSimple"]>[1];
+
+test("critical workflows retain separate provider admission beside oversized ordinary work", async () => {
+  const capacity = new InferenceCapacity({ maxEstimatedTokens: 800 });
+  const ordinary = await capacity.acquire("account", "foreground", 500);
+  const first = await capacity.acquire("account", "critical", 100, undefined, "workflow-a");
+  let sameStarted = false;
+  const same = capacity.acquire("account", "critical", 100, undefined, "workflow-a").then(release => { sameStarted = true; return release; });
+  const other = await capacity.acquire("account", "critical", 100, undefined, "workflow-b");
+  assert.equal(sameStarted, false, "One workflow must not take another workflow's critical request");
+  first(); const successor = await same;
+  assert.equal(sameStarted, true);
+  successor(); other(); ordinary();
+});
+
+test("oversized ordinary contexts fail without consuming critical capacity", async () => {
+  const capacity = new InferenceCapacity({ maxEstimatedTokens: 800 });
+  await assert.rejects(capacity.acquire("account", "backfill", 601), /compact retained work/u);
+  const first = await capacity.acquire("account", "critical", 100, undefined, "workflow-a");
+  const other = await capacity.acquire("account", "critical", 100, undefined, "workflow-b");
+  first(); other();
+});
+
+test("oversized ordinary admission counts critical tokens already in use", async () => {
+  const capacity = new InferenceCapacity({ maxEstimatedTokens: 1000 });
+  const critical = await capacity.acquire("account", "critical", 400, undefined, "workflow-a");
+  let started = false;
+  const ordinary = capacity.acquire("account", "foreground", 700).then(release => { started = true; return release; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(started, false, "Aggregate active tokens must stay within the account budget");
+  critical(); const release = await ordinary; release();
+});
 
 async function openControlled(capacity: InferenceCapacity) {
   const directory = await mkdtemp(join(tmpdir(), "agent-inference-capacity-"));
@@ -78,12 +109,12 @@ test("backfill leaves real wrapped-provider capacity for foreground, fresh work 
   const app = await openControlled(new InferenceCapacity());
   try {
     const bulk = Array.from({ length: 6 }, (_, index) => app.request(`bulk-${index}`, "backfill"));
-    await pump(() => app.starts.length >= 3);
+    await pump(() => app.starts.length >= 2);
     await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(app.starts.length, 3, "Backfill must leave reserved provider capacity for other work");
+    assert.equal(app.starts.length, 2, "Backfill must leave reserved provider capacity for critical and other work");
     const foreground = app.request("interactive", "foreground"), cron = app.request("scheduled", "cron"), fresh = app.request("new-signal", "fresh");
     await pump(() => app.active.has("interactive") && app.active.has("scheduled") && app.active.has("new-signal"));
-    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 3);
+    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 2);
     app.release("interactive"); app.release("scheduled"); app.release("new-signal");
     assert.equal((await foreground).stopReason, "stop"); assert.equal((await cron).stopReason, "stop"); assert.equal((await fresh).stopReason, "stop");
     for (let completed = 0; completed < 6; completed += 1) {
@@ -100,30 +131,30 @@ test("email starts through the real wrapped provider while fresh work and backfi
   const cost = estimatedInferenceTokens(model, normalizeContext(context()), { maxTokens: 16 });
   const app = await openControlled(new InferenceCapacity({ maxEstimatedTokens: cost * 8 }));
   try {
-    const backfill = Array.from({ length: 2 }, (_, index) => app.request(`bulk-${index}`, "backfill"));
-    const fresh = [app.request("held-fresh-one", "fresh"), app.request("held-fresh-two", "fresh")];
+    const backfill = [app.request("bulk-0", "backfill")];
+    const fresh = [app.request("held-fresh-one", "fresh")];
     const foreground = [app.request("interactive-one", "foreground"), app.request("interactive-two", "foreground")];
     const cron = app.request("held-cron", "cron");
-    await pump(() => app.active.size === 7);
+    await pump(() => app.active.size === 5);
     const queuedFresh = app.request("queued-fresh", "fresh");
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(app.starts.includes("queued-fresh"), false, "Ordinary fresh work must leave the email reservation available");
     const email = app.request("priority-email", "email");
     await pump(() => app.active.has("priority-email"));
-    assert.equal(app.active.size, 8, "Email owns both a request and estimated-token reservation beside held work");
+    assert.equal(app.active.size, 6, "Email owns its reservation while critical capacity remains available");
     assert.equal(app.starts.includes("queued-fresh"), false);
-    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 2);
+    assert.equal(app.starts.filter(id => id.startsWith("bulk-")).length, 1);
     app.release("priority-email");
     assert.equal((await email).stopReason, "stop");
     app.release("interactive-one"); app.release("interactive-two"); app.release("held-cron");
-    app.release("held-fresh-one"); app.release("held-fresh-two");
+    app.release("held-fresh-one");
     await Promise.all([...foreground, ...fresh, cron]);
     for (let index = 0; index < backfill.length; index++) {
       const id = `bulk-${index}`; await pump(() => app.active.has(id)); app.release(id);
     }
     await pump(() => app.active.has("queued-fresh")); app.release("queued-fresh");
     assert.ok((await Promise.all([...backfill, queuedFresh])).every(result => result.stopReason === "stop"));
-    assert.equal(app.maxActive(), 8);
+    assert.equal(app.maxActive(), 6);
   } finally { await app.close(); }
 });
 
@@ -270,14 +301,17 @@ test("work classification survives configure-before-model, model edits and nativ
       if (!closing) await new Promise<void>(resolve => { active.push(resolve); });
       return fauxAssistantMessage("Done.");
     }));
-    // The restored provider session's persisted class must enforce backfill's
-    // three-request ceiling; treating it as foreground would admit a fourth.
+    // The restored provider session retains backfill's two shared requests;
+    // treating it as foreground would admit a third.
     const model = app.models.getModel("openai", "fixture"); assert.ok(model);
     calls = Array.from({ length: 5 }, () => app.models.streamSimple(model, context(), { sessionId: connection.sessionId, maxTokens: 16 }).result());
-    await pump(() => starts.length === 3);
-    assert.equal(starts.length, 3);
-    for (const release of active.splice(0)) release();
-    await pump(() => starts.length === 5); for (const release of active.splice(0)) release(); await Promise.all(calls);
+    await pump(() => starts.length === 2);
+    assert.equal(starts.length, 2);
+    for (let index = 0; index < calls.length; index++) {
+      await pump(() => starts.length >= index + 1);
+      for (const release of active.splice(0)) release();
+    }
+    await Promise.all(calls);
   } finally {
     closing = true; for (const release of active.splice(0)) release(); await Promise.allSettled(calls);
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });

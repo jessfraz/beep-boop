@@ -44,13 +44,13 @@ test("stopped placed input reconciles its saved entry across reopen while an unp
     const entries = (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.map((entry) => entry.id);
     const expected = [{ type: "input_accepted", input_id: "placed", work: { type: "stopped" } }, { type: "input_placed", input_id: "placed", entry_id: placedState.entry.toString() }];
     let writes = 0;
-    const stop = app.session.subscribeCommits((commit) => { writes += commit.changes.length; });
+    const observation = app.session.observeCommits({ advance: (commit) => { writes += commit.changes.length; }, end() {} });
     assert.deepEqual(await reconcileMainInput(root, "placed", app.session), expected,
       "A saved placed input must clear its pending row instead of restoring a duplicate draft");
     const rejected = await reconcileMainInput(root, "queued", app.session);
     assert.equal(rejected?.length, 1); assert.equal(rejected?.[0]?.type, "input_rejected");
     assert.equal(await reconcileMainInput(root, "unknown", app.session), undefined);
-    stop(); assert.equal(writes, 0); assert.equal(app.faux.state.callCount, 1);
+    observation.detach(); assert.equal(writes, 0); assert.equal(app.faux.state.callCount, 1);
     await app.session.close(BACKGROUND_CONTEXT); root = undefined;
     app = await open(path); root = await app.session.root(BACKGROUND_CONTEXT);
     assert.deepEqual(await reconcileMainInput(root, "placed", app.session), expected);

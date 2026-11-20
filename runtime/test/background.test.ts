@@ -134,7 +134,14 @@ test("history indexing has its own durable lane with source polling disabled", a
     await pump(async () => (await app.receipts())?.jobs.length === 1);
     for (let i = 0; i < 2; i++) {
       clock.advance(60_000);
-      await pump(async () => (await app.scheduler.status()).pending > 0);
+      await pump(async () => {
+        const timers = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.filter(task => {
+          const input = task.record.input;
+          return task.record.kind === "agent.background" && typeof input === "object" && input !== null && "type" in input && input.type === "trigger";
+        });
+        return (await app.scheduler.status()).pending > 0 && timers.length > 0 && timers.every(task =>
+          task.state.kind === "sleeping" && (task.state.until ?? 0) > clock.value);
+      });
     }
     assert.equal(calls, 1, "Repeated ticks must not start competing index owners");
     held.release(); await pump(async () => calls === 2 && (await app.scheduler.status()).pending === 0);
@@ -176,7 +183,7 @@ test("a failed source judgment keeps its native retry identity across reopen whi
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("timer and manual runs reuse one owned job actor across reopen while equal titles stay separate", async () => {
+test("timer and manual runs retain one bookkeeping owner while each occurrence gets a fresh actor", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-actor-")), clock = new FakeClock();
   const job = exampleJob(), other = { ...exampleJob(), id: "other-review" };
   const actorId = "99999999-9999-4999-8999-999999999999";
@@ -193,18 +200,18 @@ test("timer and manual runs reuse one owned job actor across reopen while equal 
     const first = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "first" });
     const separate = await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "other" });
     await pump(async () => runs.length === 2 && (await app.scheduler.status()).pending === 0);
-    assert.equal(first.task_id, actorId); assert.notEqual(separate.task_id, actorId);
+    assert.notEqual(first.task_id, actorId); assert.notEqual(separate.task_id, actorId); assert.notEqual(first.task_id, separate.task_id);
     clock.advance(DAY); await pump(async () => runs.length === 4 && (await app.scheduler.status()).pending === 0);
-    assert.ok(runs.filter((run) => run.job === job.id).every((run) => run.actor === actorId));
-    assert.ok(runs.filter((run) => run.job === other.id).every((run) => run.actor === separate.task_id));
-    assert.equal(lookups, 2);
+    assert.equal(new Set(runs.filter((run) => run.job === job.id).map(run => run.actor)).size, 2);
+    assert.equal(new Set(runs.filter((run) => run.job === other.id).map(run => run.actor)).size, 2);
+    assert.equal(lookups, 0, "Indexed canonical ownership avoids legacy conversation selection");
     await app.session.close(BACKGROUND_CONTEXT);
     app = await openBackground(directory, clock, { runJob, jobActor: async () => { throw new Error("A bound job must not select another actor"); } });
     await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
     const later = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "later" });
     await pump(async () => runs.length === 5 && (await app.scheduler.status()).pending === 0);
-    assert.equal(later.task_id, actorId); assert.equal((await app.tasks.get(actorId)).conversation_id, owned.conversation_id);
-    assert.equal((await app.tasks.list()).length, 2);
+    assert.notEqual(later.task_id, actorId); assert.notEqual(later.task_id, first.task_id); assert.equal((await app.tasks.get(actorId)).conversation_id, owned.conversation_id);
+    assert.equal((await app.tasks.list()).length, 7);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -230,7 +237,7 @@ test("an occurrence's native actor memo and immutable snapshot survive a failed 
     assert.equal(restored?.memos?.job_actor_task_id, original.actor);
     await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: null });
     clock.advance(60_000); await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
-    assert.deepEqual(attempts[1], original); assert.equal((await app.tasks.list()).length, 1);
+    assert.deepEqual(attempts[1], original); assert.equal((await app.tasks.list()).length, 2);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -264,7 +271,7 @@ test("running retries stop publishing retained work failures across reopen", asy
     const before = await app.scheduler.getJob(job.id);
     assert.deepEqual(before.last_run?.state, { status: "retrying", at: START + 60_000, message: unavailable });
     const original = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task =>
-      task.record.kind === "agent.background" && task.record.memos?.job_actor_task_id === before.task_id);
+      task.record.kind === "agent.background" && task.record.memos?.job_actor_task_id === before.last_run?.task_id);
     assert.ok(original);
 
     await app.session.close(BACKGROUND_CONTEXT);
@@ -323,7 +330,7 @@ test("job-only synchronization diffs definitions without altering built-in sourc
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("replacing a timer preserves admitted model snapshots and serializes pending runs", async () => {
+test("replacing a timer preserves admitted model snapshots while independent occurrences proceed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-"));
   const clock = new FakeClock(), releases = [gate(), gate(), gate()];
   const runs: ScheduledOccurrence[] = [];
@@ -346,10 +353,10 @@ test("replacing a timer preserves admitted model snapshots and serializes pendin
     assert.equal(runs[1]?.job.revision, "one"); assert.equal(runs[1]?.job.model.reasoning, null);
     clock.advance(2 * DAY);
     await pump(async () => (await app.scheduler.getJob(updated.id)).schedules[0]?.last_at === START + 4 * DAY);
-    assert.equal(runs.length, 2);
-    releases[1]?.release(); await pump(() => runs.length === 3);
+    await pump(() => runs.length === 3);
+    releases[1]?.release();
     assert.equal(runs[2]?.job.revision, "two"); assert.equal(runs[2]?.job.model.reasoning, "high");
-    assert.equal(runs[2]?.scheduled_at, START + 4 * DAY); assert.equal(maximum, 1);
+    assert.equal(runs[2]?.scheduled_at, START + 4 * DAY); assert.equal(maximum, 2);
     releases[2]?.release();
   } finally { for (const release of releases) release.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -428,22 +435,23 @@ for (const boundary of boundaries) {
   });
 }
 
-test("repeated interrupted restarts expose Pi parking without replacing the durable timer", { timeout: 20_000 }, async () => {
+test("repeated interrupted restarts expose a terminal Pi failure without rerunning the occurrence", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-parked-"));
   let app: Awaited<ReturnType<typeof openBackground>> | undefined;
   try {
     for (let restart = 0; restart < 5; restart += 1) await killAt(directory, "before");
     app = await openBackground(directory, new FakeClock(START + DAY));
     await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob()] });
+    await pump(async () => (await app!.scheduler.getJob("example-review")).schedules[0]?.error !== null);
     const job = await app.scheduler.getJob("example-review");
-    assert.match(job.schedules[0]?.error ?? "", /parked after repeated interrupted restarts/);
+    assert.match(job.schedules[0]?.error ?? "", /interrupted|restart|cut off/i);
     assert.equal((await app.receipts())?.jobs.length ?? 0, 0);
     assert.deepEqual(await app.scheduler.syncJobs([exampleJob()]), { added: 0, updated: 0, removed: 0, unchanged: 1 });
-    assert.match((await app.scheduler.getJob("example-review")).schedules[0]?.error ?? "", /parked/);
+    assert.match((await app.scheduler.getJob("example-review")).schedules[0]?.error ?? "", /interrupted|restart|cut off/i);
   } finally { await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("parked job retry resumes its exact native work once while another job stays running", { timeout: 20_000 }, async () => {
+test("interrupted job retry creates new native work once while another job stays running", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-retry-")), held = gate();
   let app: Awaited<ReturnType<typeof openBackground>> | undefined;
   let started = () => {}; const running = new Promise<void>(resolve => { started = resolve; });
@@ -468,21 +476,23 @@ test("parked job retry resumes its exact native work once while another job stay
     await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "normal-running-job" });
     await running;
     const before = await app.scheduler.getJob("example-review"), inspection = await app.session.inspect(BACKGROUND_CONTEXT);
-    const parked = inspection.tasks.find(task => matches(task.record.input, "example-review") && task.state.kind === "blocked" && task.state.reason === "restart_limit");
+    const failed = (await app.session.commit(tx => tx.scanTasks({ kind: "agent.background", status: "terminal" }, 100), BACKGROUND_CONTEXT)).items
+      .find(task => matches(task.input, "example-review"));
     const normal = inspection.tasks.find(task => matches(task.record.input, other.id));
-    assert.ok(parked); assert.ok(normal); assert.equal(normal.record.state.status, "running");
-    assert.ok(retryable(app.scheduler), "Parked jobs need an explicit retry of their retained native task");
+    assert.ok(failed?.state.status === "terminal"); assert.equal(failed.state.outcome.status, "faulted");
+    assert.ok(normal); assert.equal(normal.record.state.status, "running");
+    assert.ok(retryable(app.scheduler), "Interrupted jobs need an explicit domain recovery");
     await assert.rejects(app.scheduler.retryJob("missing"), /Unknown scheduled job/);
-    await assert.rejects(app.scheduler.retryJob(other.id), /parked/);
+    await assert.rejects(app.scheduler.retryJob(other.id), /interrupted|parked/);
     const resumed = await app.scheduler.retryJob("example-review");
     assert.equal(resumed.job.id, "example-review");
     const current = app;
-    await pump(async () => (await current.session.getTask(parked.record.id, BACKGROUND_CONTEXT))?.state.status === "terminal");
-    const after = await app.session.getTask(parked.record.id, BACKGROUND_CONTEXT); assert.ok(after);
-    assert.deepEqual(after.input, parked.record.input, "The captured occurrence and request identity must survive retry");
-    assert.equal(after.id, parked.record.id);
-    assert.equal(after.state.status, "terminal");
-    if (after.state.status === "terminal") assert.equal(after.state.outcome.status, "completed");
+    await pump(async () => (await current.receipts())?.jobs.some(job => job.job.id === "example-review") === true);
+    const retried = (await app.session.commit(tx => tx.scanTasks({ kind: "agent.background", status: "terminal" }, 100), BACKGROUND_CONTEXT)).items
+      .find(task => task.id !== failed.id && matches(task.input, "example-review"));
+    assert.ok(retried?.state.status === "terminal"); assert.equal(retried.state.outcome.status, "completed");
+    assert.deepEqual(retried.input, failed.input, "The captured occurrence and request identity must survive retry");
+    assert.deepEqual(await app.session.getTask(failed.id, BACKGROUND_CONTEXT), failed, "Terminal native work must never be resurrected");
     assert.deepEqual(await app.session.getTask(normal.record.id, BACKGROUND_CONTEXT), normal.record,
       "Retrying another job cannot reset or replace normal running work");
     const status = await app.scheduler.getJob("example-review");
@@ -490,12 +500,15 @@ test("parked job retry resumes its exact native work once while another job stay
     assert.equal(status.schedules[0]?.last_at, before.schedules[0]?.last_at);
     assert.ok("task_id" in status && typeof status.task_id === "string",
       "Job diagnostics must retain their owning task independently of run timing");
-    assert.equal(status.task_id, status.last_run?.task_id);
+    assert.notEqual(status.task_id, status.last_run?.task_id, "Canonical metadata and fresh execution have distinct owners");
     const listed = (await app.scheduler.listJobs()).find(job => job.job.id === "example-review");
     assert.ok(listed !== undefined && "task_id" in listed);
     assert.equal(listed.task_id, status.task_id);
     assert.equal((await app.receipts())?.jobs.filter(job => job.job.id === "example-review").length, 1);
-    await assert.rejects(app.scheduler.retryJob("example-review"), /parked/);
+    const nativeBeforeRepeat = await app.session.commit(tx => tx.scanTasks({ kind: "agent.background" }, 100), BACKGROUND_CONTEXT);
+    await app.scheduler.retryJob("example-review");
+    assert.deepEqual(await app.session.commit(tx => tx.scanTasks({ kind: "agent.background" }, 100), BACKGROUND_CONTEXT), nativeBeforeRepeat,
+      "A repeated successful retry must reuse its durable recovery identity");
     assert.equal((await app.receipts())?.jobs.filter(job => job.job.id === "example-review").length, 1);
   } finally {
     held.release(); await app?.session.close(BACKGROUND_CONTEXT);

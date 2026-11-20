@@ -8,6 +8,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import { SourceCollectors, collectorSourceKey, discoverSourceCatalogs, type SourceCollectorOptions } from "../src/source-collectors.js";
 import { SourceJournal } from "../src/sources.js";
 import { TaskStore } from "../src/tasks.js";
@@ -56,6 +57,46 @@ async function open(directory: string, clock: FakeClock, fixture: Fixture, optio
   return { session, journal, collectors, discoveries: () => discoveries };
 }
 const signal = () => new AbortController().signal;
+
+test("sync replaces a terminal collector from its journal checkpoint without restarting another account", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-terminal-collector-")), clock = new FakeClock();
+  const first = config("example.retained"), other = config("example.unrelated"), seen: (string | null)[] = [];
+  const fixture: Fixture = { sources: [first, other], poll: async (source, state) => {
+    if (collectorSourceKey(source).account === "example.retained") seen.push(state?.checkpoint?.value ?? null);
+    return read(source, state, state === null ? "saved" : "caught-up");
+  } };
+  let app = await open(directory, clock, fixture);
+  try {
+    await app.collectors.sync(60, signal());
+    await pump(async () => (await app.collectors.status()).every(slot => slot.pages === 1));
+    const native = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.filter(task => task.record.kind === "agent.source.collector");
+    const owns = (input: unknown, account: string) => typeof input === "object" && input !== null && "key" in input &&
+      typeof input.key === "object" && input.key !== null && "account" in input.key && input.key.account === account;
+    const retained = native.find(task => owns(task.record.input, "example.retained"))?.record;
+    const unrelated = native.find(task => owns(task.record.input, "example.unrelated"))?.record;
+    assert.ok(retained?.state.status === "sleeping" && unrelated?.state.status === "sleeping");
+    await app.session.close(BACKGROUND_CONTEXT);
+    const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
+    try {
+      await commitWrites(storage, [{ type: "task", value: { ...retained, restarts: 5,
+        state: { status: "pending", checkpoint: retained.state.checkpoint } } }], BACKGROUND_CONTEXT);
+    } finally { await storage.close(BACKGROUND_CONTEXT); }
+    app = await open(directory, clock, fixture);
+    const failed = await app.session.waitForTask(retained.id, BACKGROUND_CONTEXT);
+    assert.equal(failed.state.outcome.status, "faulted");
+    await app.collectors.sync(60, signal());
+    await pump(async () => (await app.journal.states()).find(state => state.source.account === "example.retained")?.checkpoint?.value === "caught-up");
+    assert.deepEqual(seen, [null, "saved"], "Recovery must continue the last admitted cursor");
+    assert.deepEqual(await app.session.getTask(unrelated.id, BACKGROUND_CONTEXT), unrelated,
+      "A healthy account keeps its native task and polling deadline");
+    assert.deepEqual(await app.session.getTask(retained.id, BACKGROUND_CONTEXT), failed,
+      "The faulted native task remains immutable");
+    const replacements = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.filter(task => task.record.kind === "agent.source.collector" && task.record.id !== unrelated.id);
+    assert.equal(replacements.length, 1); assert.notEqual(replacements[0]?.record.id, retained.id);
+    await app.collectors.sync(60, signal());
+    assert.deepEqual(seen, [null, "saved"], "Repeated sync must not admit another recovery poll");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("a discovered source admits consecutive pages while another source catalog is still discovering", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-progressive-discovery-")), clock = new FakeClock(), held = gate();

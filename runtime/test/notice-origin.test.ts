@@ -52,10 +52,13 @@ test("actual concurrent scheduler publications retain run titles live and after 
     });
     let entered = 0, release = () => {}; const both = new Promise<void>((resolve) => { release = resolve; });
     const respond: FauxResponseFactory = async (context) => {
-      if (context.messages.at(-1)?.role === "toolResult") return fauxAssistantMessage("");
+      // The explicit manual run must return its result after the notice. An
+      // identical final is deduplicated against that actual delivered notice.
+      const text = JSON.stringify(context.messages).includes("PACKAGE_JOB_FIXTURE") ? "Morning brief: the parcel needs a decision." : "Package tracking: a briefing decision is needed.";
+      if (context.messages.at(-1)?.role === "toolResult") return fauxAssistantMessage(text);
       entered += 1; if (entered === 2) release(); await both;
       // Deliberately misleading body labels cannot choose the originating job.
-      return notice(JSON.stringify(context.messages).includes("PACKAGE_JOB_FIXTURE") ? "Morning brief: the parcel needs a decision." : "Package tracking: a briefing decision is needed.");
+      return notice(text);
     };
     app.faux.setResponses([respond, respond, respond, respond]);
     const [packageRun] = await Promise.all([
@@ -70,11 +73,11 @@ test("actual concurrent scheduler publications retain run titles live and after 
     await app.tasks.update(task.id, (saved) => { saved.title = "An unrelated mutable task title"; });
     await continued(app, task, "continue-before-next-run", "A continuation retains its admitted workflow origin.");
     origin(live.at(-1), packages);
-    app.faux.setResponses([notice("The renamed job's new run."), fauxAssistantMessage("")]);
+    app.faux.setResponses([notice("The renamed job's new run."), fauxAssistantMessage("The renamed job's new run.")]);
     await background.runJob({ type: "run_job", job_id: packages.id, schedule_id: null, request_id: "renamed" });
     await eventually(() => completed.length === 3); origin(live.at(-1), renamed);
     await background.syncJobs([brief]);
-    await continued(app, task, "after-delete", "A saved continuation survives source deletion."); origin(live.at(-1), renamed);
+    await continued(app, task, "after-delete", "A saved continuation survives source deletion."); origin(live.at(-1), packages);
     const count = live.length, calls = app.faux.state.callCount;
     await background.runJob({ type: "run_job", job_id: packages.id, schedule_id: null, request_id: "packages" });
     assert.equal(live.length, count); assert.equal(app.faux.state.callCount, calls, "Replay must not generate an extra publication");
@@ -103,7 +106,7 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
         if (done("notify_user")) return fauxAssistantMessage(fauxToolCall("report_result", { summary: "Checked the parcel with evidence." }), { stopReason: "toolUse" });
         entered(); await deleted; return notice("The child needs a concrete decision.");
       }
-      return done("spawn_agent") ? fauxAssistantMessage("") : fauxAssistantMessage(fauxToolCall("spawn_agent", {
+      return done("spawn_agent") ? fauxAssistantMessage("The child is reviewing the admitted source.") : fauxAssistantMessage(fauxToolCall("spawn_agent", {
         title: "Unrelated child title", outcome: "Check the admitted source.", input: "Check the parcel.",
       }), { stopReason: "toolUse" });
     };
@@ -114,7 +117,8 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
     await background.syncJobs([]); await app.tasks.update(task.id, (saved) => { saved.title = "Wrong renamed parent title"; });
     release(); await eventually(() => !app.tasks.isRunning(task.id));
     const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
-    assert.equal(rows.length, 1); origin(rows[0], job);
+    assert.equal(rows.length, 2); for (const row of rows) origin(row, job);
+    assert.ok(rows.some(row => row.text === "The child needs a concrete decision."));
     await app.close(); app = await openScheduled(directory, "original", new FakeClock()); scheduler(app, []);
     const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(saved, rows);
@@ -122,7 +126,7 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
     await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
     await app.tasks.runBackground(task.id, undefined, child.id);
     const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
-    assert.equal(continuedRows.length, 2); origin(continuedRows[1], job);
+    assert.equal(continuedRows.length, 3); origin(continuedRows[2], job);
   } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

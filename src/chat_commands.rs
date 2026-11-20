@@ -23,6 +23,9 @@ pub struct JobRunArgs {
     pub job_id: JobId,
     #[arg(long = "schedule", value_name = "SCHEDULE_ID", value_parser = parse_schedule_id)]
     pub schedule_id: Option<ScheduleId>,
+    /// Current request for this fresh job run; put --input last in chat.
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub input: Option<String>,
 }
 
 impl JobRunArgs {
@@ -35,6 +38,7 @@ impl JobRunArgs {
             job_id: self.job_id.clone(),
             schedule_id: self.schedule_id.clone(),
             request_id,
+            input: self.input.clone(),
         }
     }
 }
@@ -187,6 +191,45 @@ fn parse_schedule_id(value: &str) -> Result<ScheduleId, String> {
     ScheduleId::try_from(value.to_owned()).map_err(|error| error.to_string())
 }
 
+fn manual_job_arguments(command: &str) -> Result<Vec<String>, clap::Error> {
+    let mut arguments = Vec::new();
+    let mut remaining = command;
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        let end = remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len());
+        let (argument, rest) = remaining.split_at(end);
+        let input = if argument == "--input" {
+            Some(rest.trim())
+        } else {
+            remaining.strip_prefix("--input=").map(str::trim)
+        };
+        if let Some(input) = input {
+            // Chat input is literal trailing text, never shell syntax. Only a
+            // matching outer quote pair is presentation, as with pasted prose.
+            let input = if let Some(quote @ ('\'' | '"')) = input.chars().next() {
+                input[1..].strip_suffix(quote).ok_or_else(|| {
+                    Input::command().error(
+                        clap::error::ErrorKind::InvalidValue,
+                        "Close the quoted job input or enter it without surrounding quotes",
+                    )
+                })?
+            } else {
+                input
+            };
+            arguments.push(format!("--input={input}"));
+            break;
+        }
+        arguments.push(argument.to_owned());
+        remaining = rest;
+    }
+    Ok(arguments)
+}
+
 impl ChatCommand {
     pub fn parse(value: &str) -> Option<Result<Self, clap::Error>> {
         let value = value.trim();
@@ -194,7 +237,11 @@ impl ChatCommand {
             return Some(Ok(Self::Help));
         }
         value.strip_prefix('/').map(|command| {
-            Input::try_parse_from(command.split_whitespace()).map(|input| input.command)
+            if command.split_whitespace().next() == Some("run-job") {
+                Input::try_parse_from(manual_job_arguments(command)?).map(|input| input.command)
+            } else {
+                Input::try_parse_from(command.split_whitespace()).map(|input| input.command)
+            }
         })
     }
 
@@ -293,6 +340,7 @@ mod tests {
             job_id,
             schedule_id: Some(schedule_id),
             request_id,
+            input: None,
         }) = command.request()
         else {
             panic!("Manual job control must produce the shared admission request");
@@ -301,6 +349,15 @@ mod tests {
         assert_eq!(schedule_id.as_str(), "Morning.v1");
         assert!(uuid::Uuid::parse_str(&request_id).is_ok());
         assert!(command.settings(None).is_none());
+        let review =
+            ChatCommand::parse("/run-job daily-review --input \"Review the current inbox\"")
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            review.request(),
+            Some(RuntimeCommand::RunJob { input: Some(input), .. })
+                if input == "Review the current inbox"
+        ));
         assert!(matches!(
             ChatCommand::parse("/run-job daily-review")
                 .unwrap()
@@ -356,6 +413,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/jobs"]
         );
+    }
+
+    #[test]
+    fn manual_job_input_preserves_literal_text_and_rejects_unclosed_outer_quotes() {
+        for (command, expected) in [
+            (
+                "/run-job daily-review --schedule morning --input Review the inbox; keep $(literal) and <labels>",
+                "Review the inbox; keep $(literal) and <labels>",
+            ),
+            (
+                "/run-job daily-review --input \"Review what's new\"",
+                "Review what's new",
+            ),
+            (
+                "/run-job daily-review --input='Review \"current\" mail'",
+                "Review \"current\" mail",
+            ),
+            (
+                "/run-job daily-review --input --retain this literal option",
+                "--retain this literal option",
+            ),
+        ] {
+            let request = ChatCommand::parse(command).unwrap().unwrap().request();
+            assert!(matches!(
+                request,
+                Some(RuntimeCommand::RunJob { input: Some(input), .. }) if input == expected
+            ));
+        }
+        for malformed in [
+            "/run-job daily-review --input \"Review the inbox",
+            "/run-job daily-review --input='Review the inbox",
+        ] {
+            let error = ChatCommand::parse(malformed).unwrap().unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+        for empty in [
+            "/run-job daily-review --input",
+            "/run-job daily-review --input \"\"",
+            "/run-job daily-review --input=''",
+        ] {
+            assert!(ChatCommand::parse(empty).unwrap().is_err(), "{empty}");
+        }
     }
 
     #[test]

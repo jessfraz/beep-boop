@@ -49,7 +49,8 @@ async function until(session: Harness, signal: AbortSignal, condition: () => Pro
       } catch (error) { cleanup(); reject(error); }
       finally { running = false; }
     }
-    const stop = session.subscribeCommits(() => queueMicrotask(() => { void check(); }));
+    const observation = session.observeCommits({ advance: () => queueMicrotask(() => { void check(); }), end() {} });
+    const stop = () => observation.detach();
     signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort(); else void check();
   });
 }
@@ -298,7 +299,7 @@ test("known APNs rejection sleeps durably before retrying the same notification 
   const queued = await delivery(app.session, second, newer), active = await app.session.snapshot(NotificationState, BACKGROUND_CONTEXT);
   assert.ok(active?.active !== null && active?.active !== undefined);
   const current = await app.session.commit((tx) => tx.task(active.active!), BACKGROUND_CONTEXT);
-  assert.ok(queued?.state === "accepted" || current?.state.status !== "sleeping" || current.state.until <= clock.value,
+  assert.ok(queued?.state === "accepted" || current?.state.status !== "sleeping" || (current.state.until !== undefined && current.state.until <= clock.value),
     "A new queued reply must wake the dispatcher rather than wait behind another delivery's rejection");
   await until(app.session, t.signal, async () => (await delivery(app.session, second, newer))?.state === "accepted");
   assert.equal(f.requests.length, 3, "Both current devices receive the newer reply before the old retry deadline");

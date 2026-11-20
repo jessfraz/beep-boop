@@ -1,5 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { copyJson, type Draft } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
+import type { Draft } from "@earendil-works/chord/delta";
 import { defineDocFamily, type Harness, type JsonObject, type Tx } from "@earendil-works/pi-durable";
 
 const CAPACITY = 128;

@@ -1,3 +1,4 @@
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -9,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai";
-import { createRegistry, GenerationTask, Harness, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
+import { createRegistry, GenerationTask, Harness, InboxDoc, LiveDoc, UserEntry, type StorageWrite } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
@@ -44,6 +45,7 @@ test("production coordinator reconciles saved input before history across a real
       { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
     let entry: string;
     const stopProbes: StopProbe[] = [];
+    const retainedWrites: StorageWrite[] = [];
     try {
       const root = await harness.root(BACKGROUND_CONTEXT);
       const original = await root.commit(async (tx) => {
@@ -71,20 +73,29 @@ test("production coordinator reconciles saved input before history across a real
           }
           const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
           const live = await tx.doc(LiveDoc, conversation.id);
-          live.run = { taskId: generation, inputs: [submission_id] }; live.generation = { attempt: 1 };
+          live.run = { turns: 0, taskId: generation, inputs: [submission_id] }; live.generation = { attempt: 1 };
+          const steer = await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId: steerInput, status: "queued" });
+          const queued = await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId: queuedInput, status: "queued" });
+          (await tx.doc(InboxDoc, conversation.id)).items.push(
+            { id: steer.id, mode: "steer", content: "Keep the unplaced steer" },
+            { id: queued.id, mode: "followUp", content: "Keep the unplaced follow-up" });
           return { generation, entry_id: entry_id.toString() };
         }, BACKGROUND_CONTEXT);
-        await conversation.submit({ type: "input", requestId: steerInput, content: "Keep the unplaced steer", whenBusy: "steer" }, BACKGROUND_CONTEXT);
-        await conversation.submit({ type: "input", requestId: queuedInput, content: "Keep the unplaced follow-up", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
         const record = await harness.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
         // A real persisted Pi retry holds this generation without a provider or
         // replacement execution service. The production interrupt must settle it.
-        await storage.commit([{ type: "task", value: { ...record, state: { status: "pending",
-          checkpoint: { phase: "retry", attempt: 1, until: Date.now() + 3_600_000 } } } }], BACKGROUND_CONTEXT);
+        const until = Date.now() + 3_600_000;
+        retainedWrites.push({ type: "task", value: { ...record, state: { status: "sleeping", until,
+          checkpoint: { phase: "retry", attempt: 1, until } } } });
         stopProbes.push({ conversation_id: conversation.id.toString(), entry_id, input_id: stoppedInput,
           steer_id: steerInput, queued_id: queuedInput, root: conversation.id === root.id });
       }
     } finally { await harness.close(BACKGROUND_CONTEXT); }
+    // Raw crash fixtures must be written after their Harness has released its
+    // cached task state. Public input admission would otherwise start the seed.
+    const retainedStorage = await SqliteStorage.open(await openNodeSqliteDatabase(join(state, "session.sqlite")));
+    try { await commitWrites(retainedStorage, retainedWrites, BACKGROUND_CONTEXT); }
+    finally { await retainedStorage.close(BACKGROUND_CONTEXT); }
 
     async function start() {
       const started = performance.now();

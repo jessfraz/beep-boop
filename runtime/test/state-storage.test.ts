@@ -23,15 +23,15 @@ for (const kind of ["agent.task.directory", "agent.source.event.directory"]) {
         journal.active = active;
       }, BACKGROUND_CONTEXT);
       const legacyTasks = await app.session.snapshot(LegacyTasks, BACKGROUND_CONTEXT), legacySources = await app.session.snapshot(LegacySources, BACKGROUND_CONTEXT);
-      const stop = app.session.subscribeCommits(publication => {
+      const observation = app.session.observeCommits({ advance: publication => {
         for (const change of publication.changes) if (change.type === "document" && change.record.kind === kind &&
-          change.value !== null && change.value.migrated === 32 && !change.value.complete && closing === undefined) {
+          change.kind === "change" && change.value.migrated === 32 && !change.value.complete && closing === undefined) {
           closing = app.session.close(BACKGROUND_CONTEXT);
         }
-      });
+      }, end() {} });
       await assert.rejects(app.tasks.get(first.id), /clos|end|stop/);
       assert.ok(closing, "The first bounded migration batch must be independently durable");
-      await closing; stop(); app = await openStateStorage(path);
+      await closing; observation.detach(); app = await openStateStorage(path);
       assert.equal((await app.tasks.list()).length, original.tasks.length);
       assert.deepEqual(await app.tasks.get(first.id), first);
       const records = await app.sources.events({ limit: 100 });

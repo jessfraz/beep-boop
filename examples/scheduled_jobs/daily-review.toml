@@ -1,6 +1,6 @@
 id = "daily-review"
 prompt = "Review recent source changes and related unfinished tasks. Report useful outcomes or needed decisions; otherwise stay quiet."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 reasoning_effort = "medium"
 timezone = "Europe/London"
 

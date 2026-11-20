@@ -168,7 +168,7 @@ test("failed native commit cannot publish a conversation mapping or item receipt
   const directory = await mkdtemp(join(tmpdir(), "agent-import-atomic-")); let app = await open(directory);
   try {
     const commit = app.storage.commit.bind(app.storage); let fail = true;
-    app.storage.commit = async (writes, context) => { if (fail && writes.some((write) => write.type === "entry")) { fail = false; throw new Error("Injected commit failure"); } return commit(writes, context); };
+    app.storage.commit = async (batches, receive, context) => { if (fail && batches.some((writes) => writes.some((write) => write.type === "entry"))) { fail = false; throw new Error("Injected commit failure"); } return commit(batches, receive, context); };
     await assert.rejects(app.imported.import(batch([item("item1", "Retain one original")])), /Injected commit failure/);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     assert.equal(await app.imported.get("native-one"), undefined);

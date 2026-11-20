@@ -168,6 +168,20 @@ pub struct JobSchedule {
     pub prompt: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobPriority {
+    #[default]
+    Normal,
+    Critical,
+}
+
+impl JobPriority {
+    fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduledJob {
@@ -175,10 +189,25 @@ pub struct ScheduledJob {
     pub title: String,
     pub prompt: String,
     pub model: ModelSelection,
+    #[serde(
+        default,
+        skip_serializing_if = "JobPriority::is_normal",
+        deserialize_with = "default_job_priority"
+    )]
+    #[schemars(with = "Option<JobPriority>")]
+    pub priority: JobPriority,
     pub timezone: TimezoneId,
     pub schedules: Vec<JobSchedule>,
     pub revision: String,
     pub cwd: String,
+}
+
+// Native clients represent an omitted wire priority as null. Both forms keep
+// the historical normal priority and its semantic revision.
+fn default_job_priority<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<JobPriority, D::Error> {
+    Ok(Option::<JobPriority>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
@@ -200,6 +229,8 @@ struct JobFile {
     reasoning_effort: Option<Reasoning>,
     #[serde(default)]
     fast: bool,
+    #[serde(default)]
+    priority: JobPriority,
     timezone: TimezoneId,
     #[serde(default = "enabled")]
     enabled: bool,
@@ -434,6 +465,7 @@ pub fn load(directories: &[PathBuf]) -> Result<Vec<ScheduledJob>> {
             id: raw.id,
             prompt: raw.prompt,
             model,
+            priority: raw.priority,
             timezone: raw.timezone,
             schedules,
             revision: String::new(),
@@ -601,6 +633,61 @@ mod tests {
             .unwrap(),
             [instant("2026-11-02T09:00:00Z")]
         );
+    }
+
+    #[test]
+    fn job_priority_defaults_and_semantic_revision_follow_the_execution_contract() {
+        #[derive(serde::Deserialize)]
+        struct PriorityContract {
+            priority: Option<String>,
+        }
+
+        let directory = tempdir().unwrap();
+        let contents = definition(
+            &recurrence("20261102T090000", "Europe/London", "FREQ=DAILY"),
+            "Europe/London",
+        );
+        let path = directory.path().join("review.toml");
+        fs::write(&path, &contents).unwrap();
+        let normal = load(&[directory.path().to_owned()]).unwrap().remove(0);
+        let retained: ScheduledJob =
+            serde_json::from_slice(&serde_json::to_vec(&normal).unwrap()).unwrap();
+        assert_eq!(retained.revision, normal.revision);
+        let omitted: PriorityContract =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert!(omitted.priority.is_none());
+
+        fs::write(&path, format!("priority = \"normal\"\n{contents}")).unwrap();
+        let explicit = load(&[directory.path().to_owned()]).unwrap().remove(0);
+        assert_eq!(normal.revision, explicit.revision);
+
+        fs::write(&path, format!("priority = \"critical\"\n{contents}")).unwrap();
+        let critical = load(&[directory.path().to_owned()]).unwrap().remove(0);
+        assert_ne!(normal.revision, critical.revision);
+        let restored: ScheduledJob =
+            serde_json::from_slice(&serde_json::to_vec(&critical).unwrap()).unwrap();
+        let selected: PriorityContract =
+            serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+        assert_eq!(selected.priority.as_deref(), Some("critical"));
+        assert_eq!(restored.revision, critical.revision);
+    }
+
+    #[test]
+    fn invalid_job_priority_is_rejected_before_catalog_sync() {
+        let directory = tempdir().unwrap();
+        let contents = definition(
+            &recurrence("20261102T090000", "Europe/London", "FREQ=DAILY"),
+            "Europe/London",
+        );
+        fs::write(
+            directory.path().join("review.toml"),
+            format!("priority = \"urgent\"\n{contents}"),
+        )
+        .unwrap();
+        let error = format!("{:#}", load(&[directory.path().to_owned()]).unwrap_err());
+        assert!(error.contains("urgent"));
+        assert!(error.contains("normal"));
+        assert!(error.contains("critical"));
     }
 
     #[test]

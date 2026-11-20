@@ -408,6 +408,13 @@ public enum HistoryRole: String, Codable, Sendable, Equatable {
 }
 
 public enum InputBlockReason: String, Codable, Sendable, Equatable {
+    case `faulted` = "faulted"
+    case `interrupted` = "interrupted"
+    case `modelError` = "model_error"
+    case `noModel` = "no_model"
+    case `nothingToAnswer` = "nothing_to_answer"
+    case `orphaned` = "orphaned"
+    case `turnLimit` = "turn_limit"
     case `missingTask` = "missing_task"
     case `taskTooOld` = "task_too_old"
     case `migrationFailed` = "migration_failed"
@@ -599,6 +606,39 @@ public enum JobExecutionState: Codable, Sendable, Equatable {
 }
 
 public typealias JobId = String
+
+public enum JobPriority: String, Codable, Sendable, Equatable {
+    case `normal` = "normal"
+    case `critical` = "critical"
+}
+
+public struct JobProgress: Codable, Sendable, Equatable {
+    public var `blocker`: String?
+    public var `checkedAt`: UtcMillis
+    public var `lastProgressAt`: UtcMillis?
+    public var `pendingWork`: Int
+    public var `status`: JobProgressStatus
+    public init(`blocker`: String? = nil, `checkedAt`: UtcMillis, `lastProgressAt`: UtcMillis? = nil, `pendingWork`: Int, `status`: JobProgressStatus) {
+        self.`blocker` = `blocker`
+        self.`checkedAt` = `checkedAt`
+        self.`lastProgressAt` = `lastProgressAt`
+        self.`pendingWork` = `pendingWork`
+        self.`status` = `status`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `blocker` = "blocker"
+        case `checkedAt` = "checked_at"
+        case `lastProgressAt` = "last_progress_at"
+        case `pendingWork` = "pending_work"
+        case `status` = "status"
+    }
+}
+
+public enum JobProgressStatus: String, Codable, Sendable, Equatable {
+    case `normal` = "normal"
+    case `overdue` = "overdue"
+    case `unavailable` = "unavailable"
+}
 
 public struct JobSchedule: Codable, Sendable, Equatable {
     public var `focus`: String?
@@ -1011,6 +1051,7 @@ public enum ModelProvider: String, Codable, Sendable, Equatable {
     case `qwenTokenPlan` = "qwen-token-plan"
     case `qwenTokenPlanCn` = "qwen-token-plan-cn"
     case `qwenTokenPlanIndividual` = "qwen-token-plan-individual"
+    case `qwenTokenPlanIndividualCn` = "qwen-token-plan-individual-cn"
     case `xiaomi` = "xiaomi"
     case `xiaomiTokenPlanCn` = "xiaomi-token-plan-cn"
     case `xiaomiTokenPlanAms` = "xiaomi-token-plan-ams"
@@ -1854,15 +1895,17 @@ public struct ScheduledJob: Codable, Sendable, Equatable {
     public var `cwd`: String
     public var `id`: JobId
     public var `model`: ModelSelection
+    public var `priority`: JobPriority?
     public var `prompt`: String
     public var `revision`: String
     public var `schedules`: [JobSchedule]
     public var `timezone`: TimezoneId
     public var `title`: String
-    public init(`cwd`: String, `id`: JobId, `model`: ModelSelection, `prompt`: String, `revision`: String, `schedules`: [JobSchedule], `timezone`: TimezoneId, `title`: String) {
+    public init(`cwd`: String, `id`: JobId, `model`: ModelSelection, `priority`: JobPriority? = nil, `prompt`: String, `revision`: String, `schedules`: [JobSchedule], `timezone`: TimezoneId, `title`: String) {
         self.`cwd` = `cwd`
         self.`id` = `id`
         self.`model` = `model`
+        self.`priority` = `priority`
         self.`prompt` = `prompt`
         self.`revision` = `revision`
         self.`schedules` = `schedules`
@@ -1873,6 +1916,7 @@ public struct ScheduledJob: Codable, Sendable, Equatable {
         case `cwd` = "cwd"
         case `id` = "id"
         case `model` = "model"
+        case `priority` = "priority"
         case `prompt` = "prompt"
         case `revision` = "revision"
         case `schedules` = "schedules"
@@ -1884,17 +1928,20 @@ public struct ScheduledJob: Codable, Sendable, Equatable {
 public struct ScheduledJobStatus: Codable, Sendable, Equatable {
     public var `job`: ScheduledJob
     public var `lastRun`: JobExecution?
+    public var `progress`: JobProgress?
     public var `schedules`: [JobScheduleStatus]
     public var `taskId`: TaskId?
-    public init(`job`: ScheduledJob, `lastRun`: JobExecution? = nil, `schedules`: [JobScheduleStatus], `taskId`: TaskId? = nil) {
+    public init(`job`: ScheduledJob, `lastRun`: JobExecution? = nil, `progress`: JobProgress? = nil, `schedules`: [JobScheduleStatus], `taskId`: TaskId? = nil) {
         self.`job` = `job`
         self.`lastRun` = `lastRun`
+        self.`progress` = `progress`
         self.`schedules` = `schedules`
         self.`taskId` = `taskId`
     }
     enum CodingKeys: String, CodingKey {
         case `job` = "job"
         case `lastRun` = "last_run"
+        case `progress` = "progress"
         case `schedules` = "schedules"
         case `taskId` = "task_id"
     }

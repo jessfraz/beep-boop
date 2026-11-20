@@ -1684,6 +1684,13 @@
     "JobId": {
       "type": "string"
     },
+    "JobPriority": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "critical"
+      ]
+    },
     "JobSchedule": {
       "type": "object",
       "properties": {
@@ -1846,6 +1853,7 @@
         "qwen-token-plan",
         "qwen-token-plan-cn",
         "qwen-token-plan-individual",
+        "qwen-token-plan-individual-cn",
         "xiaomi",
         "xiaomi-token-plan-cn",
         "xiaomi-token-plan-ams",
@@ -2746,6 +2754,12 @@
         {
           "type": "object",
           "properties": {
+            "input": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "job_id": {
               "$ref": "#/$defs/JobId"
             },
@@ -4026,6 +4040,16 @@
         },
         "model": {
           "$ref": "#/$defs/ModelSelection"
+        },
+        "priority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobPriority"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "prompt": {
           "type": "string"

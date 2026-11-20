@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { copyJson, type JsonRepresentation, type JsonValue } from "@earendil-works/chord";
+import { copyJson, type JsonRepresentation, type JsonValue } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type AssistantMessageEvent, type DeferredFetchOptions,
-  type DeferredHandle, type Message, type Model, type MutableModels, type Provider, type ProviderRequestOptions,
+  type DeferredHandle, type Message, type Model, type MutableModels, type Provider, type ProviderRequestOptions, type SystemMessage,
   type ProviderResponse, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
@@ -12,8 +12,13 @@ import type { InferenceClass } from "./generated/InferenceClass.js";
 import { estimatedInferenceTokens, type InferenceCapacity } from "./inference-capacity.js";
 
 type SavedOptions = Pick<SimpleStreamOptions, "reasoning" | "maxTokens" | "temperature" | "sessionId" | "transport" | "cacheRetention" | "toolChoice" | "thinkingBudgets" | "timeoutMs" | "deferred">;
+// Pi's tool-schema boundary is `object`; persisted schemas are strict JSON.
+type StoredSystemMessage = Omit<JsonRepresentation<SystemMessage>, "toolsAdded"> & {
+  toolsAdded?: (Omit<JsonRepresentation<NonNullable<SystemMessage["toolsAdded"]>[number]>, "parameters"> & { parameters: { [key: string]: JsonValue } })[];
+};
+type StoredMessage = JsonRepresentation<Exclude<Message, SystemMessage>> | StoredSystemMessage;
 type PendingRequest = { account: string; provider: string; model: string } & (
-  { phase: "pending"; messages: JsonRepresentation<Message>[]; options: JsonRepresentation<SavedOptions>; usage: JsonRepresentation<Usage> }
+  { phase: "pending"; messages: StoredMessage[]; options: JsonRepresentation<SavedOptions>; usage: JsonRepresentation<Usage> }
   | { phase: "complete"; result: JsonRepresentation<AssistantMessage> });
 type Probe = { owner: string; token: string; until: number };
 type Cooldown = { attempt: number; next: number; probe: Probe | null; epoch: number };
@@ -25,7 +30,8 @@ const Pending = defineDocFamily<{ request: PendingRequest | null }, null>({ kind
 const Notice = defineEntry<{ provider: string; paused: boolean }>("agent.quota_state");
 const PREFIX = "beep-boop:quota:", BASE = 300_000, LIMIT = 3_600_000, PROBE_LEASE = 90_000;
 export type QuotaClock = { now?: () => number; random?: () => number; setTimer?: SetTimer };
-type InferenceAdmission = { capacity: InferenceCapacity; workClass(model: Model<Api>, options: SimpleStreamOptions): Promise<InferenceClass> };
+type InferenceAdmission = { capacity: InferenceCapacity; workClass(model: Model<Api>, options: SimpleStreamOptions): Promise<InferenceClass>;
+  workGroup?(model: Model<Api>, options: SimpleStreamOptions): Promise<string | undefined> };
 type RequestAccount = string | { id: string; refreshApiKey(): Promise<string> };
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
@@ -46,10 +52,10 @@ function sum(left: Usage, right: Usage): Usage {
 }
 /** The input is already Pi's typed transcript; only strict-JSON ownership changes here. */
 function storedMessages(messages: AssistantMessage[]): JsonRepresentation<AssistantMessage>[];
-function storedMessages(messages: Message[]): JsonRepresentation<Message>[];
-function storedMessages(messages: Message[]): JsonRepresentation<Message>[] {
+function storedMessages(messages: Message[]): StoredMessage[];
+function storedMessages(messages: Message[]): StoredMessage[] {
   const value = copyJson(messages, { omitUndefinedProperties: true });
-  const array = (copy: JsonValue): copy is JsonRepresentation<Message>[] => Array.isArray(copy);
+  const array = (copy: JsonValue): copy is StoredMessage[] => Array.isArray(copy);
   if (!array(value)) throw new Error("Pi transcript must be a message array");
   return value;
 }
@@ -162,11 +168,12 @@ export class QuotaRecovery {
     const refreshApiKey = typeof owner === "string" ? undefined : owner.refreshApiKey;
     if (this.admission === undefined) return this.requestAdmitted(provider, model, id, context, options, emit, account, retained, refreshApiKey);
     const workClass = await this.admission.workClass(model, options);
+    const workGroup = await this.admission.workGroup?.(model, options);
     // Resource waits are outside Pi's mutation line. Recheck the durable quota
     // gate only after admission, so a queued request cannot use an old permit
     // to send traffic after another request exhausted the account.
     return this.admission.capacity.run(account, workClass, estimatedInferenceTokens(model, context, options),
-      () => this.requestAdmitted(provider, model, id, context, options, emit, account, retained, refreshApiKey), options.signal);
+      () => this.requestAdmitted(provider, model, id, context, options, emit, account, retained, refreshApiKey), options.signal, workGroup);
   }
   private async requestAdmitted(provider: Provider, model: Model<Api>, id: string, context: TranscriptContext, options: SimpleStreamOptions,
     emit: (event: AssistantMessageEvent) => void, account: string, retained: boolean, refreshApiKey?: () => Promise<string>): Promise<AssistantMessage> {

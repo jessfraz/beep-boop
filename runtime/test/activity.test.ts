@@ -34,10 +34,10 @@ function summaryMessage(text: string): NonNullable<NonNullable<LiveState["genera
     stopReason: message.stopReason, timestamp: message.timestamp, content: [{ type: "thinking", thinking: text }] };
 }
 
-function heldWatch(session: Harness) {
+function heldObservation(session: Harness) {
   const entered = gate(), release = gate();
   let held = true;
-  session.watchDoc = new Proxy(session.watchDoc, {
+  session.observeDoc = new Proxy(session.observeDoc, {
     apply(target, owner, args: unknown[]) {
       const result: unknown = Reflect.apply(target, owner, args);
       assert.ok(result instanceof Promise);
@@ -69,9 +69,9 @@ test("activity reconnect reads one native tail regardless of retained root size"
   } finally { await stop?.(); await app.close(); }
 });
 
-test("native coalesced LiveDoc delivery orders final thinking before new canonical entries without replay", { timeout: 10_000 }, async () => {
+test("native LiveDoc observation orders final thinking before new canonical entries without replay", { timeout: 10_000 }, async () => {
   const app = await fixture(); let stop: (() => Promise<void>) | undefined;
-  const held = heldWatch(app.session);
+  const held = heldObservation(app.session);
   try {
     await app.root.commit(async (tx) => { await tx.doc(LiveDoc, app.root.id); }, BACKGROUND_CONTEXT);
     const thinking: string[] = [], visible: HistoryMessage[] = [], order: string[] = [];
@@ -137,13 +137,19 @@ test("an absent LiveDoc can be created, retired and recreated while an observati
 test("LiveDoc acquisition failure releases entry, visibility and close subscriptions", async () => {
   const app = await fixture();
   try {
-    const original = app.session.subscribeCommits.bind(app.session); let subscriptions = 0;
-    app.session.subscribeCommits = (listener) => {
-      const stop = original(listener); subscriptions += 1;
-      return () => { subscriptions -= 1; stop(); };
+    const original = app.session.observeCommits.bind(app.session); let subscriptions = 0;
+    app.session.observeCommits = (observer) => {
+      const observation = original(observer); subscriptions += 1;
+      let attached = true;
+      return { detach() { if (attached) { attached = false; subscriptions -= 1; observation.detach(); } } };
+    };
+    const subscribeClose = app.session.subscribeClose.bind(app.session);
+    app.session.subscribeClose = listener => {
+      const stop = subscribeClose(listener); subscriptions += 1; let attached = true;
+      return () => { if (attached) { attached = false; subscriptions -= 1; stop(); } };
     };
     const existing = subscriptions;
-    app.session.watchDoc = new Proxy(app.session.watchDoc, { apply() { return Promise.reject(new Error("fixture acquisition failed")); } });
+    app.session.observeDoc = new Proxy(app.session.observeDoc, { apply() { return Promise.reject(new Error("fixture acquisition failed")); } });
     await assert.rejects(activity(app.session, app.root, () => {}), /fixture acquisition failed/);
     assert.equal(subscriptions, existing, "A failed native acquisition must leave no entry or visibility listener");
   } finally { await app.close(); }
@@ -219,13 +225,13 @@ test("a typed notice committed during native streaming leaves the response and r
 });
 
 test("activity bounds pending native commits during delayed acquisition", { timeout: 10_000 }, async () => {
-  const app = await fixture(); const held = heldWatch(app.session);
+  const app = await fixture(); const held = heldObservation(app.session);
   try {
     const starting = activity(app.session, app.root, () => {});
     await held.entered;
-    for (let index = 0; index < 520; index += 1) await app.root.commit(async (tx) => {
-      (await tx.doc(LiveDoc, app.root.id)).generation = { attempt: 1, message: summaryMessage(String(index)) };
-    }, BACKGROUND_CONTEXT);
+    for (let index = 0; index < 520; index += 1) await app.root.commit(tx => tx.appendEntry(app.root.id, {
+      kind: "pi.user", model: [{ role: "user", content: `Queued fixture ${index}`, timestamp: index }],
+    }), BACKGROUND_CONTEXT);
     held.release();
     await assert.rejects(starting, /Activity observation fell behind/);
   } finally { held.release(); await app.close(); }

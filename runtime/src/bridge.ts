@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -35,9 +35,10 @@ import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
-import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput, watchMainNotices } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
+import { WorkflowProgress } from "./workflow-progress.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
 import { Notifications, NotificationError } from "./notifications.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
@@ -153,7 +154,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; collectors: SourceCollectors; reviews: SourceReviews };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; collectors: SourceCollectors; reviews: SourceReviews; progress: WorkflowProgress };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -171,6 +172,7 @@ async function openApplication(): Promise<Application> {
   try { return await startup.run("application_recovery", async () => {
   const notifications = new Notifications(harness, registry, notificationConfig());
   const tasks = new TaskStore(harness, inference);
+  const progress = new WorkflowProgress(harness, registry, tasks);
   await startup.run("task_migration", () => tasks.prepare());
   const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
@@ -184,8 +186,9 @@ async function openApplication(): Promise<Application> {
   const executions = new Executions();
   await executions.prepareRecovery(harness);
   const sources = new SourceJournal(harness, tasks, executions);
+  progress.useReceipts((tx, id, conversation, request) => sources.reconcilesIn(tx, id, conversation, request));
   await startup.run("source_migration", () => sources.prepare());
-  const tools = createAppTools(tasks, executions);
+  const tools = createAppTools(tasks, executions, () => background);
   const guidance = createGuidance(executions); registry.install(guidance);
   const inputOrigins = createInputOrigins(harness); registry.install(inputOrigins);
   const sourceTools = createSourceTools(sources, executions);
@@ -257,7 +260,7 @@ async function openApplication(): Promise<Application> {
     }),
   });
   registry.install(reviews.tools);
-  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry, collectors, reviews };
+  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry, collectors, reviews, progress };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     ready: waitForBackground,
     async plan(cadence, after, now, signal) {
@@ -498,6 +501,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         try {
           const application = await app();
           await application.tasks.resumeBackground();
+          await application.progress.start(command.settings.jobs ?? []);
           await application.background.start(command.settings);
           admissions.delete(id);
           await stopped;
@@ -826,8 +830,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // after history makes the observer ready, so it stays connected.
           const work = await inspectMainWork(application.harness, root);
           if (work.type === "blocked") failure(id, "invalid_request", work.recovery === "message"
-            ? "Main conversation paused after repeated restarts. Send a message to resume."
-            : work.recovery === "inspect_outcome" ? "Main conversation paused while owned work is parked. Inspect its prior outcome before retrying it."
+            ? "The previous main run stopped without an answer. Its history is retained; send a new continuation after checking the prior outcome."
+            : work.recovery === "inspect_outcome" ? "The previous main run ended during owned work. Inspect its saved tool outcomes before retrying it."
               : "Main conversation paused. Worker/runtime update required before it can resume.");
           else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
           await observer.finished;
@@ -904,7 +908,6 @@ async function handle(request: RuntimeRequest): Promise<void> {
             // One owner must retain every saved root input. Completing the
             // selected input can hand Pi directly to an older queued follow-up.
             await retainMainInputs(harness, root, turn);
-            await recoverMainGeneration(harness, root);
             let submission = reclaimedInput;
             if (submission === undefined) {
               const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin);
@@ -916,6 +919,18 @@ async function handle(request: RuntimeRequest): Promise<void> {
               });
             }
             if (submission === undefined) { await interrupts.get(id); return; }
+            if (reclaimedInput !== undefined) {
+              const retained = reclaimedInput;
+              await root.commit(async (tx) => {
+                const saved = await tx.submission(retained.id), live = await tx.doc(LiveDoc, root.id);
+                // A failed run retains its inbox but does not start it again.
+                // Resume that queue only after its execution owner is bound;
+                // the new receipt never resurrects the ended native task.
+                if (!interrupted.has(id) && saved?.status === "queued" && live.run === undefined) {
+                  await root.submit(tx, { type: "continue", requestId: "main-queue-recovery:" + retained.id });
+                }
+              }, BACKGROUND_CONTEXT);
+            }
             if (command.input_id !== undefined) {
               if (reclaimedInput === undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
               else for (const event of await reconcileMainInput(root, command.input_id, harness) ?? []) emit(id, event);

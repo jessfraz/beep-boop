@@ -144,6 +144,7 @@ pub struct CoordinatorBootstrap {
 #[serde(rename_all = "snake_case")]
 pub enum InferenceClass {
     Foreground,
+    Critical,
     Email,
     Fresh,
     Cron,
@@ -530,6 +531,9 @@ pub enum RuntimeCommand {
         job_id: crate::jobs::JobId,
         schedule_id: Option<crate::jobs::ScheduleId>,
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input: Option<String>,
     },
     ConfigureCoordinator {
         bootstrap: CoordinatorBootstrap,
@@ -943,6 +947,16 @@ pub enum TaskState {
     },
 }
 
+/// A work item's captured authorization, separate from the canonical job's
+/// source ownership and execution history.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWorkflow {
+    pub job: crate::jobs::ScheduledJob,
+    pub owner_task_id: TaskId,
+    pub work_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TaskRecord {
     pub id: TaskId,
@@ -958,6 +972,9 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub execution: Option<TaskExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workflow: Option<TaskWorkflow>,
     pub state: TaskState,
     pub worker: WorkerState,
     pub sources: Vec<SourceRef>,
@@ -1008,7 +1025,7 @@ pub struct TaskInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
-    // The admitted file snapshot belongs to this turn, even in a reused chat.
+    // The admitted file snapshot belongs to this exact occurrence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub scheduled: Option<crate::background::ScheduledOccurrence>,
@@ -1304,7 +1321,7 @@ pub enum RuntimeEventKind {
         jobs: Vec<crate::background::ScheduledJobStatus>,
     },
     ScheduledJob {
-        job: crate::background::ScheduledJobStatus,
+        job: Box<crate::background::ScheduledJobStatus>,
     },
     Usage {
         usage: crate::usage::UsageAvailability,
@@ -1708,6 +1725,13 @@ pub enum InputWorkState {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputBlockReason {
+    Faulted,
+    Interrupted,
+    ModelError,
+    NoModel,
+    NothingToAnswer,
+    Orphaned,
+    TurnLimit,
     MissingTask,
     TaskTooOld,
     MigrationFailed,
@@ -1872,9 +1896,105 @@ pub enum ErrorCode {
 mod tests {
     use crate::protocol::{
         HistoryMessage, HistoryProvider, HistoryRole, ImportedConversation,
-        ImportedConversationSummary, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
-        ToolStatus,
+        ImportedConversationSummary, RuntimeCommand, RuntimeEventKind, SearchMode, TaskRecord,
+        TaskWorkflow, ToolHistory, ToolStatus,
     };
+
+    fn retained_task() -> TaskRecord {
+        serde_json::from_str(
+            r#"{
+                "id":"11111111-1111-4111-8111-111111111111",
+                "conversation_id":"retained",
+                "title":"Parcel work",
+                "outcome":"Reconcile one parcel",
+                "summary":"",
+                "state":{"state":"open"},
+                "worker":{"state":"unassigned"},
+                "sources":[{"provider":"google","account":"mailbox","thread_id":"parcel-mail"}],
+                "pending":[],
+                "agents":[],
+                "updated_at":1
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retained_tasks_without_workflow_provenance_remain_readable() {
+        let task = retained_task();
+        assert!(task.workflow.is_none());
+        let restored: TaskRecord =
+            serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        assert!(restored.workflow.is_none());
+        assert_eq!(restored.id, task.id);
+        assert_eq!(restored.sources[0].thread_id, "parcel-mail");
+    }
+
+    #[test]
+    fn direct_job_requests_preserve_optional_current_input() {
+        let legacy: RuntimeCommand = serde_json::from_str(
+            r#"{"type":"run_job","job_id":"example-review","schedule_id":null,"request_id":"legacy"}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, RuntimeCommand::RunJob { input: None, .. }));
+        let requested: RuntimeCommand = serde_json::from_str(
+            r#"{"type":"run_job","job_id":"example-review","schedule_id":null,
+                "request_id":"direct","input":"Review only the newly arrived mail."}"#,
+        )
+        .unwrap();
+        let restored: RuntimeCommand =
+            serde_json::from_slice(&serde_json::to_vec(&requested).unwrap()).unwrap();
+        assert!(
+            matches!(restored, RuntimeCommand::RunJob { input: Some(input), .. }
+            if input == "Review only the newly arrived mail.")
+        );
+    }
+
+    #[test]
+    fn workflow_work_preserves_its_job_snapshot_without_claiming_job_source_ownership() {
+        let mut task = retained_task();
+        let job = serde_json::from_str(
+            r#"{
+                "id":"delivery-review",
+                "title":"Delivery review",
+                "prompt":"Reconcile the captured parcel only.",
+                "model":{"provider":"openai","model_id":"fixture","reasoning":"high","fast":false},
+                "priority":"critical",
+                "timezone":"Etc/UTC",
+                "schedules":[],
+                "revision":"captured-revision",
+                "cwd":"/workspace/example"
+            }"#,
+        )
+        .unwrap();
+        let owner_task_id = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+        task.workflow = Some(TaskWorkflow {
+            job,
+            owner_task_id,
+            work_key: "parcel:carrier:tracking".into(),
+        });
+        let restored: TaskRecord =
+            serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        let workflow = restored.workflow.unwrap();
+        assert_eq!(
+            workflow.owner_task_id.to_string(),
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(workflow.work_key, "parcel:carrier:tracking");
+        assert_eq!(workflow.job.id.as_str(), "delivery-review");
+        assert_eq!(workflow.job.prompt, "Reconcile the captured parcel only.");
+        assert_eq!(workflow.job.model.model_id, "fixture");
+        assert_eq!(
+            workflow.job.model.reasoning,
+            Some(crate::models::Reasoning::High)
+        );
+        assert_eq!(workflow.job.priority, crate::jobs::JobPriority::Critical);
+        assert_eq!(workflow.job.revision, "captured-revision");
+        assert_eq!(workflow.job.cwd, "/workspace/example");
+        assert_eq!(restored.sources.len(), 1);
+        assert_eq!(restored.sources[0].provider, "google");
+        assert_eq!(restored.sources[0].thread_id, "parcel-mail");
+    }
 
     #[test]
     fn import_coverage_summary_preserves_legacy_fields_and_accepts_absent_counts() {

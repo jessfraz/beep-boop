@@ -1,3 +1,5 @@
+import { copyJson } from "@earendil-works/chord/json";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -79,13 +81,13 @@ for (const boundaryHeld of [false, true]) {
         requestId: current.id, status: "placed", entry: entry.id });
       const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
       const live = await tx.doc(LiveDoc, conversation.id);
-      live.run = { taskId: generation, inputs: [submission.id] }; live.generation = { attempt: 1 };
+      live.run = { turns: 0, taskId: generation, inputs: [submission.id] }; live.generation = { attempt: 1 };
       return { generation, submission: submission.id };
     }, BACKGROUND_CONTEXT);
     const record = await app.harness.getTask(native.generation, BACKGROUND_CONTEXT); assert.ok(record);
     const deadline = Date.now() + 3_600_000;
     const checkpoint: GenerationCheckpoint = { phase: "retry", attempt: 1, until: deadline };
-    await app.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
+    await commitWrites(app.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint: copyJson(checkpoint) } } }], BACKGROUND_CONTEXT);
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT);
     app = await open(directory); conversation = await app.tasks.conversation(task.conversation_id);
     const controller = new AbortController(), executions = new Executions();

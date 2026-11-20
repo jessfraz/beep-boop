@@ -21,7 +21,7 @@ import { InferenceCapacity } from "./inference-capacity.js";
 
 /** Keep application provider IDs aligned with the pinned upstream registry. */
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
-export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
+export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.2-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
 const configuredAuth = Symbol("configuredAuth");
 type ConfiguredAuthOptions = ProviderRequestOptions & { [configuredAuth]?: Promise<AuthStatus> };
@@ -82,7 +82,7 @@ export function savedHost(host: WorkerHost): WorkerHost {
 // A native conversation may receive its work class before its first model is
 // configured. Model choice remains native; these fields bind application-only
 // fast-mode and resource-admission policy to that exact provider session.
-type ModelPolicy = Partial<ModelSelection> & { work_class?: InferenceClass; foreground_owned?: true };
+type ModelPolicy = Partial<ModelSelection> & { work_class?: InferenceClass; work_group?: string; foreground_owned?: true };
 const Policies = defineDoc<{ sessions: Record<string, ModelPolicy> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
@@ -173,6 +173,8 @@ export class ConversationModels {
       return account(options.apiKey ?? "ambient");
     }, {}, { capacity, workClass: async (_model, options) => {
       return options.sessionId === undefined ? "foreground" : (await this.policy(options.sessionId))?.work_class ?? "foreground";
+    }, workGroup: async (_model, options) => {
+      return options.sessionId === undefined ? undefined : (await this.policy(options.sessionId))?.work_group;
     } });
     for (const provider of models.getProviders()) models.setProvider(quota.wrapProvider(provider));
     quota.wrapComplete();
@@ -228,11 +230,15 @@ export class ConversationModels {
     const session = await this.session;
     await session.commit((tx) => this.configureIn(tx, conversation, selection, change, workClass), BACKGROUND_CONTEXT);
   }
-  async assignClassIn(tx: Tx, conversation: Pick<Conversation, "id">, workClass: InferenceClass): Promise<void> {
+  async assignClassIn(tx: Tx, conversation: Pick<Conversation, "id">, workClass: InferenceClass, workGroup?: string): Promise<void> {
     const native = await tx.doc(ProviderDoc, conversation.id);
     const slot = await tx.doc(Policy, native.sessionId, null);
     slot.policy ??= { ...await this.policyIn(tx, native.sessionId) };
-    if (slot.policy.foreground_owned !== true) slot.policy.work_class = workClass;
+    if (slot.policy.foreground_owned !== true) {
+      slot.policy.work_class = workClass;
+      if (workClass !== "critical") delete slot.policy.work_group;
+      else if (workGroup !== undefined) slot.policy.work_group = workGroup;
+    }
   }
   async promoteForegroundIn(tx: Tx, conversation: Pick<Conversation, "id">): Promise<void> {
     const native = await tx.doc(ProviderDoc, conversation.id);
@@ -246,11 +252,16 @@ export class ConversationModels {
     const native = await tx.doc(ProviderDoc, conversation.id);
     return (await this.policyIn(tx, native.sessionId))?.work_class ?? "foreground";
   }
+  async workGroupIn(tx: Tx, conversation: Pick<Conversation, "id">): Promise<string | undefined> {
+    const native = await tx.doc(ProviderDoc, conversation.id);
+    return (await this.policyIn(tx, native.sessionId))?.work_group;
+  }
   async configureIn(tx: Tx, conversation: Pick<Conversation, "id">, selection: ModelSelection, change: AgentChange, workClass?: InferenceClass): Promise<void> {
     const native = await tx.doc(ProviderDoc, conversation.id);
     const previous = await this.policyIn(tx, native.sessionId);
     const selectedClass = previous?.foreground_owned === true ? "foreground" : workClass ?? previous?.work_class;
     const policy: ModelPolicy = { ...selection, ...(selectedClass === undefined ? {} : { work_class: selectedClass }) };
+    if (selectedClass === "critical" && previous?.work_group !== undefined) policy.work_group = previous.work_group;
     if (previous?.foreground_owned === true) policy.foreground_owned = true;
     (await tx.doc(Policy, native.sessionId, null)).policy = policy;
     await configure(tx, conversation.id, { ...change, model: { provider: selection.provider, modelId: selection.model_id },

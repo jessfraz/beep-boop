@@ -7,6 +7,7 @@ import type { TaskExecution } from "./TaskExecution.js";
 import type { TaskId } from "./TaskId.js";
 import type { TaskInput } from "./TaskInput.js";
 import type { TaskState } from "./TaskState.js";
+import type { TaskWorkflow } from "./TaskWorkflow.js";
 import type { WorkerState } from "./WorkerState.js";
 
-export type TaskRecord = { id: TaskId, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, scheduled_run?: JobRunReceipt, execution?: TaskExecution, state: TaskState, worker: WorkerState, sources: Array<SourceRef>, pending: Array<TaskInput>, agents: Array<TaskAgentRecord>, updated_at: number, };
+export type TaskRecord = { id: TaskId, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, scheduled_run?: JobRunReceipt, execution?: TaskExecution, workflow?: TaskWorkflow, state: TaskState, worker: WorkerState, sources: Array<SourceRef>, pending: Array<TaskInput>, agents: Array<TaskAgentRecord>, updated_at: number, };

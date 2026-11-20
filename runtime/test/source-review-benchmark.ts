@@ -73,9 +73,9 @@ async function run(events: SourceEvent[], reviewers: number, latency: number): P
   }, { workers: reviewers, maximumEvents: 24, maximumEntities: 4 });
   registry.install(reviews.tools);
   tasks.wakeBackground = async id => { effectBlocked = true; effectEntered.release(); await heldEffect.promise; effectBlocked = false; return tasks.get(id); };
-  const stop = session.subscribeCommits(publication => {
+  const observation = session.observeCommits({ advance: publication => {
     for (const change of publication.changes) {
-      if (change.type !== "document" || change.record.kind !== "agent.source.event.records" || !object(change.value) || !object(change.value.value)) continue;
+      if (change.type !== "document" || change.kind !== "change" || change.record.kind !== "agent.source.event.records" || !object(change.value) || !object(change.value.value)) continue;
       const record = change.value.value;
       if (record.decision === null || !object(record.event)) continue;
       decided++;
@@ -83,7 +83,8 @@ async function run(events: SourceEvent[], reviewers: number, latency: number): P
         firstFresh = performance.now(); freshPending = events.length + 1 - decided;
       }
     }
-  });
+  }, end() {} });
+  const stop = () => observation.detach();
   let workers: Promise<void>[] = [];
   try {
     await session.root(BACKGROUND_CONTEXT); await tasks.prepare(); await sources.prepare();

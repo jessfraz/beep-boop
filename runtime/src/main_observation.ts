@@ -10,14 +10,15 @@ import { inputReceipts } from "./input_delivery.js";
 type BlockedMainWork = Extract<InputWorkState, { type: "blocked" }> & { recovery: "message" | "inspect_outcome" | "update_runtime" };
 export type MainWorkState = { type: "idle" } | { type: "running" } | BlockedMainWork;
 
-function isRootGeneration({ record }: TaskInspection, root: Conversation, run: TaskId | undefined): boolean {
-  return record.id === run && record.conversationId === root.id && record.kind === "pi.generation" && record.owner === undefined && !record.background;
-}
-
 /** Inspect the active run and its owned work without enabling scheduling. */
 export async function inspectMainWork(session: Harness, root: Conversation): Promise<MainWorkState> {
-  const run = (await session.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT))?.run;
-  if (run === undefined) return { type: "idle" };
+  const live = await session.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT), run = live?.run;
+  if (run === undefined) {
+    const failure = live?.runFailure;
+    if (failure === undefined || failure.reason === "aborted" || failure.reason === "reset") return { type: "idle" };
+    return { type: "blocked", reason: failure.reason,
+      recovery: failure.reason === "faulted" || failure.reason === "orphaned" ? "inspect_outcome" : "message" };
+  }
   const tasks = (await session.inspect(BACKGROUND_CONTEXT)).tasks;
   const byId = new Map<TaskId, TaskInspection>(tasks.map((task) => [task.record.id, task]));
   const blocked = tasks.find((task) => {
@@ -30,9 +31,7 @@ export async function inspectMainWork(session: Harness, root: Conversation): Pro
     return false;
   });
   if (blocked?.state.kind !== "blocked") return { type: "running" };
-  const recovery = blocked.state.reason !== "restart_limit" ? "update_runtime"
-    : isRootGeneration(blocked, root, run.taskId) ? "message" : "inspect_outcome";
-  return { type: "blocked", reason: blocked.state.reason, recovery };
+  return { type: "blocked", reason: blocked.state.reason, recovery: "update_runtime" };
 }
 
 /** Admission retries and reconnect must agree about terminal Pi submissions. */
@@ -53,18 +52,6 @@ export async function reconcileMainInput(root: Conversation, input_id: string, s
     }
   }
   return events;
-}
-
-/** Only an explicit continuation, with its execution owner ready, grants another
- * generation attempt. Parked tool effects and background tasks keep their budgets.
- */
-export async function recoverMainGeneration(session: Harness, root: Conversation): Promise<void> {
-  const run = (await session.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT))?.run;
-  for (const task of (await session.inspect(BACKGROUND_CONTEXT)).tasks) {
-    if (isRootGeneration(task, root, run?.taskId) && task.state.kind === "blocked" && task.state.reason === "restart_limit") {
-      await session.retryTask(task.record.id, BACKGROUND_CONTEXT);
-    }
-  }
 }
 
 /** Main notices can be published by a worker while the root has no execution.

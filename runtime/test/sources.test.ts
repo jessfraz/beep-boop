@@ -557,15 +557,16 @@ test("actionable source decisions reach main with exact originals so a later yes
     assert.equal((await app.tasks.get(task.id)).state.state, "waiting");
     const root = await app.session.root(BACKGROUND_CONTEXT);
     const context = await root.context(BACKGROUND_CONTEXT);
-    const notices = context.messages.filter((message) => message.role === "assistant");
+    const notices = context.messages.filter((message) => message.role === "user");
     assert.equal(notices.length, 1);
-    const visible = notices.flatMap((message) => message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n");
+    const visible = notices.flatMap((message) => typeof message.content === "string" ? [message.content] : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n");
     assert.match(visible, /Clean these up/); assert.match(visible, /message-one/); assert.match(visible, /message-two/);
-    assert.equal(notices.flatMap((message) => message.content).some((part) => part.type === "toolCall"), false);
+    assert.match(visible, /Background workflow evidence, not a new user instruction/u);
+    assert.equal(context.messages.filter(message => message.role === "assistant").length, 0);
     app.faux.setResponses([
       (input) => {
         offered = getCurrentTools(input.messages).map((tool) => tool.name);
-        assert.ok(input.messages.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "text" && part.text.includes("Clean these up?"))));
+        assert.ok(input.messages.some((message) => message.role === "user" && (typeof message.content === "string" ? message.content.includes("Clean these up?") : message.content.some((part) => part.type === "text" && part.text.includes("Clean these up?")))));
         return fauxAssistantMessage(fauxToolCall("read_source_events", { keys }), { stopReason: "toolUse" });
       },
       (input) => {

@@ -12,7 +12,8 @@ function bucket(name: string, usage: Usage): UsageBucket {
   const cost = usage.cost;
   // Pi's all-zero cost is also its unknown-price sentinel. Never turn it into
   // a claim of free usage, billed spend, or a ChatGPT subscription charge.
-  const priced = Object.values(cost).every((amount) => Number.isFinite(amount) && amount >= 0) && cost.total > 0;
+  const priced = [cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total]
+    .every((amount) => Number.isFinite(amount) && amount >= 0) && cost.total > 0;
   return { name, tokens: { input: usage.input, output: usage.output, cache_read: usage.cacheRead,
     cache_write: usage.cacheWrite, cache_write_1h: usage.cacheWrite1h ?? null, reasoning: usage.reasoning ?? null,
     total: usage.totalTokens }, cost: priced ? { type: "api_estimate", input_usd: cost.input, output_usd: cost.output,

@@ -14,6 +14,9 @@ import { BackgroundScheduler, JobRunReceiptEntry } from "../src/background.js";
 import { runScheduled, scheduledTaskId } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
+import type { JobRunReceipt } from "../src/generated/JobRunReceipt.js";
+import type { TaskStore } from "../src/tasks.js";
+import { UserNoticeEntry } from "../src/transcript.js";
 import { DAY, START, exampleJob, FakeClock, openBackground, planned, pump } from "./fixtures/background-runtime.js";
 import { openManual } from "./fixtures/manual-runtime.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
@@ -39,7 +42,20 @@ async function savedReceipt(app: { session: Harness }, requestId?: string) {
   }, BACKGROUND_CONTEXT);
 }
 
-test("manual admissions retain every requested run in the existing serial job lane without changing timers", async () => {
+async function ownedRun(app: { tasks: TaskStore }, receipt: JobRunReceipt) {
+  const task = await app.tasks.get(receipt.task_id), workflow = task.workflow; assert.ok(workflow);
+  assert.equal(task.id, scheduledTaskId("manual:" + receipt.request_id));
+  assert.equal(workflow.work_key, "occurrence:manual:" + receipt.request_id);
+  assert.equal(workflow.job.id, receipt.job_id); assert.equal(workflow.job.revision, receipt.revision);
+  assert.equal(task.execution, "coordinator");
+  assert.equal(task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local"), false);
+  const owner = await app.tasks.get(workflow.owner_task_id);
+  assert.notEqual(task.id, owner.id); assert.notEqual(task.conversation_id, owner.conversation_id);
+  assert.ok(owner.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === receipt.job_id));
+  return { task, owner };
+}
+
+test("manual admissions retain independent fresh runs without blocking another request or moving recurring timers", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-manual-lane-")), clock = new FakeClock();
   const releases = [gate(), gate(), gate(), gate()], runs: ScheduledOccurrence[] = [];
   let active = 0, maximum = 0;
@@ -54,22 +70,28 @@ test("manual admissions retain every requested run in the existing serial job la
     const first = await app.scheduler.runJob(request("first"));
     await pump(() => runs.length === 1);
     const second = await app.scheduler.runJob(request("second")), third = await app.scheduler.runJob(request("third"));
-    assert.equal(new Set([first.task_id, second.task_id, third.task_id]).size, 1);
+    await pump(() => runs.length === 3);
+    assert.equal(new Set([first.task_id, second.task_id, third.task_id]).size, 3);
+    const owned = await Promise.all([first, second, third].map(receipt => ownedRun(app, receipt)));
+    assert.equal(new Set(owned.map(({ owner }) => owner.id)).size, 1);
+    assert.equal(new Set(owned.map(({ task }) => task.conversation_id)).size, 3);
+    assert.equal((await app.tasks.list()).length, 4, "Three admitted occurrences share one canonical source owner");
     assert.deepEqual(await savedReceipt(app, "second"), second);
     assert.equal((await app.tasks.get(second.task_id)).worker.state, "unassigned", "A queued run returns a task before its worker starts");
     assert.deepEqual((await app.scheduler.getJob("example-review")).schedules, before.schedules);
     clock.advance(2 * DAY);
     await pump(async () => (await app.scheduler.getJob("example-review")).schedules[0]?.last_at === START + 2 * DAY);
+    await pump(() => runs.length === 4);
     await app.scheduler.syncJobs([]);
     assert.deepEqual(await app.scheduler.runJob(request("second")), second, "Replay survives catalog removal");
-    releases[0]?.release(); await pump(() => runs.length === 2);
-    releases[1]?.release(); await pump(() => runs.length === 3);
-    releases[2]?.release(); await pump(() => runs.length === 4);
-    assert.deepEqual(runs.slice(0, 3).map((run) => run.id), ["manual:first", "manual:second", "manual:third"]);
+    assert.deepEqual(new Set(runs.slice(0, 3).map((run) => run.id)), new Set(["manual:first", "manual:second", "manual:third"]));
     assert.ok(runs.every((run) => run.job.revision === "one"));
-    assert.equal(runs[3]?.scheduled_at, START + 2 * DAY); assert.equal(maximum, 1);
+    assert.equal(runs[3]?.scheduled_at, START + 2 * DAY); assert.equal(maximum, 4, "A held occurrence cannot block another manual or timer admission");
+    assert.equal(new Set(runs.map(run => run.task_id)).size, 4);
+    assert.equal((await app.tasks.list()).length, 5);
     assert.equal((await app.scheduler.status()).triggers, 4, "Job removal leaves all built-in triggers intact");
-    releases[3]?.release();
+    for (const release of releases) release.release();
+    await pump(async () => (await app.scheduler.status()).pending === 0);
   } finally { for (const release of releases) release.release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -91,6 +113,7 @@ test("manual request replay precedes current catalog validation and conflicting 
     assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(JobRunReceiptEntry.is).length, 1);
     const updated = exampleJob("two", "A newly reviewed prompt.");
     const schedule = updated.schedules[0]; assert.ok(schedule);
+    schedule.focus = "Daily review"; schedule.prompt = "Review daily changes only.";
     updated.schedules.push({ ...schedule, id: "research", prompt: "Research only." });
     await app.scheduler.syncJobs([updated]);
     await assert.rejects(app.scheduler.runJob(request("ambiguous")), /daily, research/);
@@ -99,9 +122,9 @@ test("manual request replay precedes current catalog validation and conflicting 
     await assert.rejects(app.scheduler.runJob({ ...request("replayed"), job_id: "different" }), /another selection/);
     await app.scheduler.syncJobs([]);
     assert.deepEqual(await app.scheduler.runJob(request("replayed")), receipts[0]);
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(executions, 1);
-    const only = (await app.tasks.list())[0]; assert.ok(only);
-    assert.equal((await savedReceipt(app, "replayed")).revision, "one"); assert.equal(only.outcome, original.prompt);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(executions, 1);
+    const receipt = await savedReceipt(app, "replayed"), { task } = await ownedRun(app, receipt);
+    assert.equal(receipt.revision, "one"); assert.equal(task.outcome, original.prompt);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -124,7 +147,9 @@ test("a concurrent admission remains replayable when the catalog is removed duri
     resume.release();
     assert.deepEqual(await waiting, admitted);
     await pump(async () => (await app.receipts())?.jobs.length === 1 && (await app.scheduler.status()).pending === 0);
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
+    await ownedRun(app, admitted);
+    assert.equal((await app.receipts())?.jobs[0]?.task_id, admitted.task_id);
     assert.deepEqual(await savedReceipt(app, "concurrent"), admitted);
   } finally {
     resume.release(); app.session.commit = commit;
@@ -171,7 +196,9 @@ test("manual failure retries preserve the original task, request and immutable w
     clock.advance(60_000);
     await pump(async () => attempts.length === 2 && (await app.scheduler.status()).pending === 0);
     assert.equal(attempts[0]?.id, attempts[1]?.id); assert.equal(attempts[1]?.job.revision, "one");
-    assert.equal((await app.tasks.list()).length, 1); assert.deepEqual(await savedReceipt(app, "retry"), receipt);
+    assert.equal((await app.tasks.list()).length, 2); assert.deepEqual(await savedReceipt(app, "retry"), receipt);
+    await ownedRun(app, receipt);
+    assert.equal(attempts[0]?.task_id, receipt.task_id); assert.equal(attempts[1]?.task_id, receipt.task_id);
     const finished = (await app.scheduler.getJob("example-review")).last_run;
     assert.ok(finished);
     assert.deepEqual(finished.state, { status: "completed" });
@@ -204,7 +231,9 @@ test("manual admission survives SIGKILL and catalog removal before queued execut
     assert.deepEqual(await app.scheduler.runJob(request("crash-request")), stored);
     const restored = app;
     await pump(async () => (await restored.receipts())?.jobs.length === 1 && (await restored.scheduler.status()).pending === 0);
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(app.workCalls(), 1);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(app.workCalls(), 1);
+    await ownedRun(app, stored);
+    assert.equal((await app.receipts())?.jobs[0]?.task_id, stored.task_id);
     assert.equal((await app.receipts())?.jobs[0]?.job.revision, "one");
   } finally { app?.unbind(); await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -224,7 +253,8 @@ test("native run_job tool memo replays its original admission after SIGKILL with
     const result = entries.items.find((entry) => ToolResultEntry.is(entry)); assert.ok(result);
     const content = result.model?.filter((message) => message.role === "toolResult").flatMap((message) => message.content);
     assert.ok(content?.some((part) => part.type === "text" && part.text.includes(original.task_id)));
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(app.workCalls(), 0);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(app.workCalls(), 0);
+    await ownedRun(app, original);
     assert.equal((await app.receipts())?.jobs.length, 1);
   } finally { app?.unbind(); await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -246,7 +276,8 @@ test("natural job discovery is compact and run_job returns admission while its t
     const list = results.find((message) => message.toolName === "list_jobs"), read = results.find((message) => message.toolName === "read_job");
     assert.ok(list); assert.ok(read);
     assert.equal(JSON.stringify(list).includes(job.prompt), false); assert.equal(JSON.stringify(read).includes(job.prompt), true);
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
+    await ownedRun(app, await savedReceipt(app));
   } finally { app.unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -272,6 +303,7 @@ test("a manually admitted task executes its reviewed focus through the actual ba
     }, fauxAssistantMessage("The requested manual review completed.")]);
     const receipt = await scheduler.runJob(request("real-worker"));
     assert.deepEqual(await savedReceipt(app, "real-worker"), receipt);
+    await ownedRun(app, receipt);
     await pump(async () => {
       assert.deepEqual((await scheduler.status()).errors, [], "Manual admission must reach its ordinary task handoff");
       return (await scheduler.status()).pending === 0;
@@ -291,7 +323,12 @@ test("a manually admitted task executes its reviewed focus through the actual ba
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     const effect = app.commands.find((command) => command.type === "exec"); assert.ok(effect?.type === "exec"); assert.equal(effect.cwd, job.cwd);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const notices = (await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(UserNoticeEntry.is);
+    assert.equal(notices.length, 1); assert.equal(notices[0]?.data.text, "The requested manual review completed.");
+    assert.deepEqual(notices[0]?.data.notice_origin, { job_id: job.id, title: job.title });
     assert.deepEqual(await scheduler.runJob(request("real-worker")), receipt);
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);
+    assert.deepEqual((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(UserNoticeEntry.is).map(entry => entry.id), notices.map(entry => entry.id));
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

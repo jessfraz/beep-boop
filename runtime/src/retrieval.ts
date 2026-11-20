@@ -15,11 +15,12 @@ export class Retrieval {
   private pendingSyncs = 0;
   private closing: Promise<void> | undefined;
   constructor(session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore, private readonly path: string) {
-    this.unsubscribe = session.subscribeCommits((publication) => {
+    const observation = session.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) if (change.type === "entry") {
         this.dirty.set(change.value.conversationId.toString(), change.value.id.toString());
       }
-    });
+    }, end: () => {} });
+    this.unsubscribe = () => observation.detach();
   }
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;

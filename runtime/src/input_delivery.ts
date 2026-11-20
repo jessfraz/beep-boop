@@ -19,7 +19,7 @@ export function inputReceipts(input: SubmissionRecord, input_id: string, activeW
  */
 export function watchInputDelivery(session: Session,
   emit: (conversation_id: string, event: RuntimeEventKind) => void): () => void {
-  return session.subscribeCommits((publication) => {
+  const observation = session.observeCommits({ advance: (publication) => {
     for (const change of publication.changes) {
       if (change.type !== "submission") continue;
       const input = change.value;
@@ -34,5 +34,6 @@ export function watchInputDelivery(session: Session,
         emit(input.conversationId.toString(), event);
       }
     }
-  });
+  }, end: () => {} });
+  return () => observation.detach();
 }

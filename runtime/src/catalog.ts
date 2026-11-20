@@ -49,7 +49,7 @@ export class ConversationCatalog {
   private readonly unsubscribe: () => void;
   private readonly unsubscribeClose: () => void;
   constructor(private readonly session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore) {
-    this.unsubscribe = session.subscribeCommits((publication) => {
+    const observation = session.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type === "conversation" && change.value.id === ROOT_CONVERSATION_ID) this.root = true;
         if (change.type !== "entry") continue;
@@ -57,7 +57,8 @@ export class ConversationCatalog {
           this.root = true; this.rootUpdatedAt = latest(this.rootUpdatedAt, messageTime(change.value));
         } else if (ImportedThreadEntry.is(change.value)) this.retain(change.value.conversationId.toString(), change.value.data.thread);
       }
-    });
+    }, end: () => {} });
+    this.unsubscribe = () => observation.detach();
     this.unsubscribeClose = session.subscribeClose(() => this.close());
   }
   close(): void { this.unsubscribe(); this.unsubscribeClose(); }

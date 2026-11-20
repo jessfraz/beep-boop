@@ -154,10 +154,11 @@ test("native private telemetry retains timings and correlation but never prompt/
     assert.equal((await app.telemetry.status()).available, true);
     const database = await openNodeSqliteDatabase(join(directory, "diagnostics", "telemetry.sqlite"));
     try {
-      const spans = await database.all<{ name: string; attributes: string; events: string; status: string; started_ms: number; ended_ms: number; trace_id: string }>("SELECT * FROM telemetry_spans");
+      const spans = await database.all<{ name: string; attributes: string; events: string; status: string; started_us: number | null; ended_us: number; trace_id: string }>("SELECT * FROM telemetry_spans");
       assert.ok(spans.some((span) => span.name === "pi.ai.request")); assert.ok(spans.some((span) => span.name === "pi.durable.phase"));
       assert.ok(spans.some((span) => span.attributes.includes('"conversation.id":1')));
-      assert.ok(spans.every((span) => span.ended_ms >= span.started_ms));
+      assert.ok(spans.every((span) => Number.isSafeInteger(span.ended_us) && (span.started_us === null ||
+        Number.isSafeInteger(span.started_us) && span.ended_us >= span.started_us)));
       assert.equal(JSON.stringify(spans).includes(secret), false);
       assert.equal((await stat(join(directory, "diagnostics"))).mode & 0o777, 0o700);
       assert.equal((await stat(join(directory, "diagnostics", "telemetry.sqlite"))).mode & 0o777, 0o600);

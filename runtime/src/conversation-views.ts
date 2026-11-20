@@ -69,7 +69,8 @@ export class ConversationViews {
       let working = false;
       stop = await activity(app.harness, conversation, (activity) => publish({ type: "activity", activity }),
         (message) => publish({ type: "message", message }), undefined,
-        { includeFinal: true, working(value) { working = value; publish({ type: "conversation_state", working }); } });
+        { includeFinal: true, working(value) { working = value; publish({ type: "conversation_state", working }); },
+          failed(message) { publish({ type: "failure", code: "internal", message }); } });
       if (view.closed) return;
       view.snapshot({ type: "conversation_ready", conversation: summary, model,
         cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });

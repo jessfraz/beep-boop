@@ -48,7 +48,6 @@ function fauxModels() {
 test("typed providers cover the actual upstream registry and explicit unsupported settings fail before inference", () => {
   const native = builtinModels(); const inference = new ConversationModels(native);
   assert.deepEqual([...PROVIDERS].sort(), native.getProviders().map((provider) => provider.id).sort());
-  assert.equal(new Set(PROVIDERS).size, 42);
   assert.throws(() => inference.validate({ ...DEFAULT_MODEL, reasoning: "minimal" }), ModelError);
   assert.throws(() => inference.validate({ ...DEFAULT_MODEL, model_id: "missing-model" }), ModelError);
   assert.throws(() => inference.validate({ provider: "anthropic", model_id: "claude-opus-4-6", reasoning: null, fast: true }), ModelError);

@@ -807,6 +807,13 @@ extension InputWorkState {
     case .blocked(let blocked):
       switch blocked.reason {
       case .restartLimit: "Processing paused after repeated restarts"
+      case .faulted: "Processing stopped; saved work needs recovery"
+      case .interrupted: "Processing was interrupted; saved work is retained"
+      case .modelError: "The model could not complete this response"
+      case .noModel: "Choose an available model to continue"
+      case .nothingToAnswer: "The response ended without an answer"
+      case .orphaned: "The saved work needs an available runtime"
+      case .turnLimit: "The response reached its turn limit"
       case .missingTask: "Processing paused: task definition unavailable"
       case .taskTooOld: "Processing paused: task needs a compatible runtime"
       case .migrationFailed: "Processing paused: task migration needs attention"

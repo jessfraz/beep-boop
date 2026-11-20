@@ -35,7 +35,7 @@ test("scheduled work uses the existing task actor, current guidance and exact na
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(app.faux.state.callCount, 2);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(app.faux.state.callCount, 2);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker" || command.type === "resume_worker").length, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -149,7 +149,7 @@ test("legacy quota failure recovers its exact occurrence after restart without r
     const retained = await app.session.commit(tx => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
     assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
     assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
     const receipt = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id, limit: 10 }))
       .find(event => event.outcome?.reconciliation !== undefined)?.outcome?.reconciliation;
     assert.equal(receipt?.original.submission_id, original.id.toString());
@@ -212,7 +212,7 @@ test("a successful exact recovery settles while subsequent work remains active",
     const later = await app.session.commit(tx => tx.submissionByRequest(conversation.id, "later-request"), BACKGROUND_CONTEXT);
     assert.equal(later?.status, "placed");
     release(); await running; running = undefined;
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
   } finally { release(); controller.abort(); await running?.catch(() => {}); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -261,7 +261,7 @@ test("a retained terminal outbox item cannot abort a fresh explicit recovery aft
     assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
     await runScheduled(scheduledOccurrence, controller.signal, app, task.id);
     assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-    assert.equal((await app.tasks.list()).length, 1);
+    assert.equal((await app.tasks.list()).length, 2);
   } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -311,7 +311,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
       const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
       assert.ok(original); assert.equal(original.status, "unanswered");
       await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));
-      clock.advance(DAY); await pump(async () => (await scheduler.status()).pending === 2);
+      clock.advance(60_000); await pump(async () => (await scheduler.status()).pending === 1);
 
       let verified = () => {}; const verifying = new Promise<void>((resolve) => { verified = resolve; });
       const verificationGate = new Promise<void>((resolve) => { allowVerification = resolve; });
@@ -351,9 +351,9 @@ for (const recoveredState of ["waiting", "resolved"]) {
         assert.deepEqual(receipt?.recovery_inputs.map((input) => input.request_id), ["reconcile-effect", "recovery-steering"]);
       } else assert.equal(receipt, undefined);
       app.faux.setResponses([fauxAssistantMessage("The next queued review completed.")]);
-      clock.advance(3_600_000); await pump(async () => (await scheduler.status()).pending === 0);
+      clock.advance(DAY); await pump(async () => (await scheduler.status()).pending === 0);
       assert.deepEqual((await scheduler.status()).errors, []);
-      assert.equal(await readFile(effectPath, "utf8"), "performed once\n"); assert.equal((await app.tasks.list()).length, 1);
+      assert.equal(await readFile(effectPath, "utf8"), "performed once\n"); assert.equal((await app.tasks.list()).length, 3);
       const restored = await app.tasks.conversation((await app.tasks.get(task.id)).conversation_id);
       const retained = await app.session.commit((tx) => tx.submissionByRequest(restored.id, occurrence.id), BACKGROUND_CONTEXT);
       assert.equal(retained?.id, original.id); assert.equal(retained?.status, "unanswered");
@@ -386,7 +386,7 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     assert.equal(signal.value, "PLACED", stderr);
     const closed = new Promise<void>((resolve) => child.once("close", () => resolve())); child.kill("SIGKILL"); await closed; lines.close();
     app = await openScheduled(directory, "restored");
-    const tasks = await app.tasks.list(); assert.equal(tasks.length, 1);
+    const tasks = await app.tasks.list(); assert.equal(tasks.length, 2);
     const original = tasks[0]; assert.ok(original); assert.deepEqual(original.pending, []);
     const originalConversation = await app.tasks.conversation(original.conversation_id);
     const prior = await app.session.commit((tx) => tx.submissionByRequest(originalConversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
@@ -394,16 +394,24 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     app.faux.setResponses([async (context) => {
       assert.match(getCurrentSystemPrompt(context.messages), /FRESH_PROJECT_POLICY_restored/, "A restored native input must use its replacement client's current project guidance");
       return fauxAssistantMessage(fauxToolCall("exec", { program: "example", args: [], cwd: scheduledOccurrence.job.cwd, timeout_seconds: 1 }), { stopReason: "toolUse" });
-    }, fauxAssistantMessage("Completed the original scheduled request after recovery.")]);
+    }, fauxAssistantMessage(fauxToolCall("record_task", { summary: "The interrupted scheduled request was verified and completed.",
+      reconciles_input: scheduledOccurrence.id, state: { state: "resolved", evidence: "The unfinished host work completed once under the original authorization." } }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Completed the original scheduled request after recovery.")]);
+    await app.tasks.resumeBackground();
+    const resumed = app, recoveryId = "background-recovery:" + prior.id;
+    await pump(async () => (await resumed.session.commit(tx => tx.submissionByRequest(originalConversation.id, recoveryId), BACKGROUND_CONTEXT))?.status === "done");
     scheduled = runScheduled(scheduledOccurrence, controller.signal, app);
     await scheduled;
     const current = await app.tasks.get(original.id), conversation = await app.tasks.conversation(current.conversation_id);
-    assert.equal((await app.tasks.list()).length, 1); assert.equal(current.conversation_id, original.conversation_id);
+    assert.equal((await app.tasks.list()).length, 2); assert.equal(current.conversation_id, original.conversation_id);
     assert.deepEqual(current.pending, []);
     const recovered = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT);
     assert.equal(recovered?.id, prior.id);
+    assert.ok(recovered?.status === "unanswered"); assert.equal(recovered.reason, "interrupted");
+    const receipts = await app.storage.scanSubmissions({ conversationId: conversation.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.equal(receipts.items.filter(input => input.requestId === recoveryId && input.status === "done").length, 1);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
-    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
+    assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 2);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1,

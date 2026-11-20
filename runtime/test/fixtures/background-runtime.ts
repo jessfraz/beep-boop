@@ -51,10 +51,11 @@ export const Receipts = defineDoc<{ jobs: ScheduledOccurrence[]; sources: number
   initial: () => ({ jobs: [], sources: 0, resources: 0 }), checkpointWhen: () => true,
 });
 export async function pump(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  for (let attempt = 0; attempt < 1000; attempt += 1) {
+  const deadline = performance.now() + 5000;
+  do {
     if (await predicate()) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  } while (performance.now() < deadline);
   throw new Error("Background work did not reach its expected durable state");
 }
 export async function openBackground(directory: string, clock: FakeClock, overrides: Partial<BackgroundCallbacks> = {}) {

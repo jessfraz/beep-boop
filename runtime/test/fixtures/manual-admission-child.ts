@@ -20,9 +20,10 @@ if (mode === "api") {
     async execute(args, api, context) {
       const result = await tool.execute(args, api, context);
       await pump(async () => (await app.receipts())?.jobs.length === 1);
-      const task = (await app.tasks.list())[0];
-      if (task === undefined) throw new Error("Manual fixture task missing");
-      process.stdout.write(task.id + "\n");
+      const occurrence = (await app.receipts())?.jobs[0];
+      if (occurrence?.task_id === undefined) throw new Error("Manual fixture admitted occurrence missing");
+      await app.tasks.get(occurrence.task_id);
+      process.stdout.write(occurrence.task_id + "\n");
       await new Promise<void>(() => {});
       return result;
     },

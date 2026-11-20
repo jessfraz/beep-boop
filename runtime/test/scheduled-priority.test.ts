@@ -1,3 +1,5 @@
+import { copyJson } from "@earendil-works/chord/json";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,7 +8,7 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory, type TranscriptContext } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
-import { AgentDoc, GenerationTask, InboxDoc, LiveDoc, UserEntry, type GenerationCheckpoint } from "@earendil-works/pi-durable";
+import { AgentDoc, GenerationTask, InboxDoc, LiveDoc, UserEntry, type GenerationCheckpoint, type Submission } from "@earendil-works/pi-durable";
 import { occurrencePrompt, runScheduled } from "../src/scheduled.js";
 import { NoticeLineage } from "../src/notice_origin.js";
 import { UserNoticeEntry } from "../src/transcript.js";
@@ -187,18 +189,18 @@ for (const scenario of ["unsubmitted", "arrived-after-binding", "already-native"
           requestId: "source-current", status: "placed", entry: entry.id });
         const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
         const live = await tx.doc(LiveDoc, conversation.id);
-        live.run = { taskId: generation, inputs: [submission.id] }; live.generation = { attempt: 1 };
+        live.run = { turns: 0, taskId: generation, inputs: [submission.id] }; live.generation = { attempt: 1 };
         return generation;
       }, BACKGROUND_CONTEXT);
       const generation = await app.session.getTask(native, BACKGROUND_CONTEXT); assert.ok(generation);
       const until = Date.now() + 3_600_000;
       const checkpoint: GenerationCheckpoint = { phase: "retry", attempt: 1, until };
-      await app.storage.commit([{ type: "task", value: { ...generation, state: { status: "sleeping", until, checkpoint } } }], BACKGROUND_CONTEXT);
+      await commitWrites(app.storage, [{ type: "task", value: { ...generation, state: { status: "sleeping", until, checkpoint: copyJson(checkpoint) } } }], BACKGROUND_CONTEXT);
       await app.close(); app = await openScheduled(directory);
       conversation = await app.tasks.conversation(task.conversation_id);
       const retained = await conversation.submit({ type: "input", content: "Retained source follow-up", requestId: "source-retained", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
       if (scenario !== "arrived-after-binding") await app.tasks.enqueueScheduled(task.id, occurrencePrompt(occurrence), occurrence);
-      let existing: Awaited<ReturnType<typeof conversation.submit>> | undefined;
+      let existing: Submission | undefined;
       if (scenario === "already-native") existing = await conversation.submit({ type: "input", content: occurrencePrompt(occurrence), requestId: occurrence.id, whenBusy: "followUp" }, BACKGROUND_CONTEXT);
       if (scenario === "arrived-after-binding") {
         const allocation = "55555555-5555-4555-8555-555555555555";

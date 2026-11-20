@@ -8,6 +8,7 @@ import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Tr
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { createRegistry, defineDoc, Harness, type TaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import type { ScheduledJobStatus } from "../src/generated/ScheduledJobStatus.js";
@@ -76,7 +77,8 @@ async function admit(journal: SourceJournal, events: SourceEvent[]): Promise<voi
   const previous = (await journal.states()).find(state => state.source.provider === source.provider && state.source.account === source.account);
   await journal.admit({ source, events, checkpoint: null, coverage: { status: "complete" } }, previous?.checkpoint ?? null);
 }
-async function open(path: string, options: SourceReviewOptions = {}, workflows: ScheduledJobStatus[] = [], clock?: FakeClock, guidance?: HostCall) {
+async function open(path: string, options: SourceReviewOptions = {}, workflows: ScheduledJobStatus[] = [], clock?: FakeClock,
+  guidance?: HostCall, ready?: (signal: AbortSignal) => Promise<void>) {
   const models = createModels(), registry = createRegistry();
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 }); models.setProvider(faux.provider);
   const inference = new ConversationModels(models, undefined, registry);
@@ -90,6 +92,7 @@ async function open(path: string, options: SourceReviewOptions = {}, workflows: 
   const bound = new Set<string>();
   const reviews = new SourceReviews(session, registry, sources, tasks, executions, {
     extensions,
+    ...(ready === undefined ? {} : { ready }),
     enabled: () => true,
     settings: async () => ({ model: fixtureModel, cwd: "/workspace/example", hosts: [], instructions: "Complete authorized work and retain its evidence." }),
     workflows: async () => workflows,
@@ -375,7 +378,7 @@ test("review task admission rolls back as one transaction, replays once and rele
   } finally { holdEffect.release(); controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("retained GitHub decisions and configured workflows keep cross-thread signals with their existing owner", { timeout: 15_000 }, async () => {
+test("retained GitHub decisions preserve their owner while configured workflow evidence gets a separate work item", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-workflow-owner-"));
   const job: ScheduledJobStatus = { job: { id: "configured-review", title: "Configured evidence review", prompt: "AUTHORIZED_WORKFLOW: inspect and resolve new evidence using the configured policy.",
     model: fixtureModel, timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "workflow-owner" };
@@ -408,9 +411,14 @@ test("retained GitHub decisions and configured workflows keep cross-thread signa
         input => { toolResult(input); return fauxAssistantMessage(""); },
       ]);
       assert.equal(await reopened.reviews.review(0, controller.signal), true);
-      assert.equal((await reopened.tasks.list()).length, 2);
-      const saved = await reopened.tasks.get(workflow.id); assert.equal(saved.pending.length, 1);
-      assert.match(saved.pending[0]?.content ?? "", /AUTHORIZED_WORKFLOW/u); assert.equal(saved.sources.length, 3);
+      const records = await reopened.tasks.list(); assert.equal(records.length, 3);
+      const saved = await reopened.tasks.get(workflow.id); assert.equal(saved.pending.length, 0);
+      assert.deepEqual(saved.sources, workflow.sources);
+      const work = records.filter(record => record.workflow?.owner_task_id === workflow.id); assert.equal(work.length, 1);
+      const item = work[0]; assert.ok(item); assert.notEqual(item.conversation_id, workflow.conversation_id);
+      assert.deepEqual(item.workflow?.job, job.job); assert.equal(item.workflow?.work_key, "github:example/project:77");
+      assert.equal(item.pending.length, 1); assert.equal(item.sources.length, 2);
+      assert.match(item.pending[0]?.content ?? "", /workflow-a/u); assert.match(item.pending[0]?.content ?? "", /workflow-b/u);
       assert.equal((await reopened.tasks.get("retained-github-owner")).pending.length, 1,
         "A shared resource cannot replace the explicitly selected configured workflow's actor");
       assert.deepEqual(await reopened.sources.events({ pending: true }), []);
@@ -418,9 +426,44 @@ test("retained GitHub decisions and configured workflows keep cross-thread signa
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("aborting and reopening a reviewer retains its exact claim, captured content and native input identity", { timeout: 15_000 }, async () => {
+test("critical mail packets isolate old holds, preserve model priority and serialize only the verified parcel", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-critical-mail-packets-"));
+  const job: ScheduledJobStatus = { job: { id: "delivery-review", title: "Delivery review", prompt: "Save current verified shipment evidence.",
+    priority: "critical", model: fixtureModel, timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "delivery-owner" };
+  const app = await open(join(directory, "session.sqlite"), { maximumEntities: 1 }, [job]), controller = new AbortController();
+  app.tasks.wakeBackground = id => app.tasks.get(id);
+  try {
+    const owner = await app.tasks.create({ id: "delivery-owner", title: job.job.title, outcome: job.job.prompt,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }] });
+    await app.tasks.update(owner.id, task => { task.summary = "OLD_BROWSER_HOLD"; task.state = { state: "waiting", next_check: null, actor: "Old parcel inspection" }; });
+    for (const [id, label] of [["fresh-a", "123456789012"], ["fresh-b", "223456789012"], ["fresh-a-update", "123456789012"]]) {
+      await admit(app.sources, [event(id!, id!, "Verified label https://www.fedex.com/fedextrack/?trknbr=" + label, "google")]);
+      app.faux.setResponses([input => answer([routed(groups(input), { job_id: job.job.id })]), fauxAssistantMessage("")]);
+      assert.equal(await app.reviews.review(0, controller.signal), true);
+    }
+    const packets = (await app.tasks.list()).filter(task => task.workflow?.owner_task_id === owner.id);
+    assert.equal(packets.length, 3); assert.equal(new Set(packets.map(task => task.conversation_id)).size, 3);
+    assert.deepEqual(packets.map(task => task.workflow?.work_key).sort(), ["shipment:fedex:123456789012", "shipment:fedex:123456789012", "shipment:fedex:223456789012"]);
+    for (const packet of packets) {
+      assert.equal(packet.pending.length, 1); assert.equal(packet.sources.length, 1);
+      assert.doesNotMatch(packet.pending[0]?.content ?? "", /OLD_BROWSER_HOLD/u);
+      const conversation = await app.tasks.conversation(packet.conversation_id);
+      await app.session.commit(async tx => {
+        assert.equal(await app.tasks.inference.workClassIn(tx, conversation), "critical");
+        assert.equal(await app.tasks.inference.workGroupIn(tx, conversation), job.job.id);
+      }, BACKGROUND_CONTEXT);
+    }
+    assert.equal((await app.tasks.get(owner.id)).pending.length, 0);
+    assert.deepEqual(await app.sources.events({ pending: true }), []);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("startup replaces a terminal reviewer while retaining its exact claim, captured content and native input identity", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-review-reopen-")), path = join(directory, "session.sqlite");
-  let app = await open(path), running: Promise<boolean> | undefined;
+  const clock = new FakeClock(Date.now()), ready = gate();
+  let app = await open(path, { workers: 1 }, [], clock, undefined, async signal => {
+    signal.addEventListener("abort", ready.release, { once: true }); await ready.promise; signal.throwIfAborted();
+  }), running: Promise<boolean> | undefined;
   const controller = new AbortController(), hold = gate(), started = gate();
   try {
     await admit(app.sources, [event("retained", "retained-thread")]);
@@ -433,20 +476,36 @@ test("aborting and reopening a reviewer retains its exact claim, captured conten
     const original = await app.session.commit(tx => tx.submissionByRequest(conversation.id, request), BACKGROUND_CONTEXT); assert.ok(original);
     controller.abort(); await aborted; running = undefined; assert.equal(app.bound.size, 0);
     await admit(app.sources, [event("later", "later-thread")]);
-    await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
+    await app.reviews.start();
+    await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(task => task.record.kind === "agent.source.reviewer" && task.state.kind === "running"));
+    const worker = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.kind === "agent.source.reviewer")?.record;
+    assert.ok(worker && worker.state.status !== "terminal" && worker.state.checkpoint !== undefined);
+    await app.session.close(BACKGROUND_CONTEXT);
+    const storage = await SqliteStorage.open(await openConversationDatabase(path));
+    try {
+      await commitWrites(storage, [{ type: "task", value: { ...worker, restarts: 5,
+        state: { status: "pending", checkpoint: worker.state.checkpoint } } }], BACKGROUND_CONTEXT);
+    } finally { await storage.close(BACKGROUND_CONTEXT); }
+    app = await open(path, { workers: 1 }, [], clock);
+    const failedWorker = await app.session.waitForTask(worker.id, BACKGROUND_CONTEXT);
+    assert.equal(failedWorker.state.outcome.status, "faulted");
     const restored = (await app.reviews.diagnostics()).active_reviews[0]; assert.ok(restored);
     assert.equal(restored.id, active.id); assert.equal(restored.conversation_id, active.conversation_id); assert.equal(restored.events, 1);
     const retained = await app.session.commit(tx => tx.submissionByRequest(conversation.id, request), BACKGROUND_CONTEXT);
     assert.equal(retained?.id, original.id);
     app.faux.setResponses([input => { assert.deepEqual(groups(input), originalGroups); assert.equal(userText(input), originalContent);
       return answer(dismissed(groups(input))); }, fauxAssistantMessage("")]);
-    assert.equal(await app.reviews.review(0, new AbortController().signal), true);
+    await app.reviews.start();
+    await pump(async () => (await app.reviews.diagnostics()).active_reviews.length === 0);
     assert.equal((await app.session.commit(tx => tx.submissionByRequest(conversation.id, request), BACKGROUND_CONTEXT))?.id, original.id);
     assert.deepEqual((await app.sources.events({ pending: true })).map(record => record.event.id), ["later"]);
-  } finally { hold.release(); controller.abort(); await Promise.allSettled([running]); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+    assert.deepEqual(await app.session.getTask(worker.id, BACKGROUND_CONTEXT), failedWorker);
+    const replacement = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.kind === "agent.source.reviewer")?.record;
+    assert.ok(replacement); assert.notEqual(replacement.id, worker.id);
+  } finally { ready.release(); hold.release(); controller.abort(); await Promise.allSettled([running]); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a due follow-up retains one admitted input and retries a failed wake after reopen", { timeout: 15_000 }, async () => {
+test("startup replaces a terminal source effect and retains its already admitted follow-up", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-followup-retry-")), path = join(directory, "session.sqlite"), clock = new FakeClock(Date.now());
   let app = await open(path, { workers: 1 }, [], clock), wakeCalls = 0;
   const failed = gate();
@@ -458,7 +517,17 @@ test("a due follow-up retains one admitted input and retries a failed wake after
     const admitted = (await app.tasks.get(task.id)).pending; assert.equal(admitted.length, 1); const input = admitted[0]; assert.ok(input);
     await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(item =>
       item.record.kind === "agent.source.effects" && item.state.kind === "sleeping"));
-    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, { workers: 1 }, [], clock);
+    const effect = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(item => item.record.kind === "agent.source.effects")?.record;
+    assert.ok(effect?.state.status === "sleeping");
+    await app.session.close(BACKGROUND_CONTEXT);
+    const storage = await SqliteStorage.open(await openConversationDatabase(path));
+    try {
+      await commitWrites(storage, [{ type: "task", value: { ...effect, restarts: 5,
+        state: { status: "pending", checkpoint: effect.state.checkpoint } } }], BACKGROUND_CONTEXT);
+    } finally { await storage.close(BACKGROUND_CONTEXT); }
+    app = await open(path, { workers: 1 }, [], clock);
+    const failedEffect = await app.session.waitForTask(effect.id, BACKGROUND_CONTEXT);
+    assert.equal(failedEffect.state.outcome.status, "faulted");
     app.tasks.wakeBackground = async id => { wakeCalls++; return app.tasks.get(id); };
     await app.reviews.start(); clock.advance(10_000); await pump(() => wakeCalls === 2);
     assert.deepEqual((await app.tasks.get(task.id)).pending, admitted,
@@ -466,6 +535,55 @@ test("a due follow-up retains one admitted input and retries a failed wake after
     await pump(async () => !(await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(item => item.record.kind === "agent.source.effects"));
     clock.advance(30_000); await pump(async () => (await app.reviews.diagnostics()).active_reviews.length === 0);
     assert.equal(wakeCalls, 2); assert.equal((await app.tasks.get(task.id)).pending[0]?.id, input.id);
+    assert.deepEqual(await app.session.getTask(effect.id, BACKGROUND_CONTEXT), failedEffect,
+      "Recovery must create new native work, never rewrite the terminal task");
+    const effects = await app.session.commit(tx => tx.scanTasks({ kind: "agent.source.effects" }, 10), BACKGROUND_CONTEXT);
+    assert.equal(effects.items.length, 2);
+    assert.ok(effects.items.some(item => item.id !== effect.id && item.state.status === "terminal" && item.state.outcome.status === "completed"));
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("startup continues a terminal claim effect after its published notice without repeating task admission", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-effect-cursor-")), path = join(directory, "session.sqlite"), clock = new FakeClock(Date.now());
+  let app = await open(path, { workers: 1 }, [], clock), wakeCalls = 0;
+  const failed = gate();
+  try {
+    await admit(app.sources, [event("decision", "decision-thread"), event("work", "work-thread")]);
+    app.faux.setResponses([input => {
+      const captured = groups(input), notice = captured.find(group => group.threads.includes("decision-thread"));
+      const work = captured.find(group => group.threads.includes("work-thread")); assert.ok(notice && work);
+      return answer([{ type: "notify", groups: [notice.id], keys: [], task_id: null, text: "A retained decision needs attention." }, routed([work])]);
+    }, fauxAssistantMessage("")]);
+    app.tasks.wakeBackground = async () => { wakeCalls++; failed.release(); throw new Error("The worker transport is temporarily unavailable"); };
+    await app.reviews.start(); await failed.promise;
+    await pump(async () => (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.some(item => item.record.kind === "agent.source.effects" && item.state.kind === "sleeping"));
+    const effect = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(item => item.record.kind === "agent.source.effects")?.record;
+    assert.ok(effect?.state.status === "sleeping");
+    const task = (await app.tasks.list())[0]; assert.ok(task); assert.equal(task.pending.length, 1);
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const notices = (await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(entry => UserNoticeEntry.is(entry));
+    assert.equal(notices.length, 1, "The first effect must be durably published before the failed wake");
+    await app.session.close(BACKGROUND_CONTEXT);
+    const storage = await SqliteStorage.open(await openConversationDatabase(path));
+    try {
+      await commitWrites(storage, [{ type: "task", value: { ...effect, restarts: 5,
+        state: { status: "pending", checkpoint: effect.state.checkpoint } } }], BACKGROUND_CONTEXT);
+    } finally { await storage.close(BACKGROUND_CONTEXT); }
+    app = await open(path, { workers: 1 }, [], clock);
+    const failedEffect = await app.session.waitForTask(effect.id, BACKGROUND_CONTEXT);
+    assert.equal(failedEffect.state.outcome.status, "faulted");
+    app.tasks.wakeBackground = async id => { wakeCalls++; return app.tasks.get(id); };
+    await app.reviews.start(); await pump(() => wakeCalls === 2);
+    await pump(async () => (await app.reviews.diagnostics()).active_reviews.length === 0);
+    assert.deepEqual((await app.tasks.get(task.id)).pending, task.pending, "Recovery must reuse the admitted task input");
+    assert.equal((await app.tasks.list()).length, 1);
+    const restoredRoot = await app.session.root(BACKGROUND_CONTEXT);
+    assert.deepEqual((await restoredRoot.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(entry => UserNoticeEntry.is(entry)), notices,
+      "The retained effect cursor must skip the already published notice");
+    assert.deepEqual(await app.session.getTask(effect.id, BACKGROUND_CONTEXT), failedEffect);
+    const effects = await app.session.commit(tx => tx.scanTasks({ kind: "agent.source.effects" }, 10), BACKGROUND_CONTEXT);
+    assert.equal(effects.items.length, 2);
+    assert.ok(effects.items.some(item => item.id !== effect.id && item.state.status === "terminal" && item.state.outcome.status === "completed"));
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

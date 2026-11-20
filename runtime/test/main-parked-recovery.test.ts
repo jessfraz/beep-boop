@@ -1,14 +1,16 @@
+import { copyJson } from "@earendil-works/chord/json";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, type AssistantMessage } from "@earendil-works/pi-ai";
-import { AssistantEntry, createRegistry, GenerationTask, Harness, LiveDoc, ToolResultEntry, ToolTask, UserEntry, type GenerationCheckpoint, type Harness as NativeHarness, type TaskId } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, GenerationTask, Harness, InboxDoc, LiveDoc, ToolResultEntry, ToolTask, UserEntry, type GenerationCheckpoint, type Harness as NativeHarness, type TaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import { ChatGptAuth } from "../src/auth.js";
@@ -39,7 +41,8 @@ async function configure(session: NativeHarness) {
 
 // Native durable records model a process cut off five times in pi.generation's
 // request phase. The missing model makes recovery settle without any provider.
-async function seed(path: string, deferred = false) {
+async function seed(path: string, settle = true) {
+  await new ChatGptAuth(dirname(path)).status();
   const app = await open(path);
   let task;
   let cutoff;
@@ -51,27 +54,34 @@ async function seed(path: string, deferred = false) {
         requestId: "placed", status: "placed", entry: user.id });
       const task = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
       const live = await tx.doc(LiveDoc, app.root.id);
-      live.run = { taskId: task, inputs: [submission.id] }; live.generation = { attempt: 1 };
+      live.run = { turns: 0, taskId: task, inputs: [submission.id] }; live.generation = { attempt: 1 };
       const answer = await tx.appendEntry(AssistantEntry, app.root.id, {});
       await tx.createSubmission({ type: "input", conversationId: app.root.id, requestId: "completed",
         status: "done", entry: user.id, answer: answer.id });
       await tx.createSubmission({ type: "input", conversationId: app.root.id, requestId: "stopped",
         status: "unanswered", entry: user.id, reason: "aborted" });
+      const queued = await tx.createSubmission({ type: "input", conversationId: app.root.id, requestId: "queued", status: "queued" });
+      (await tx.doc(InboxDoc, app.root.id)).items.push({ id: queued.id, mode: "followUp", content: "Original queued input" });
       return { task, cutoff: user.id };
     }, BACKGROUND_CONTEXT));
     const record = await app.session.getTask(task, BACKGROUND_CONTEXT); assert.ok(record);
-    const checkpoint: GenerationCheckpoint = deferred ? { phase: "retry", attempt: 1, until: Date.now() + 60_000 }
-      : { phase: "request", attempt: 1, model: { provider: "missing", modelId: "unavailable" }, thinkingLevel: "off", streamOptions: {}, cutoff };
+    const checkpoint: GenerationCheckpoint = { phase: "request", attempt: 1, model: { provider: "missing", modelId: "unavailable" }, thinkingLevel: "off", streamOptions: {}, cutoff };
     // The Harness stays paused while the persisted crash checkpoint is installed.
-    await app.storage.commit([{ type: "task", value: { ...record, restarts: 5,
-      state: { status: "pending", checkpoint } } }], BACKGROUND_CONTEXT);
+    await commitWrites(app.storage, [{ type: "task", value: { ...record, restarts: 5,
+      state: { status: "pending", checkpoint: copyJson(checkpoint) } } }], BACKGROUND_CONTEXT);
   } finally { await app.session.close(BACKGROUND_CONTEXT); }
-  const parked = await open(path);
-  try {
-    const queued = await parked.root.submit({ type: "input", content: "Original queued input", requestId: "queued", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
-    assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
-    assert.equal((await parked.session.inspect(BACKGROUND_CONTEXT)).tasks.find((item) => item.record.id === task)?.state.kind, "blocked");
-  } finally { await parked.session.close(BACKGROUND_CONTEXT); }
+  if (settle) {
+    const reopened = await open(path);
+    try {
+      const ended = await reopened.session.waitForTask(task, BACKGROUND_CONTEXT);
+      assert.equal(ended.state.outcome.status, "failed");
+      const live = await reopened.session.snapshot(LiveDoc, reopened.root.id, BACKGROUND_CONTEXT);
+      assert.equal(live?.run, undefined); assert.equal(live?.runFailure?.reason, "restart_limit");
+      const original = await reopened.root.commit(tx => tx.submissionByRequest(reopened.root.id, "placed"), BACKGROUND_CONTEXT);
+      assert.ok(original?.status === "unanswered"); assert.equal(original.reason, "restart_limit");
+      assert.equal((await reopened.root.commit(tx => tx.submissionByRequest(reopened.root.id, "queued"), BACKGROUND_CONTEXT))?.status, "queued");
+    } finally { await reopened.session.close(BACKGROUND_CONTEXT); }
+  }
   return task;
 }
 
@@ -89,13 +99,14 @@ function bridge(directory: string, options: { holdGuidance?: boolean; denyNetwor
   const diagnostics = () => ({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode, killed: child.killed,
     inputEnded: child.stdin.writableEnded, stderr: errors.slice(-4096), frames: frames.slice(-16).map((frame) => ({
       id: frame.id, type: frame.event.type, ...(frame.event.type === "host_call" ? { command: frame.event.command.type } : {}),
+      ...(frame.event.type === "failure" ? { message: frame.event.message } : {}),
     })) });
   child.stdin.on("error", (error) => { console.error("Owned bridge stdin failed", diagnostics()); throw error; });
   const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n",
     (error) => { assert.ifError(error); });
   const events = (id: number) => frames.filter((frame) => frame.id === id).map((frame) => frame.event);
   const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { changes.delete(check); reject(new Error(`Request ${id} stalled: ${errors}`)); }, 5_000);
+    const timer = setTimeout(() => { changes.delete(check); reject(new Error(`Request ${id} stalled: ${errors} ${JSON.stringify(diagnostics())}`)); }, 5_000);
     const check = () => {
       const event = events(id).find(predicate);
       if (event !== undefined) { clearTimeout(timer); changes.delete(check); resolve(event); }
@@ -149,7 +160,7 @@ async function records(session: NativeHarness) {
   }), BACKGROUND_CONTEXT);
 }
 
-test("source triage recovers its parked tool without replaying an unsafe effect or unrelated work", { timeout: 15_000 }, async (t) => {
+test("source triage settles its interrupted unsafe tool without replaying it or restarting unrelated work", { timeout: 15_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-parked-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   let durable = "Recovery readback has not started";
@@ -194,7 +205,7 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
             { ownership: { kind: "task", taskId: generation } });
           const unrelated = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" }, background: true });
           const live = await tx.doc(LiveDoc, conversation.id);
-          live.run = { taskId: generation, inputs: [submission.id] };
+          live.run = { turns: 0, taskId: generation, inputs: [submission.id] };
           live.tools = [{ taskId: tool, callId: "interrupted-source", name: "dismiss_source_events", status: "running" }];
           return { generation, tool, assistant: assistant.id, unrelated, conversation: conversation.id };
         }, BACKGROUND_CONTEXT);
@@ -203,7 +214,7 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
         }), BACKGROUND_CONTEXT);
         assert.ok(saved.generation && saved.tool && saved.unrelated);
         const unrelated = { ...saved.unrelated, restarts: 5 };
-        await app.storage.commit([
+        await commitWrites(app.storage, [
           { type: "task", value: { ...saved.generation, restarts: 0, state: { status: "waiting", on: [created.tool], policy: "allSettled",
             checkpoint: { phase: "tools", assistant: created.assistant, tools: [created.tool], pending: [] } } } },
           { type: "task", value: { ...saved.tool, restarts: 5, state: { status: "pending", checkpoint: { phase: "execute",
@@ -233,8 +244,10 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
       "Native recovery must retain an interrupted result, never execute the unsafe tool again");
       const unrelated = await readback.task(round.unrelated, BACKGROUND_CONTEXT);
       durable = JSON.stringify({ tool, unrelated, result });
-      assert.deepEqual(unrelated, round.unrelatedRecord,
-        "Source recovery must not retry unrelated background work");
+      assert.ok(unrelated?.state.status === "terminal" && unrelated.state.outcome.status === "failed");
+      assert.equal(unrelated.id, round.unrelatedRecord.id); assert.deepEqual(unrelated.input, round.unrelatedRecord.input);
+      assert.deepEqual(unrelated.state.outcome.error.detail, { reason: "restart_limit" },
+        "Source recovery must let Pi settle unrelated crash-limited work, never reset its budget");
     } finally { await readback.close(BACKGROUND_CONTEXT); }
     // Keep a genuine host reply queued across the owned process shutdown.
     // The recovery assertions above must still hold before this cutover.
@@ -249,41 +262,42 @@ test("source triage recovers its parked tool without replaying an unsafe effect 
   }
 });
 
-for (const input_id of ["placed", "queued"]) test(`explicit retry reclaims the saved ${input_id} input's execution owner`, { timeout: 15_000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-main-parked-")), path = join(directory, "session.sqlite");
+for (const input_id of ["placed", "queued"]) test(`retrying a saved ${input_id} receipt never resurrects its terminal generation`, { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-main-terminal-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   try {
-    const task = await seed(path);
-    const before = await open(path);
-    const saved = await records(before.session); await before.session.close(BACKGROUND_CONTEXT);
-    peer = bridge(directory);
+    const task = await seed(path), before = await open(path);
+    const saved = await records(before.session), original = await before.session.getTask(task, BACKGROUND_CONTEXT);
+    await before.session.close(BACKGROUND_CONTEXT);
+    peer = bridge(directory, { holdGuidance: input_id === "queued", denyNetwork: true });
     peer.send(1, { type: "set_connected_nodes", host_ids: [host] }); await peer.done(1);
     peer.send(2, { type: "main_input", input_id, input: "Do not replace the original saved input", mode: "steer" });
-    const claimed = await peer.wait(2, (event) => event.type === "input_accepted" && event.work !== undefined && event.work.type !== "blocked" || event.type === "done");
-    assert.equal(claimed.type, "input_accepted", "An unfinished saved admission must resume its execution owner before returning");
     if (input_id === "queued") {
-      // No provider exists for the interrupted request. Its queued successor is
-      // retained by Pi's keep policy until the explicit stop withdraws it.
-      const readback = await SqliteStorage.open(await openNodeSqliteDatabase(path));
-      try {
-        const deadline = Date.now() + 5_000;
-        while ((await readback.task(task, BACKGROUND_CONTEXT))?.state.status !== "terminal") {
-          assert.ok(Date.now() < deadline, "The parked generation must settle after explicit retry");
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-      } finally { await readback.close(BACKGROUND_CONTEXT); }
-      peer.send(3, { type: "main_interrupt" }); await peer.done(3);
+      await peer.wait(2, event => event.type === "host_call");
+      peer.send(4, { type: "main_input", input_id, input: "Another retry must retain the original", mode: "steer" }); await peer.done(4);
+      assert.equal(peer.events(4).some(event => event.type === "host_call" || event.type === "failure"), false);
+      peer.send(3, { type: "main_interrupt" }); peer.releaseGuidance(); await peer.done(3);
     }
     await peer.done(2);
+    if (input_id === "placed") {
+      assert.ok(peer.events(2).some(event => event.type === "input_accepted" && event.work?.type === "stopped"));
+      assert.equal(peer.events(2).some(event => event.type === "host_call"), false, "A terminal receipt cannot start another turn");
+    }
     peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
     const after = await open(path);
     try {
       const current = await records(after.session);
-      assert.deepEqual(current.submissions.map((input) => input.id), saved.submissions.map((input) => input.id), "Reclaim must reuse every native submission ID");
-      assert.deepEqual(current.entries.filter((entry) => entry.kind === "pi.user"), saved.entries.filter((entry) => entry.kind === "pi.user"), "Reclaim must retain the original saved text without another placement");
-      const recovered = await after.session.getTask(task, BACKGROUND_CONTEXT);
-      assert.equal(recovered?.state.status, "terminal");
-      assert.equal(recovered?.restarts ?? 0, 0, "Explicit continuation must clear the parked generation's restart budget");
+      assert.deepEqual(current.submissions.map(input => input.id), saved.submissions.map(input => input.id), "Existing request identities must be reused");
+      assert.deepEqual(await after.session.getTask(task, BACKGROUND_CONTEXT), original, "Terminal native task history is immutable");
+      for (const entry of saved.entries) assert.deepEqual(current.entries.find(value => value.id === entry.id), entry);
+      assert.equal(JSON.stringify(current.entries).includes("Do not replace the original saved input"), false);
+      if (input_id === "queued") {
+        const queued = saved.submissions.find(input => input.requestId === "queued"); assert.ok(queued);
+        const receipts = (await after.storage.scanSubmissions({}, 100, undefined, BACKGROUND_CONTEXT)).items;
+        assert.equal(receipts.filter(input => input.requestId === "main-queue-recovery:" + queued.id).length, 1,
+          "Repeated transport retries must share the one supported continuation receipt");
+        assert.equal(JSON.stringify(current.entries).includes("Another retry must retain the original"), false);
+      }
     } finally { await after.session.close(BACKGROUND_CONTEXT); }
   } finally {
     peer?.child.kill("SIGKILL"); await peer?.closed; await peer?.reader.catch(() => {});
@@ -291,54 +305,37 @@ for (const input_id of ["placed", "queued"]) test(`explicit retry reclaims the s
   }
 });
 
-test("a fresh main input resumes the parked foreground generation before waiting for its queued admission", { timeout: 15_000 }, async () => {
+test("a fresh main input continues retained context after terminal failure without reviving its old task", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-new-input-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   try {
-    const task = await seed(path, true);
-    peer = bridge(directory);
+    const task = await seed(path), before = await open(path);
+    const original = await before.session.getTask(task, BACKGROUND_CONTEXT); await before.session.close(BACKGROUND_CONTEXT);
+    peer = bridge(directory, { holdGuidance: true, denyNetwork: true });
     peer.send(1, { type: "set_connected_nodes", host_ids: [host] }); await peer.done(1);
     peer.send(2, { type: "main_input", input_id: "new", input: "A new request", mode: "steer" });
-    await peer.wait(2, (event) => event.type === "input_accepted");
+    await peer.wait(2, event => event.type === "host_call");
     const readback = await SqliteStorage.open(await openNodeSqliteDatabase(path));
     try {
-      let recovered = await readback.task(task, BACKGROUND_CONTEXT);
-      assert.equal(recovered?.restarts ?? 0, 0, "A new explicit input must grant the old generation another attempt");
-      // Acceptance grants execution ownership; Pi may still be transitioning
-      // from running to the persisted retry sleep when that receipt arrives.
-      const deadline = Date.now() + 5_000;
-      while (recovered?.state.status === "running") {
-        assert.ok(Date.now() < deadline, "The recovered generation must enter its native retry sleep");
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        recovered = await readback.task(task, BACKGROUND_CONTEXT);
-      }
-      assert.equal(recovered?.state.status, "sleeping", "The original native retry checkpoint must resume before new admission waits");
-      const root = (await readback.scanConversations({}, 1, undefined, BACKGROUND_CONTEXT)).items[0]; assert.ok(root);
-      assert.equal((await readback.submissionByRequest(root.id, "new", BACKGROUND_CONTEXT))?.status, "queued");
+      assert.deepEqual(await readback.task(task, BACKGROUND_CONTEXT), original);
+      const inputs = (await readback.scanSubmissions({}, 100, undefined, BACKGROUND_CONTEXT)).items;
+      for (const request of ["placed", "queued", "new"]) assert.equal(inputs.filter(input => input.requestId === request).length, 1);
+      const placed = inputs.find(input => input.requestId === "placed");
+      assert.ok(placed?.status === "unanswered"); assert.equal(placed.reason, "restart_limit");
     } finally { await readback.close(BACKGROUND_CONTEXT); }
     peer.send(20, { type: "observe_main", input_ids: [] });
-    await peer.wait(20, (event) => event.type === "history" && event.page_complete);
-    peer.send(3, { type: "main_interrupt" }); await peer.done(3); await peer.done(2);
-    await peer.wait(20, (event) => event.type === "worker_idle");
-    for (const id of [2, 20]) {
-      for (const input_id of ["queued", "new"]) {
-        assert.equal(peer.events(id).filter((event) => event.type === "input_rejected" && event.input_id === input_id).length, 1,
-          `Request ${id} must receive exactly one terminal receipt for aborted unplaced input ${input_id}`);
-      }
-      assert.equal(peer.events(id).some((event) => event.type === "input_rejected" && event.input_id === "placed"), false,
-        "Stopping must preserve an input already placed in native history");
-    }
+    await peer.wait(20, event => event.type === "history" && event.page_complete);
+    peer.send(3, { type: "main_interrupt" }); peer.releaseGuidance(); await peer.done(3); await peer.done(2);
+    await peer.wait(20, event => event.type === "worker_idle");
     peer.send(20, { type: "detach_main" }); await peer.done(20);
     peer.send(21, { type: "observe_main", input_ids: ["placed", "queued", "new"] });
-    await peer.wait(21, (event) => event.type === "worker_idle");
-    for (const input_id of ["queued", "new"]) {
-      assert.equal(peer.events(21).filter((event) => event.type === "input_rejected" && event.input_id === input_id).length, 1,
-        "Reconnect must still reconcile each withdrawn input from its native submission");
+    await peer.wait(21, event => event.type === "worker_idle");
+    assert.ok(peer.events(21).some(event => event.type === "input_accepted" && event.input_id === "placed" && event.work?.type === "stopped"));
+    for (const request of ["queued", "new"]) {
+      const receipts: RuntimeEventKind[] = peer.events(21).filter(event => (event.type === "input_rejected" || event.type === "input_accepted" && event.work?.type === "stopped") && event.input_id === request);
+      assert.equal(receipts.length, 1, "Reconnect must reconcile the actual durable stopped receipt exactly once");
     }
-    assert.ok(peer.events(21).some((event) => event.type === "input_accepted" && event.input_id === "placed" && event.work?.type === "stopped"));
-    assert.ok(peer.events(21).some((event) => event.type === "input_placed" && event.input_id === "placed"));
-    assert.equal(peer.events(21).some((event) => event.type === "host_call" || event.type === "activity" || event.type === "failure"), false,
-      "Reconciliation must not restart execution or replay a stopped input");
+    assert.equal(peer.events(21).some(event => event.type === "host_call" || event.type === "activity"), false, "Reconciliation cannot restart execution");
     peer.send(21, { type: "detach_main" }); await peer.done(21);
     peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
   } finally {
@@ -347,7 +344,7 @@ test("a fresh main input resumes the parked foreground generation before waiting
   }
 });
 
-test("reconnect reports blocked, completed and stopped work without granting another restart", { timeout: 15_000 }, async () => {
+test("reconnect reports terminal, queued, completed and stopped receipts without another execution", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-receipts-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   try {
@@ -356,7 +353,7 @@ test("reconnect reports blocked, completed and stopped work without granting ano
     const saved = await records(before.session); await before.session.close(BACKGROUND_CONTEXT);
     const answer = saved.submissions.find((input) => input.requestId === "completed"); assert.ok(answer?.type === "input" && answer.status === "done");
     const expected = new Map([
-      ["placed", { type: "blocked", reason: "restart_limit" }], ["queued", { type: "blocked", reason: "restart_limit" }],
+      ["placed", { type: "stopped" }], ["queued", { type: "blocked", reason: "restart_limit" }],
       ["completed", { type: "completed", answer_entry_id: answer.answer.toString() }], ["stopped", { type: "stopped" }],
     ]);
     peer = bridge(directory);
@@ -379,7 +376,9 @@ test("reconnect reports blocked, completed and stopped work without granting ano
     const after = await open(path);
     try {
       assert.deepEqual(await records(after.session), saved, "Passive reconnect and terminal retry must not change native records");
-      assert.equal((await after.session.getTask(task, BACKGROUND_CONTEXT))?.restarts, 5);
+      const failed = await after.session.getTask(task, BACKGROUND_CONTEXT);
+      assert.ok(failed?.state.status === "terminal" && failed.state.outcome.status === "failed");
+      assert.deepEqual(failed.state.outcome.error.detail, { reason: "restart_limit" });
     } finally { await after.session.close(BACKGROUND_CONTEXT); }
   } finally {
     peer?.child.kill("SIGKILL"); await peer?.closed; await peer?.reader.catch(() => {});
@@ -387,10 +386,10 @@ test("reconnect reports blocked, completed and stopped work without granting ano
   }
 });
 
-test("foreground recovery leaves parked tools, owned generations and background work untouched", { timeout: 10_000 }, async () => {
+test("foreground inspection leaves interrupted tools, owned generations and background work untouched", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-retry-scope-")), path = join(directory, "session.sqlite");
   try {
-    const generation = await seed(path);
+    await seed(path, false);
     let app = await open(path);
     const protectedTasks: TaskId[] = await app.root.commit(async (tx) => {
       const assistant = await tx.appendEntry(AssistantEntry, app.root.id, {});
@@ -405,22 +404,21 @@ test("foreground recovery leaves parked tools, owned generations and background 
     const protectedRecords = await Promise.all(protectedTasks.map(taskRecord));
     for (const record of protectedRecords) {
       assert.ok(record);
-      await app.storage.commit([{ type: "task", value: { ...record, restarts: 5 } }], BACKGROUND_CONTEXT);
+      await commitWrites(app.storage, [{ type: "task", value: { ...record, restarts: 5 } }], BACKGROUND_CONTEXT);
     }
     await app.session.close(BACKGROUND_CONTEXT); app = await open(path);
     try {
-      const parked = await Promise.all(protectedTasks.map(taskRecord));
-      await mainObservation.recoverMainGeneration(app.session, app.root);
-      await app.session.waitForTask(generation, BACKGROUND_CONTEXT);
-      assert.deepEqual(await Promise.all(protectedTasks.map(taskRecord)), parked);
+      const retained = await Promise.all(protectedTasks.map(taskRecord));
+      await mainObservation.inspectMainWork(app.session, app.root);
+      assert.deepEqual(await Promise.all(protectedTasks.map(taskRecord)), retained);
       const queued = await mainObservation.reconcileMainInput(app.root, "queued", app.session);
       assert.deepEqual(queued, [{ type: "input_accepted", input_id: "queued", work: { type: "queued" } }],
-        "Unrelated parked work must not block a saved input after its run settles");
+        "Read-only inspection must preserve the saved queued receipt without retrying native work");
     } finally { await app.session.close(BACKGROUND_CONTEXT); }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-for (const state of ["parked", "parked_tool", "missing_task", "completed"]) test(`observation with no pending IDs reports ${state} main work after history is ready`, { timeout: 10_000 }, async () => {
+for (const state of ["terminal_generation", "terminal_tool", "missing_task", "completed"]) test(`observation with no pending IDs reports ${state} main work after history is ready`, { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-observed-state-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   try {
@@ -435,13 +433,13 @@ for (const state of ["parked", "parked_tool", "missing_task", "completed"]) test
         }, BACKGROUND_CONTEXT);
       } finally { await app.session.close(BACKGROUND_CONTEXT); }
     } else {
-      const task = await seed(path);
-      if (state === "missing_task" || state === "parked_tool") {
+      const task = await seed(path, state === "terminal_generation");
+      if (state === "missing_task" || state === "terminal_tool") {
         const app = await open(path);
         try {
           const record = await app.session.getTask(task, BACKGROUND_CONTEXT); assert.ok(record);
           if (state === "missing_task") {
-            await app.storage.commit([{ type: "task", value: { ...record, kind: "fixture.unavailable", restarts: 0 } }], BACKGROUND_CONTEXT);
+            await commitWrites(app.storage, [{ type: "task", value: { ...record, kind: "fixture.unavailable", restarts: 0 } }], BACKGROUND_CONTEXT);
           } else {
             const round = await app.root.commit(async (tx) => {
               const assistant = await tx.appendEntry(AssistantEntry, app.root.id, {});
@@ -453,11 +451,12 @@ for (const state of ["parked", "parked_tool", "missing_task", "completed"]) test
               return { assistant: assistant.id, tool };
             }, BACKGROUND_CONTEXT);
             const child = await app.root.commit((tx) => tx.task(round.tool), BACKGROUND_CONTEXT); assert.ok(child);
-            await app.storage.commit([
+            await commitWrites(app.storage, [
               { type: "task", value: { ...record, restarts: 0, state: { status: "waiting", on: [round.tool], policy: "allSettled",
                 checkpoint: { phase: "tools", assistant: round.assistant, tools: [round.tool], pending: [] } } } },
               { type: "task", value: { ...child, restarts: 5 } },
             ], BACKGROUND_CONTEXT);
+            await app.session.waitForTask(task, BACKGROUND_CONTEXT);
           }
         } finally { await app.session.close(BACKGROUND_CONTEXT); }
       }
@@ -466,22 +465,21 @@ for (const state of ["parked", "parked_tool", "missing_task", "completed"]) test
     const saved = await records(before.session); await before.session.close(BACKGROUND_CONTEXT);
     peer = bridge(directory);
     peer.send(1, { type: "observe_main", input_ids: [] });
-    const status = await peer.wait(1, (event) => event.type === "failure" || event.type === "worker_idle");
+    const status = await peer.wait(1, (event) => event.type === (state === "completed" ? "worker_idle" : "failure"));
     if (state === "completed") {
       assert.equal(status.type, "worker_idle");
       assert.equal(peer.events(1).some((event) => event.type === "failure"), false, "Completed work must not report a runtime block");
     } else {
       assert.equal(status.type, "failure", "A blocked native run must remain visible without locally pending input IDs");
       assert.ok(status.type === "failure");
-      if (state === "parked") assert.match(status.message, /paused after repeated restarts.*Send a message to resume/u);
-      else if (state === "parked_tool") {
-        assert.match(status.message, /inspect.*prior.*outcome/iu);
-        assert.doesNotMatch(status.message, /send a message.*resume/iu, "An ordinary message must not promise to replay a parked effect");
-      } else assert.match(status.message, /worker\/runtime update required/iu);
-      assert.equal(status.code, "invalid_request", "Paused work is not a broken coordinator connection");
+      if (state === "missing_task") {
+        assert.match(status.message, /worker\/runtime update required/iu);
+        assert.equal(status.code, "invalid_request", "Unavailable native definitions are not a broken coordinator connection");
+      } else assert.match(status.message, /restart|interrupt|answer|model/iu, "A terminal native failure must remain visible after its run ends");
       const events = peer.events(1), ready = events.findIndex((event) => event.type === "history" && event.page_complete);
       assert.ok(ready >= 0 && events.indexOf(status) > ready, "Blocked status must follow history readiness on the same observer");
-      assert.equal(events.some((event) => event.type === "worker_idle" || event.type === "host_call" || event.type === "activity"), false);
+      assert.equal(events.some((event) => event.type === "host_call" || event.type === "activity"), false);
+      if (state === "missing_task") assert.equal(events.some(event => event.type === "worker_idle"), false);
     }
     peer.send(1, { type: "detach_main" }); await peer.done(1);
     peer.child.stdin.end(); assert.equal(await peer.closed, 0, peer.errors()); await peer.reader;
@@ -494,11 +492,11 @@ for (const state of ["parked", "parked_tool", "missing_task", "completed"]) test
   }
 });
 
-test("a reclaimed owner stays attached for its existing follow-up and a concurrent admission", { timeout: 15_000 }, async () => {
+test("an execution owner stays attached for its existing follow-up and a concurrent admission", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-follow-up-")), path = join(directory, "session.sqlite");
   let peer: ReturnType<typeof bridge> | undefined;
   try {
-    const generation = await seed(path), app = await open(path);
+    const generation = await seed(path, false), app = await open(path);
     try {
       const record = await app.session.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
       const round = await app.root.commit(async (tx) => {
@@ -516,8 +514,8 @@ test("a reclaimed owner stays attached for its existing follow-up and a concurre
       }, BACKGROUND_CONTEXT);
       const child = await app.root.commit((tx) => tx.task(round.tool), BACKGROUND_CONTEXT); assert.ok(child);
       const { memos: _memos, ...endedChild } = child;
-      await app.storage.commit([
-        { type: "task", value: { ...record, state: { status: "pending",
+      await commitWrites(app.storage, [
+        { type: "task", value: { ...record, restarts: 0, state: { status: "pending",
           checkpoint: { phase: "tools", assistant: round.assistant, tools: [round.tool], pending: [] } } } },
         { type: "task", value: { ...endedChild, state: { status: "terminal", outcome: { status: "completed",
           result: { kind: "model", entryId: round.result, control: { terminate: true } } } } } },

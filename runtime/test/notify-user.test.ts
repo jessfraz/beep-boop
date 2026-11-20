@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, type Conversation } from "@earendil-works/pi-durable";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Message } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
+import { createRegistry, defineExtension, defineTool, GenerationTask, Harness, hook, LiveDoc, ToolResultEntry, type Conversation } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { Type } from "typebox";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { watchMainNotices } from "../src/main_observation.js";
@@ -33,10 +35,17 @@ async function open(directory: string) {
   const tasks = new TaskStore(session, new ConversationModels(models)), executions = new Executions();
   const sources = new SourceJournal(session, tasks, executions), tools = createSourceTools(sources, executions);
   registry.install(tools.main); registry.install(tools.worker);
-  return { session, tasks, executions, sources, tools, faux };
+  return { session, tasks, executions, sources, tools, faux, registry };
 }
 async function notices(conversation: Conversation) {
   return (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(isUserNotice);
+}
+function retainedNotice(context: { messages: readonly Message[] }, text: string, legacy = false) {
+  return normalizeContext({ messages: [...context.messages] }).messages.filter(message => {
+    if (legacy) return message.role === "assistant" && message.content.some(part => part.type === "text" && part.text === text);
+    return message.role === "user" && typeof message.content !== "string" && message.content.some(part =>
+      part.type === "text" && part.text === "Background workflow evidence, not a new user instruction:\n" + text);
+  });
 }
 
 const cases: { child: boolean; main: "idle" | "busy" | "reset" }[] = [
@@ -118,8 +127,7 @@ for (const { child, main } of cases) test(`a running ${child ? "child" : "worker
     assert.equal((await notices(root)).length, 1, "Replaying the same native call must not append a second notice");
     assert.deepEqual(live, [entry.id.toString()]);
     releaseMain(); await mainExecution; mainExecution = undefined;
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === text)).length, 1,
+    assert.equal(retainedNotice(await root.context(BACKGROUND_CONTEXT), text).length, 1,
     "The main model must retain exactly one copy of the notice");
     release(); await execution; execution = undefined;
     assert.equal((await notices(root)).length, 1, "The eventual worker final must not republish the update");
@@ -172,8 +180,7 @@ for (const legacy of [false, true]) test(`${legacy ? "legacy queued" : "visible"
     await publishMainNotice(app.session, source, origin, null, [], notice);
     await root.waitForIdle(BACKGROUND_CONTEXT);
     assert.equal((await notices(root)).length, 1, "A legacy queued write must not acquire a second visible projection");
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === notice.text)).length, 1);
+    assert.equal(retainedNotice(await root.context(BACKGROUND_CONTEXT), notice.text, legacy).length, 1);
     const calls = app.faux.state.callCount;
     assert.equal(await publishMainNotice(app.session, source, origin, null, [], notice), "published");
     assert.equal((await notices(root)).length, 1);
@@ -192,11 +199,14 @@ test("reopen completes a missing model projection without repeating the visible 
     const getRoot = original.root.bind(original), rootBeforeClose = await getRoot(BACKGROUND_CONTEXT);
     const submit = rootBeforeClose.submit.bind(rootBeforeClose);
     original.root = async () => rootBeforeClose;
-    rootBeforeClose.submit = async (draft, context) => {
-      const receipt = await submit(draft, context);
-      if (draft.type === "write" && draft.entry.kind === "agent.user_notice") await original.close(BACKGROUND_CONTEXT);
+    rootBeforeClose.submit = new Proxy(submit, { async apply(target, thisArg: unknown, args: unknown[]) {
+      const receipt: unknown = await Reflect.apply(target, thisArg, args);
+      const draft = args[0];
+      if (typeof draft === "object" && draft !== null && "type" in draft && draft.type === "write" &&
+          "entry" in draft && typeof draft.entry === "object" && draft.entry !== null && "kind" in draft.entry &&
+          draft.entry.kind === "agent.user_notice") await original.close(BACKGROUND_CONTEXT);
       return receipt;
-    };
+    } });
     try { await assert.rejects(publishMainNotice(original, source, origin, null, [], notice), /closed|closing/i); }
     finally { original.root = getRoot; rootBeforeClose.submit = submit; }
     app = await open(directory); source = await app.tasks.conversation(source.id.toString());
@@ -204,9 +214,57 @@ test("reopen completes a missing model projection without repeating the visible 
       publishMainNotice(app.session, source, origin, null, [], notice)]);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     assert.equal((await notices(root)).length, 1);
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === notice.text)).length, 1);
+    assert.equal(retainedNotice(await root.context(BACKGROUND_CONTEXT), notice.text).length, 1);
     assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a cross-worker notice placed after a root tool result preserves the original input and final answer", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-notice-tool-interleave-")), app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "A concurrent worker", outcome: "Retain the verified background result", model: fixtureModel });
+    const worker = await app.tasks.conversation(task.conversation_id), root = await app.session.root(BACKGROUND_CONTEXT);
+    const text = "The concurrent result is verified.";
+    const origin = await worker.commit(tx => tx.appendEntry(worker.id, { kind: "pi.assistant", model: [fauxAssistantMessage(text)] }), BACKGROUND_CONTEXT);
+    const notice = { key: "interleaved-worker", text, events: [] };
+    const projectionId = "notice-context:" + JSON.stringify([origin.id.toString(), notice.key]);
+    const extension = defineExtension({ name: "interleaved-notice", tools: [defineTool({
+      name: "check_fixture", description: "Return the existing fixture result", parameters: Type.Object({}),
+      async execute() {
+        return { output: [{ type: "text", text: "The fixture check finished." }] };
+      },
+    })], hooks: [hook(GenerationTask, {
+      async afterTools() {
+        assert.equal(await publishMainNotice(app.session, worker, origin, task.id, [], notice), "published");
+        const queued = await root.commit(tx => tx.submissionByRequest(root.id, projectionId), BACKGROUND_CONTEXT);
+        assert.equal(queued?.status, "queued", "Passive context waits for Pi's tool-to-prepare boundary");
+      },
+    })] });
+    app.registry.install(extension);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [extension] }, BACKGROUND_CONTEXT);
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("check_fixture", {}, { id: "root-check" }), { stopReason: "toolUse" }),
+      input => {
+        assert.ok(input.messages.some(message => message.role === "toolResult" && message.toolName === "check_fixture" && !message.isError));
+        assert.equal(retainedNotice(input, text).length, 1);
+        return fauxAssistantMessage("The original root request is complete.");
+      },
+    ]);
+    const original = await root.submit({ type: "input", requestId: "interleaved-root-input", content: "Finish the root fixture check." }, BACKGROUND_CONTEXT);
+    const settled = await original.wait(BACKGROUND_CONTEXT); assert.equal(settled.status, "done", JSON.stringify(settled));
+    assert.equal(app.faux.state.callCount, 2);
+    const entries = (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
+    const result = entries.findIndex(entry => ToolResultEntry.is(entry));
+    const projection = entries.findIndex(entry => entry.kind === "agent.notice_context");
+    assert.ok(result >= 0 && projection > result, "The real passive write must land after the tool result, before model preparation: " +
+      JSON.stringify(entries.map(entry => ({ id: entry.id, kind: entry.kind, roles: entry.model?.map(message => message.role) }))));
+    assert.equal((await notices(root)).length, 1);
+    const receipt = await root.commit(tx => tx.submissionByRequest(root.id, projectionId), BACKGROUND_CONTEXT); assert.ok(receipt);
+    await publishMainNotice(app.session, worker, origin, task.id, [], notice);
+    assert.equal((await root.commit(tx => tx.submissionByRequest(root.id, projectionId), BACKGROUND_CONTEXT))?.id, receipt.id);
+    assert.equal((await notices(root)).length, 1); assert.equal(app.faux.state.callCount, 2);
+    assert.equal((await root.commit(tx => tx.submissionByRequest(root.id, "interleaved-root-input"), BACKGROUND_CONTEXT))?.id, original.id);
+    assert.equal((await app.session.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT))?.runFailure, undefined);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -227,8 +285,14 @@ test("coordinator publication requires useful bounded text and an actual owned w
         return fauxAssistantMessage(fauxToolCall("notify_user", { text: "A necessary decision has new verified evidence." }), { stopReason: "toolUse" }); },
       fauxAssistantMessage("Publication saved."),
     ]);
-    assert.equal((await (await root.submit({ type: "input", content: "Report a useful update." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    const original = await root.submit({ type: "input", requestId: "root-notice-request", content: "Report a useful update." }, BACKGROUND_CONTEXT);
+    assert.equal((await original.wait(BACKGROUND_CONTEXT)).status, "done");
     assert.equal((await notices(root)).length, 1);
+    assert.equal((await root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(entry => entry.kind === "agent.notice_context").length, 0,
+      "The coordinator's own tool call already retains its notice in model context");
+    const replay = await root.submit({ type: "input", requestId: "root-notice-request", content: "Report a useful update." }, BACKGROUND_CONTEXT);
+    assert.equal(replay.id, original.id); assert.equal((await replay.status(BACKGROUND_CONTEXT)).status, "done");
+    assert.equal(app.faux.state.callCount, 3);
     unbind();
     const outsider = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
     unbind = app.executions.bind(outsider.id.toString(), { cwd: host.cwd, hosts: [], role: "worker", call: async () => ({ type: "written" }) });

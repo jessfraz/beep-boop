@@ -445,9 +445,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
                 RuntimeEventKind::ScheduledJobs { jobs } => {
                     Some(NativeJobStatus::List { jobs: jobs.clone() })
                 }
-                RuntimeEventKind::ScheduledJob { job } => Some(NativeJobStatus::Detail {
-                    job: Box::new(job.clone()),
-                }),
+                RuntimeEventKind::ScheduledJob { job } => {
+                    Some(NativeJobStatus::Detail { job: job.clone() })
+                }
                 _ => None,
             },
         });
@@ -761,7 +761,7 @@ mod tests {
         else {
             panic!("Settings must retain the legacy notice shape")
         };
-        assert!(text.starts_with("openai/gpt-6.1-sol · xhigh"));
+        assert!(text.starts_with("openai/gpt-6.2-sol · xhigh"));
         assert_eq!(current.configured.model, settings.model);
         assert_eq!(
             current.configured.catalog[0].reasoning,
@@ -931,6 +931,7 @@ mod tests {
                 job_id,
                 schedule_id: Some(schedule_id),
                 request_id,
+                input: None,
             } = *command
             else {
                 panic!("Manual control must produce a typed job admission");
@@ -1010,11 +1011,13 @@ mod tests {
             Detail { job: Box<ScheduledJobStatus> },
         }
         let mut job = ScheduledJobStatus {
+            progress: None,
             job: ScheduledJob {
                 id: "example-review".to_string().try_into().unwrap(),
                 title: "Example review".into(),
                 prompt: "Review existing evidence".into(),
                 model: crate::models::ModelSelection::default(),
+                priority: crate::jobs::JobPriority::Normal,
                 timezone: "Etc/UTC".to_string().try_into().unwrap(),
                 cwd: "/workspace/example".into(),
                 revision: "original".into(),
@@ -1063,7 +1066,7 @@ mod tests {
             output: Some("Complete retained output\nwith another line".into()),
             output_truncated: false,
         });
-        let detail = decode(RuntimeEventKind::ScheduledJob { job });
+        let detail = decode(RuntimeEventKind::ScheduledJob { job: Box::new(job) });
         assert!(
             detail
                 .text

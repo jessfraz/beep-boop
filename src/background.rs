@@ -145,6 +145,24 @@ pub struct ScheduledOccurrence {
     pub job: ScheduledJob,
     pub schedule_id: jobs::ScheduleId,
     pub scheduled_at: UtcMillis,
+    /// New admissions capture a fresh task; older retained work keeps its
+    /// original actor and receipts when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_id: Option<crate::protocol::TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub manual: Option<JobManualRequest>,
+}
+
+/// Presence records a directly requested run and its obligation to publish the
+/// actual result or blocker, even when no additional input was supplied.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobManualRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -164,6 +182,9 @@ pub struct JobRunReceipt {
     pub schedule_id: jobs::ScheduleId,
     pub revision: String,
     pub admitted_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub manual: Option<JobManualRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -256,6 +277,29 @@ pub struct ScheduledJobStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub last_run: Option<JobExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub progress: Option<JobProgress>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobProgressStatus {
+    Normal,
+    Overdue,
+    Unavailable,
+}
+
+/// Observation of existing work, not another execution state machine.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct JobProgress {
+    pub status: JobProgressStatus,
+    pub checked_at: UtcMillis,
+    pub last_progress_at: Option<UtcMillis>,
+    pub pending_work: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub blocker: Option<String>,
 }
 
 /// A view of the existing Pi execution, never a second execution state machine.
@@ -343,4 +387,62 @@ fn interval(seconds: u32, after: Option<UtcMillis>, now: UtcMillis) -> Result<Oc
         due,
         next: Some(UtcMillis::new(next)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::background::{JobManualRequest, JobProgress, JobProgressStatus, JobRunReceipt};
+
+    #[test]
+    fn manual_job_receipts_distinguish_legacy_admission_from_direct_result_obligations() {
+        let mut receipt: JobRunReceipt = serde_json::from_str(
+            r#"{
+                "request_id":"retained-request",
+                "task_id":"11111111-1111-4111-8111-111111111111",
+                "job_id":"example-review",
+                "schedule_id":"daily",
+                "revision":"one",
+                "admitted_at":1
+            }"#,
+        )
+        .unwrap();
+        assert!(receipt.manual.is_none());
+        receipt.manual = Some(JobManualRequest { input: None });
+        let direct: JobRunReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_eq!(direct, receipt);
+        assert_eq!(direct.manual, Some(JobManualRequest { input: None }));
+
+        receipt.manual = Some(JobManualRequest {
+            input: Some("Review newly arrived mail now.".into()),
+        });
+        let requested: JobRunReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_ne!(requested, direct);
+        assert_eq!(
+            requested.manual.unwrap().input.as_deref(),
+            Some("Review newly arrived mail now.")
+        );
+    }
+
+    #[test]
+    fn workflow_progress_reports_unavailable_coverage_explicitly() {
+        let progress: JobProgress = serde_json::from_str(
+            r#"{"status":"unavailable","checked_at":1,"last_progress_at":null,
+                "pending_work":0,"blocker":"Native progress read is unavailable"}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.status, JobProgressStatus::Unavailable);
+        assert!(progress.last_progress_at.is_none());
+        let restored: JobProgress =
+            serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+        assert_eq!(restored.status, progress.status);
+        assert_eq!(restored.blocker, progress.blocker);
+        assert!(
+            serde_json::from_str::<JobProgress>(
+                r#"{"status":"unknown","checked_at":1,"last_progress_at":null,"pending_work":0}"#
+            )
+            .is_err()
+        );
+    }
 }

@@ -7,7 +7,7 @@ job_directories = []
 # Defaults for new work. Existing tasks keep their saved model selection.
 [model]
 provider = "openai"
-model_id = "gpt-6.1-sol"
+model_id = "gpt-6.2-sol"
 reasoning = "high"
 fast = false
 
