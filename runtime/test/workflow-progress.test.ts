@@ -35,6 +35,22 @@ async function fail(app: Awaited<ReturnType<typeof open>>, id: string) {
   await app.tasks.runBackground(id).catch(() => {});
 }
 
+test("an admitted workflow without a native input reports a dispatch blocker", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-workflow-dispatch-")), clock = new FakeClock(), app = await open(directory, clock);
+  try {
+    const job = { ...exampleJob(), priority: "critical" } satisfies ScheduledJob;
+    const owner = await app.tasks.create({ title: job.title, outcome: job.prompt });
+    const task = await app.tasks.create({ title: job.title, outcome: job.prompt, model: job.model, execution: "coordinator",
+      workflow: { job, owner_task_id: owner.id, work_key: "admitted-before-dispatch" } });
+    await app.progress.start(); clock.advance(120_001);
+    await pump(async () => (await app.progress.status(job.id)).status === "overdue" && (await notices(app)).length === 1);
+    const notice = (await notices(app))[0]; assert.ok(notice);
+    assert.match(notice.data.text ?? "", /admitted input has not completed dispatch/);
+    assert.deepEqual((await app.tasks.get(task.id)).pending, []);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("an older overdue workflow survives restart and a newer success without duplicate Main alerts", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-workflow-progress-")), clock = new FakeClock();
   let app = await open(directory, clock);

@@ -660,7 +660,10 @@ export class BackgroundScheduler {
         tx.submissionByRequest(conversation.id, reference.request_id), BACKGROUND_CONTEXT);
       const interrupted = original?.type === "input" && original.status === "unanswered";
       const terminalWork = previous?.state.status === "terminal" && previous.state.outcome.status !== "completed" && previous.state.outcome.status !== "aborted";
-      if (work !== undefined && (interrupted || terminalWork)) {
+      const checkpoint = previous?.state.status === "sleeping" ? previous.state.checkpoint : undefined;
+      const retainedFailure = object(checkpoint) && checkpoint.phase === "execute" && typeof checkpoint.attempt === "number" &&
+        Number.isSafeInteger(checkpoint.attempt) && checkpoint.attempt > 0;
+      if (work !== undefined && (interrupted || terminalWork || retainedFailure)) {
         if ((work.work.type !== "job" && work.work.type !== "manual_job") || work.work.occurrence.id !== reference.request_id ||
             work.key.type !== "job" || work.key.job_id !== id) throw new TaskError("The interrupted job's ownership changed");
         if (interrupted && actor !== undefined && conversation !== undefined) {

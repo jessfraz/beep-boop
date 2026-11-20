@@ -16,7 +16,7 @@ import type { BackgroundTriggerKey } from "../src/generated/BackgroundTriggerKey
 import type { BackgroundWork } from "../src/generated/BackgroundWork.js";
 import { openJobActor, runScheduled, scheduledTaskId } from "../src/scheduled.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
-import { pump } from "./fixtures/background-runtime.js";
+import { FakeClock, pump } from "./fixtures/background-runtime.js";
 import { fixtureModel } from "./model.js";
 
 const State = defineDoc<{ lanes: { id: string; active: TaskId | null; actor_task_id: string | null;
@@ -92,6 +92,57 @@ test("job inspection leaves an actor without a native run untouched", async () =
     assert.deepEqual(await app.tasks.get(actor.id), actor); assert.equal(app.faux.state.callCount, 0);
     await assert.rejects(scheduler.retryJob(job.id), /interrupted|parked/);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("explicit retry wakes one retained sleeping occurrence without cloning its replacement or replaying effects", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-job-preplacement-retry-")), clock = new FakeClock();
+  let app = await openScheduled(directory, "original", clock), available = false;
+  const held = gate(), entered = gate();
+  const callback: BackgroundCallbacks["runJob"] = async (occurrence, signal, actor) => {
+    if (!available) throw new Error("The fixture stopped before native input placement");
+    await runScheduled(occurrence, signal, app, actor);
+  };
+  try {
+    let scheduler = background(app, callback); await scheduler.syncJobs([job]);
+    const request = { type: "run_job", request_id: "retained-sleeping", job_id: job.id, schedule_id: null } satisfies Parameters<BackgroundScheduler["runJob"]>[0];
+    const receipt = await scheduler.runJob(request);
+    await pump(async () => (await scheduler.getJob(job.id)).last_run?.state.status === "retrying");
+    const initial = (await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === JSON.stringify(["job", job.id]))?.last_run;
+    assert.ok(initial);
+    const original = await app.session.getTask(initial.task, BACKGROUND_CONTEXT); assert.ok(original);
+    const task = await app.tasks.get(receipt.task_id), conversationId = task.conversation_id;
+    const conversation = await app.tasks.conversation(conversationId);
+    assert.equal(await app.session.commit(tx => tx.submissionByRequest(conversation.id, "manual:retained-sleeping"), BACKGROUND_CONTEXT), undefined);
+    assert.equal(app.faux.state.callCount, 0);
+    await app.close(); app = await openScheduled(directory, "restored", clock);
+    scheduler = background(app, callback); await scheduler.syncJobs([job]);
+    await scheduler.retryJob(job.id);
+    await pump(async () => (await scheduler.getJob(job.id)).last_run?.state.status === "retrying");
+    const replacement = (await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === JSON.stringify(["job", job.id]))?.last_run;
+    assert.ok(replacement); assert.notEqual(replacement.task, initial.task);
+    const replacementTask = await app.session.getTask(replacement.task, BACKGROUND_CONTEXT); assert.ok(replacementTask);
+    assert.deepEqual(replacementTask.input, original.input);
+    await pump(async () => (await app.session.getTask(initial.task, BACKGROUND_CONTEXT))?.state.status === "terminal");
+    await Promise.all([scheduler.retryJob(job.id), scheduler.retryJob(job.id)]);
+    assert.equal((await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === JSON.stringify(["job", job.id]))?.last_run?.task, replacement.task);
+    assert.deepEqual(await scheduler.runJob(request), receipt);
+    assert.equal((await app.tasks.get(receipt.task_id)).conversation_id, conversationId);
+    available = true;
+    app.faux.setResponses([async () => {
+      entered.release(); await held.promise;
+      return fauxAssistantMessage(fauxToolCall("exec", { program: "example", args: ["verify"] }), { stopReason: "toolUse" });
+    }, fauxAssistantMessage("The retained occurrence verified its original work once.")]);
+    clock.advance(60_000); await entered.promise;
+    await scheduler.retryJob(job.id);
+    assert.equal((await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === JSON.stringify(["job", job.id]))?.last_run?.task, replacement.task);
+    held.release(); await pump(async () => (await scheduler.status()).pending === 0);
+    assert.equal((await scheduler.getJob(job.id)).last_run?.state.status, "completed");
+    await scheduler.retryJob(job.id);
+    assert.equal((await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === JSON.stringify(["job", job.id]))?.last_run?.task, replacement.task);
+    assert.equal(app.commands.filter(command => command.type === "exec").length, 1);
+    assert.equal(app.faux.state.callCount, 2);
+    assert.deepEqual(await scheduler.runJob(request), receipt);
+  } finally { held.release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 for (const legacy of [false, true]) test(`explicit job recovery uses one new input in the ${legacy ? "legacy" : "current"} retained actor`, { timeout: 15_000 }, async () => {

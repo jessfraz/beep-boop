@@ -169,7 +169,21 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const fresh = id === scheduledTaskId(occurrence.id);
   let owner: string | undefined;
   if (fresh) {
-    owner = await openJobActor(occurrence.job, tasks);
+    owner = await session.commit(async tx => {
+      const captured = (await tasks.findIn(tx, id))?.workflow;
+      if (captured === undefined) return;
+      if (captured.job.id !== occurrence.job.id || captured.job.revision !== occurrence.job.revision ||
+          captured.work_key !== "occurrence:" + occurrence.id) {
+        throw new TaskError("The captured workflow snapshot does not own this scheduled occurrence");
+      }
+      const canonical = await tasks.findIn(tx, captured.owner_task_id);
+      if (canonical === undefined || canonical.id === id || !canonical.sources.some(source =>
+          source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === occurrence.job.id)) {
+        throw new TaskError("The captured workflow's canonical owner no longer owns this job");
+      }
+      return canonical.id;
+    }, BACKGROUND_CONTEXT);
+    owner ??= await openJobActor(occurrence.job, tasks);
     if (owner === undefined) owner = (await tasks.create({ id: scheduledTaskId("job:" + occurrence.job.id),
       title: occurrence.job.title, outcome: occurrence.job.prompt, model: occurrence.job.model,
       sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] })).id;

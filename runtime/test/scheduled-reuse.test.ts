@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
 import { BackgroundScheduler } from "../src/background.js";
-import { openJobActor, runScheduled } from "../src/scheduled.js";
+import { openJobActor, runScheduled, scheduledTaskId } from "../src/scheduled.js";
 import { UserNoticeEntry } from "../src/transcript.js";
 import { WorkflowProgress } from "../src/workflow-progress.js";
 import type { TaskState } from "../src/generated/TaskState.js";
@@ -102,6 +102,111 @@ test("new manual and timer occurrences use fresh conversations while exact repla
     assert.deepEqual((await scheduler.status()).errors, []);
   } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("manual and cron runs honor their persisted canonical owner across restart with historical source links", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-persisted-workflow-owner-")), clock = new FakeClock();
+  let app = await openScheduled(directory, "original", clock);
+  let hold = false, entered = () => {};
+  const admitted = new Promise<void>(resolve => { entered = resolve; });
+  const background = () => new BackgroundScheduler(app.session, app.registry, app.tasks, {
+    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {},
+    triageSources: async () => {}, collectResources: async () => {}, indexHistory: async () => {},
+    runJob: async (occurrence, signal, actor) => {
+      if (hold) {
+        entered();
+        await new Promise<void>((_resolve, reject) => {
+          const stopped = () => reject(new Error("The fixture stopped after durable admission"));
+          if (signal.aborted) stopped(); else signal.addEventListener("abort", stopped, { once: true });
+        });
+      }
+      await runScheduled(occurrence, signal, app, actor);
+    },
+  });
+  try {
+    const previous = exampleJob("previous", "OLDER_CANONICAL_POLICY");
+    const owner = await app.tasks.create({ title: previous.title, outcome: previous.prompt, model: previous.model,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: previous.id }] });
+    const stopped: TaskState = { state: "waiting", actor: "The prior execution remains stopped.", next_check: null };
+    await app.tasks.update(owner.id, task => { task.summary = "OLDER_CANONICAL_SUMMARY"; task.state = stopped; });
+    const retained = await app.tasks.conversation(owner.conversation_id);
+    await (await retained.submit({ type: "write", entry: { kind: "fixture.old_owner", model: [{ role: "user", content: "OLDER_CANONICAL_TRANSCRIPT", timestamp: 1 }] } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    let scheduler = background(); await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [previous] });
+    app.faux.setResponses([fauxAssistantMessage("The previous bounded occurrence finished.")]);
+    await scheduler.runJob({ type: "run_job", request_id: "previous-owned-run", job_id: previous.id, schedule_id: null });
+    await pump(async () => (await scheduler.status()).pending === 0);
+    assert.equal((await scheduler.getJob(previous.id)).task_id, owner.id);
+    const historical = await app.tasks.create({ title: "Historical owned occurrence", outcome: "OLDER_HISTORICAL_POLICY", model: previous.model,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: previous.id }] });
+    const oldConversation = await app.tasks.conversation(historical.conversation_id);
+    await (await oldConversation.submit({ type: "write", entry: { kind: "fixture.old_occurrence", model: [{ role: "user", content: "OLDER_OCCURRENCE_TRANSCRIPT", timestamp: 1 }] } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    const current = { ...previous, revision: "current", prompt: "CURRENT_CAPTURED_POLICY", model: { ...previous.model, model_id: "fixture-updated" } };
+    await scheduler.syncJobs([current]); hold = true;
+    const request = { type: "run_job", request_id: "current-owned-run", job_id: current.id, schedule_id: null } satisfies Parameters<BackgroundScheduler["runJob"]>[0];
+    const manual = await scheduler.runJob(request); await admitted;
+    assert.equal((await app.tasks.get(manual.task_id)).workflow?.owner_task_id, owner.id);
+    await app.close(); hold = false; app = await openScheduled(directory, "current", clock);
+    scheduler = background();
+    const respond: FauxResponseFactory = (context, _options, _state, model) => {
+      assert.match(getCurrentSystemPrompt(context.messages), /CURRENT_CAPTURED_POLICY/);
+      assert.doesNotMatch(JSON.stringify(context.messages), /OLDER_CANONICAL_|OLDER_OCCURRENCE_|OLDER_HISTORICAL_/);
+      assert.equal(model.id, "fixture-updated");
+      return fauxAssistantMessage("The current bounded occurrence finished.");
+    };
+    app.faux.setResponses([respond, respond]);
+    await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [current] });
+    assert.deepEqual(await scheduler.runJob(request), manual);
+    await pump(async () => ["completed", "retrying"].includes((await scheduler.getJob(current.id)).last_run?.state.status ?? ""));
+    const result = await scheduler.getJob(current.id);
+    assert.equal(result.last_run?.state.status, "completed", JSON.stringify(result.last_run?.state));
+    await pump(async () => (await scheduler.status()).pending === 0);
+    assert.equal((await app.tasks.get(manual.task_id)).workflow?.owner_task_id, owner.id);
+    clock.advance(DAY);
+    await pump(() => app.faux.state.callCount === 2);
+    await pump(async () => (await scheduler.status()).pending === 0);
+    const cron = (await scheduler.getJob(current.id)).last_run?.task_id; assert.ok(cron);
+    assert.notEqual(cron, manual.task_id);
+    assert.equal((await app.tasks.get(cron)).workflow?.owner_task_id, owner.id);
+    assert.equal((await app.tasks.get(owner.id)).conversation_id, owner.conversation_id);
+    assert.deepEqual((await app.tasks.get(owner.id)).state, stopped);
+    assert.equal((await app.tasks.get(owner.id)).summary, "OLDER_CANONICAL_SUMMARY");
+    assert.equal((await app.tasks.get(historical.id)).conversation_id, historical.conversation_id);
+    assert.deepEqual(new Set((await app.tasks.findBySources([{ provider: "scheduled_jobs", account: "local", thread_id: current.id }], 3)).map(task => task.id)), new Set([owner.id, historical.id]));
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("an unbound occurrence still rejects ambiguous historical workflow owners", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-unbound-workflow-owner-")), app = await openScheduled(directory), job = exampleJob();
+  try {
+    for (const title of ["First historical owner", "Second historical owner"]) await app.tasks.create({ title, outcome: job.prompt,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    await assert.rejects(runScheduled({ id: "unbound-occurrence", job, schedule_id: "daily", scheduled_at: START }, new AbortController().signal, app), /ambiguous/);
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const mismatch of ["job", "revision", "work key", "missing owner", "removed owner link"]) {
+  test(`a captured occurrence rejects ${mismatch} ownership instead of rediscovering another actor`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-invalid-workflow-owner-")), app = await openScheduled(directory), job = exampleJob();
+    try {
+      const owner = await app.tasks.create({ title: "Captured canonical owner", outcome: job.prompt,
+        sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      if (mismatch === "removed owner link") {
+        await app.tasks.update(owner.id, task => { task.sources = []; });
+        await app.tasks.create({ title: "Another linked actor", outcome: job.prompt,
+          sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      }
+      const occurrence = { id: "captured-occurrence", job, schedule_id: "daily", scheduled_at: START };
+      const task = await app.tasks.create({ id: scheduledTaskId(occurrence.id), title: job.title, outcome: job.prompt, model: job.model, execution: "coordinator",
+        workflow: { job: mismatch === "job" ? { ...job, id: "another-job" } : mismatch === "revision" ? { ...job, revision: "stale" } : job,
+          owner_task_id: mismatch === "missing owner" ? "11111111-1111-4111-8111-111111111111" : owner.id,
+          work_key: mismatch === "work key" ? "another-owned-input" : "occurrence:" + occurrence.id } });
+      app.faux.setResponses([fauxAssistantMessage("An invalid owner must not execute.")]);
+      await assert.rejects(runScheduled(occurrence, new AbortController().signal, app), /owner|ownership|snapshot/);
+      assert.equal(app.faux.state.callCount, 0);
+      assert.deepEqual((await app.tasks.get(task.id)).pending, []);
+    } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("manual job admission chooses a neutral schedule while focused alternatives remain explicit", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-manual-schedule-")), clock = new FakeClock();

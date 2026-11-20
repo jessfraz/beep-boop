@@ -270,7 +270,7 @@ export class WorkflowProgress {
         : live.runFailure !== undefined ? `Its native input is unanswered (${live.runFailure.reason})` +
           (live.runFailure.detail === undefined ? "" : ": " + live.runFailure.detail.slice(0, 320))
         : busy ? "Its native work has made no verified progress before its deadline"
-        : task.pending.length > 0 ? "Its admitted input has not completed dispatch"
+        : task.pending.length > 0 || native === undefined ? "Its admitted input has not completed dispatch"
         : task.state.state === "waiting" ? "Its waiting state has no future recovery check"
         : "Its native turn ended without verified task resolution";
       aggregate.blocker = run.blocker;
