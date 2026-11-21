@@ -782,6 +782,9 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
     return execution;
   }
   const read = defineTool({ name: "read_source_events", replay: "safe",
+    // One original fits the existing 2 MiB serialized source-page budget.
+    // Leave bounded room for its retained decision and the reader's envelope.
+    outputLimits: { maxBytes: 4 * 1024 * 1024 },
     description: "Read one bounded page of retained evidence and task links. Review views bound task-outcome references with source_count/sources_complete; exact originals remain retained. Follow cursor while complete is false, including empty filtered pages. Completion describes this retained scan, not upstream provider coverage. Filter by account/thread or exact keys before acting.",
     parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })), provider: Type.Optional(Type.String()),
       account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),

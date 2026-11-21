@@ -8,6 +8,7 @@ import type { SourcePipelineDiagnostics } from "./generated/SourcePipelineDiagno
 import type { SourceCollectorDiagnostics } from "./generated/SourceCollectorDiagnostics.js";
 import type { SourceReviewDecision } from "./generated/SourceReviewDecision.js";
 import type { SourceRef } from "./generated/SourceRef.js";
+import type { SourceEvent } from "./generated/SourceEvent.js";
 import type { SourceKey } from "./generated/SourceKey.js";
 import type { ScheduledJobStatus } from "./generated/ScheduledJobStatus.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
@@ -18,10 +19,13 @@ import { Executions, reviewSourceReferences, reviewTaskState, reviewTaskStatus }
 import { publishMainNotice, sourceReference, TaskError, TaskStore } from "./tasks.js";
 import { scheduledTaskId } from "./scheduled.js";
 import { sourceWorkResource, sourceWorkResources } from "./source-work.js";
+import { AttachmentError, validateInput } from "./attachments.js";
 
 type ReviewClass = "email" | "fresh" | "backfill";
 type Capture = { id: string; revision: number; decision_revision: number; keys: string[]; group: string };
 type Effect = { type: "task"; task_id: string } | { type: "notice"; keys: string[]; task_id: string | null; text: string; call_id: string; identity: string };
+type WorkflowPacket = { job: ScheduledJobStatus["job"]; owner: string; work_key: string; records: StoredEvent[]; resource?: string };
+type WorkflowEvidence = { key: string; event: SourceEvent; text_complete?: false; original_text_bytes?: number };
 type Claim = { id: string; slot: number; conversation_id: string; class: ReviewClass; started_at: number; attempt: number;
   source?: SourceKey; usage_recorded?: boolean;
   model: ModelSelection | null; review_done: boolean;
@@ -37,6 +41,37 @@ const Claims = defineDocFamily<{ value: Claim | null }, null>({ kind: "agent.sou
   version: 1, initial: () => ({ value: null }), checkpointWhen: () => false });
 const WorkOwners = defineDocFamily<{ task_id: string | null }, null>({ kind: "agent.source.work-owner", scope: "session", family: true,
   version: 1, initial: () => ({ task_id: null }), checkpointWhen: () => true });
+
+function workflowInput(evidence: WorkflowEvidence[], batch = false): string {
+  return "Handle this current workflow evidence under the task's configured instructions. " +
+    "Use current provider state and only relevant durable decisions/checkpoints. Do not load earlier job-run transcripts. " +
+    "Complete independent actionable work promptly; retain a concrete recovery date for any blocked item." +
+    (batch ? " This bounded Slack batch owns only the listed originals, not an accumulating conversation." : "") +
+    (evidence.some(item => item.text_complete === false)
+      ? " For every incomplete preview, call read_source_events with keys:[that exact key],limit:1 before judging or acting." : "") + "\n\n" + JSON.stringify(evidence);
+}
+function fitsWorkflowInput(content: string): boolean {
+  try { validateInput(content); return true; }
+  catch (error) { if (error instanceof AttachmentError) return false; throw error; }
+}
+function workflowPackets(records: StoredEvent[], batch = false): { records: StoredEvent[]; content: string }[] {
+  const batches: { records: StoredEvent[]; content: string }[] = [];
+  let selected: StoredEvent[] = [], evidence: WorkflowEvidence[] = [];
+  for (const record of records) {
+    let item: WorkflowEvidence = { key: record.key, event: sourceReviewRecord(record).event };
+    if (selected.length > 0 && !fitsWorkflowInput(workflowInput([...evidence, item], batch))) {
+      batches.push({ records: selected, content: workflowInput(evidence, batch) }); selected = []; evidence = [];
+    }
+    if (!fitsWorkflowInput(workflowInput([item], batch))) {
+      item = { key: record.key, event: { ...item.event, text: item.event.text.slice(0, 2048).replace(/[\uD800-\uDBFF]$/u, "") },
+        text_complete: false, original_text_bytes: Buffer.byteLength(item.event.text) };
+      validateInput(workflowInput([item], batch));
+    }
+    selected.push(record); evidence.push(item);
+  }
+  if (selected.length > 0) batches.push({ records: selected, content: workflowInput(evidence, batch) });
+  return batches;
+}
 const FollowupEffects = defineDocFamily<{ task_id: string; native: TaskId | null; completed: boolean }, null>({
   kind: "agent.source.followup-effect", scope: "session", family: true, version: 1,
   initial: () => ({ task_id: "", native: null, completed: false }), checkpointWhen: () => true });
@@ -548,6 +583,19 @@ export class SourceReviews {
     return [...selected];
   }
 
+  private async admitWorkflowPacketIn(tx: Tx, claim: Claim, packet: WorkflowPacket, content: string): Promise<void> {
+    const keys = packet.records.map(record => record.key).sort(), job = packet.job;
+    const id = scheduledTaskId(`workflow-source:${digest([job.id, job.revision, keys])}`);
+    const created = await this.tasks.createIn(tx, { id, title: `${job.title}: ${packet.records[0]?.event.title ?? "new evidence"}`,
+      outcome: job.prompt, model: job.model, execution: "coordinator",
+      sources: [...new Map(packet.records.map(record => [sourceReference(record.event.source), record.event.source])).values()],
+      workflow: { job, owner_task_id: packet.owner, work_key: packet.work_key } });
+    await this.tasks.enqueueReviewIn(tx, { task_id: created.id, input_id: `source-review:${digest([created.id, keys])}`,
+      content, sender_conversation_id: claim.conversation_id, work_class: job.priority === "critical" ? "critical" : claim.class });
+    await this.journal.decideBatchIn(tx, keys, { type: "task", task_id: created.id }, claim.id, packet.resource);
+    if (!claim.effects.some(effect => effect.type === "task" && effect.task_id === created.id)) claim.effects.push({ type: "task", task_id: created.id });
+  }
+
   async apply(conversationId: string, callId: string, proposals: Proposal[]): Promise<{ accounted: number; superseded: number }> {
     const workflows = await this.callbacks.workflows();
     return this.session.commit(async tx => {
@@ -568,6 +616,22 @@ export class SourceReviews {
         if (entity === undefined || entity.claim_id !== claim.id || entity.decision_revision !== capture.decision_revision) { superseded += capture.keys.length; continue; }
         for (const key of capture.keys) { const record = await this.journal.sourceRecordIn(tx, key);
           if (record?.decision === null) valid.add(key); else superseded++; }
+      }
+      const batchable = new Map<string, string | null>(), batches = new Map<string, WorkflowPacket>();
+      // Decide eligibility across the whole claim before admitting any work.
+      // A protected/current-work proposal vetoes batching its other thread versions.
+      for (const { proposal, keys } of expanded) {
+        const job = proposal.type !== "task" ? undefined : proposal.job_id === null
+          ? workflows.find(item => item.task_id === proposal.task_id) : workflows.find(item => item.job.id === proposal.job_id);
+        for (const key of keys.filter(key => valid.has(key))) {
+          const record = await this.journal.sourceRecordIn(tx, key); if (record === undefined) throw new TaskError("Source original disappeared");
+          const ref = sourceReference(record.event.source);
+          const candidate = proposal.type === "task" && proposal.work_url === null && job !== undefined && job.job.priority !== "critical" &&
+            await this.noisePolicy.canBatchIn(tx, record, claim.id)
+            ? JSON.stringify([job.job.id, job.job.revision, record.event.source.account]) : null;
+          const previous = batchable.get(ref);
+          batchable.set(ref, previous === undefined || previous === candidate ? candidate : null);
+        }
       }
       for (const { proposal, keys: requested } of expanded) {
         const keys = requested.filter(key => valid.has(key)); if (keys.length === 0) continue;
@@ -604,26 +668,20 @@ export class SourceReviews {
             owner.task_id = ownerId;
             const packets = new Map<string, StoredEvent[]>();
             for (const record of records) {
+              const batchKey = JSON.stringify([job.job.id, job.job.revision, record.event.source.account]);
+              if (batchable.get(sourceReference(record.event.source)) === batchKey) {
+                let batch = batches.get(batchKey);
+                if (batch === undefined) { batch = { job: job.job, owner: ownerId,
+                  work_key: "source-batch:" + digest([claim.id, batchKey]), records: [] }; batches.set(batchKey, batch); }
+                batch.records.push(record); continue;
+              }
               const identities = sourceWorkResources(record.event);
               const identity = resource ?? (identities.length === 1 ? identities[0] : undefined) ?? `source:${sourceReference(record.event.source)}`;
               const packet = packets.get(identity) ?? []; packet.push(record); packets.set(identity, packet);
             }
-            for (const [workKey, packet] of packets) {
-              const packetKeys = packet.map(record => record.key).sort();
-              const id = scheduledTaskId(`workflow-source:${digest([job.job.id, job.job.revision, packetKeys])}`);
-              const created = await this.tasks.createIn(tx, { id, title: `${job.job.title}: ${packet[0]?.event.title ?? "new evidence"}`,
-                outcome: job.job.prompt, model: job.job.model, execution: "coordinator",
-                sources: [...new Map(packet.map(record => [sourceReference(record.event.source), record.event.source])).values()],
-                workflow: { job: job.job, owner_task_id: ownerId, work_key: workKey } });
-              const input = "Handle this current workflow evidence under the task's configured instructions. " +
-                "Use current provider state and only relevant durable decisions/checkpoints. Do not load earlier job-run transcripts. " +
-                "Complete independent actionable work promptly; retain a concrete recovery date for any blocked item.\n\n" +
-                JSON.stringify(packet.map(record => ({ key: record.key, event: sourceReviewRecord(record).event })));
-              await this.tasks.enqueueReviewIn(tx, { task_id: created.id, input_id: `source-review:${digest([created.id, packetKeys])}`,
-                content: input, sender_conversation_id: claim.conversation_id,
-                work_class: job.job.priority === "critical" ? "critical" : claim.class });
-              await this.journal.decideBatchIn(tx, packetKeys, { type: "task", task_id: created.id }, claim.id, resource);
-              if (!claim.effects.some(effect => effect.type === "task" && effect.task_id === created.id)) claim.effects.push({ type: "task", task_id: created.id });
+            for (const [workKey, packet] of packets) for (const part of workflowPackets(packet)) {
+              await this.admitWorkflowPacketIn(tx, claim, { job: job.job, owner: ownerId, work_key: workKey, records: part.records,
+                ...(resource === undefined ? {} : { resource }) }, part.content);
             }
             continue;
           }
@@ -668,6 +726,9 @@ export class SourceReviews {
           await this.journal.decideBatchIn(tx, keys, { type: "task", task_id: created.id }, claim.id, resource);
           if (!claim.effects.some(effect => effect.type === "task" && effect.task_id === created.id)) claim.effects.push({ type: "task", task_id: created.id });
         }
+      }
+      for (const packet of batches.values()) for (const batch of workflowPackets(packet.records, true)) {
+        await this.admitWorkflowPacketIn(tx, claim, { ...packet, records: batch.records }, batch.content);
       }
       for (const capture of claim.captures) await this.journal.index.releaseEntityIn(tx, capture.id, claim.id);
       claim.proposal = hash; claim.phase = "applied";

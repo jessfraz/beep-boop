@@ -13,6 +13,7 @@ const CHECK_INTERVAL = 30_000;
 const CRITICAL_TIMEOUT = 120_000;
 const NORMAL_TIMEOUT = 600_000;
 const BATCH = 32;
+const MONITOR_NOTICE = "Workflow status updates are unavailable right now.";
 type Recovery = { kind: "resume" | "wake"; identity: string } | { kind: "continue"; identity: string; input_id: string; content: string; fingerprint: string };
 type Alert = { request_id: string; conversation_id: string; evidence_id: string; text: string };
 type Run = {
@@ -22,7 +23,9 @@ type Run = {
   latest_entry: EntryId | null; input_id: string | null; episode: number; alert: Alert | null;
   recovery: { identity: string; task: TaskId<null> } | null;
 };
-type Aggregate = { pending: number; overdue: number; unavailable: number; checked_at: number; last_progress_at: number | null; blocker: string | null };
+type NoticeProgress = Pick<Run, "status" | "admitted_at" | "last_progress_at">;
+type Aggregate = { pending: number; overdue: number; unavailable: number; checked_at: number; last_progress_at: number | null; blocker: string | null;
+  incident?: { episode: number; active: boolean; notice: TaskId<null> | null } };
 const Runs = defineDocFamily<{ run: Run | null }, null>({ kind: "agent.workflow.progress.run", scope: "session", family: true, version: 1,
   initial: () => ({ run: null }), checkpointWhen: () => true });
 const Jobs = defineDocFamily<Aggregate, null>({ kind: "agent.workflow.progress.job", scope: "session", family: true, version: 1,
@@ -37,11 +40,30 @@ function timeout(run: Pick<Run, "critical">): number { return run.critical ? CRI
 function fingerprint(task: TaskRecord): string { return JSON.stringify([task.summary, task.state, task.agents.map(agent => [agent.id, agent.state])]); }
 function stateFingerprint(task: TaskRecord): string { return JSON.stringify([task.state, task.agents.map(agent => [agent.id, agent.state])]); }
 function recoveryInput(id: string): boolean { return /^(?:background|scheduled|quota|workflow)-(?:recovery|reconcile|wait):/.test(id); }
+function untimedWait(task: TaskRecord): boolean { return task.state.state === "waiting" && task.state.next_check === null && task.pending.length === 0; }
+function clearIncident(aggregate: Aggregate): void {
+  if (aggregate.overdue === 0 && aggregate.unavailable === 0 && aggregate.incident !== undefined) aggregate.incident.active = false;
+}
 function conversationIdentity(value: unknown): value is ConversationId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
 function nativeConversation(value: string): ConversationId {
   const id: unknown = Number(value);
   if (!conversationIdentity(id) || String(id) !== value) throw new Error("Workflow conversation identity is unavailable");
   return id;
+}
+
+function progressNotice(run: NoticeProgress & { title: string }, observedAt: number): string {
+  const title = run.title.trim().replace(/\s+/gu, " ");
+  const name = title.length === 0 ? "This workflow" : title.charAt(0).toLocaleUpperCase() + title.slice(1);
+  if (run.status === "unavailable") return `${name} status is unavailable right now.`;
+  const delayed = `${name} is delayed.`;
+  if (!Number.isFinite(run.last_progress_at) || run.last_progress_at <= 0 || run.last_progress_at > observedAt) {
+    return `${delayed} Its last progress time is unavailable.`;
+  }
+  if (run.last_progress_at <= run.admitted_at) return `${delayed} No progress has been reported yet.`;
+  const minutes = Math.floor((observedAt - run.last_progress_at) / 60_000), hours = Math.floor(minutes / 60);
+  const elapsed = minutes < 1 ? "less than a minute" : hours === 0
+    ? `${minutes} minute${minutes === 1 ? "" : "s"}` : `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${delayed} Last progress was ${elapsed} ago.`;
 }
 
 /** Tracks owned work, rather than the newest run of a job. The ordered index
@@ -50,9 +72,39 @@ export class WorkflowProgress {
   private readonly deadlines = new OrderedIndex<{ id: string }>("agent.workflow.progress.deadline");
   private readonly timer;
   private readonly recovery;
+  private readonly notice;
   private reconciles: ((tx: Tx, taskId: string, conversation: ConversationId, requestId: string) => Promise<boolean>) | undefined;
   constructor(private readonly session: Harness, registry: Registry, private readonly tasks: TaskStore,
     private readonly now: () => number = Date.now) {
+    this.notice = defineTask<{ job_id: string; episode: number; task_id: string; title: string; alert: Alert; progress?: NoticeProgress }, { phase: "publish"; attempt: number }, null>({
+      name: "agent.workflow_progress_notice", version: 1, initial: () => ({ phase: "publish", attempt: 0 }),
+      phases: { publish: async (task, runtime, context) => {
+        try {
+          const root = await session.root(context);
+          await runtime.commit(async tx => {
+            const job = await tx.doc(Jobs, task.input.job_id, null), input = task.input;
+            const prior = await tx.submissionByRequest(root.id, input.alert.request_id);
+            if (prior !== undefined && prior.type !== "write") throw new Error("Workflow notice identity belongs to another submission type");
+            // Eligibility and native admission share a commit. Clearing the
+            // incident cannot race a stale alert into Main; published history stays.
+            if (prior === undefined && job.incident?.episode === input.episode && job.incident.active && job.overdue + job.unavailable > 0) {
+              await root.submit(tx, { type: "write", requestId: input.alert.request_id, entry: { kind: UserNoticeEntry.kind, data: {
+                task_id: input.task_id, source_conversation_id: input.alert.conversation_id, source_entry_id: input.alert.evidence_id,
+                text: input.progress === undefined ? `${input.title} needs attention.` : progressNotice({ title: input.title, ...input.progress }, runtime.now()),
+                notice_origin: { job_id: input.job_id, title: input.title },
+              } } });
+            }
+            return { status: "terminal", outcome: { status: "completed", result: null } };
+          }, context);
+        } catch (error) {
+          if (runtime.signal.aborted) throw error;
+          const attempt = Math.min(6, task.state.checkpoint.attempt + 1);
+          await runtime.commit(() => ({ status: "sleeping", until: runtime.now() + Math.min(60_000, 1000 * 2 ** attempt),
+            checkpoint: { phase: "publish", attempt } }), context);
+        }
+      } },
+      abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+    });
     this.timer = defineTask<Record<string, never>, { phase: "check"; turn: boolean }, null>({
       name: "agent.workflow_progress", version: 1, initial: () => ({ phase: "check", turn: false }),
       phases: { check: async (task, runtime, context) => {
@@ -60,10 +112,8 @@ export class WorkflowProgress {
         const due = await this.deadlines.range(session, "due", { before: timeKey(observedAt + 1, ""), limit: BATCH });
         for (const item of due) {
           runtime.signal.throwIfAborted();
-          let alert: Alert | undefined;
-          try { alert = await this.check(item.value.id, observedAt); }
-          catch (error) { alert = await this.unavailable(item.value.id, observedAt, error); }
-          if (alert !== undefined) await this.publish(alert, item.value.id);
+          try { await this.check(item.value.id, observedAt); }
+          catch (error) { await this.unavailable(item.value.id, observedAt, error); }
         }
         const next = await this.deadlines.range(session, "due", { limit: 1 });
         await runtime.commit(async tx => {
@@ -90,11 +140,13 @@ export class WorkflowProgress {
               const current = await tasks.enqueueWorkflowRecovery(id, recovery.content, recovery.input_id, async (tx, task) => {
                 const run = (await tx.doc(Runs, id, null)).run;
                 const conversation = nativeConversation(task.conversation_id);
+                const live = await tx.doc(LiveDoc, conversation), inbox = await tx.doc(InboxDoc, conversation);
+                const native = run?.input_id == null ? undefined : await tx.submissionByRequest(conversation, run.input_id);
                 const futureWait = task.state.state === "waiting" && task.state.next_check !== null && Date.parse(task.state.next_check) > runtime.now();
+                const externalWait = untimedWait(task) && live.runFailure === undefined && !(native?.type === "input" && native.status === "unanswered");
                 return run !== null && run.active && run.recovery?.identity === recovery.identity && run.fingerprint === recovery.fingerprint &&
-                  task.state.state !== "resolved" && !futureWait &&
-                  (await tx.doc(LiveDoc, conversation)).run === undefined &&
-                  (await tx.doc(InboxDoc, conversation)).items.every(item => item.mode === "write");
+                  task.state.state !== "resolved" && !futureWait && !externalWait &&
+                  live.run === undefined && inbox.items.every(item => item.mode === "write");
               });
               dispatch = current.state.state !== "resolved" && current.pending.some(input => input.id === recovery.input_id);
             }
@@ -113,7 +165,7 @@ export class WorkflowProgress {
       } },
       abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
     });
-    registry.install({ name: "workflow-progress", tasks: [this.timer, this.recovery] });
+    registry.install({ name: "workflow-progress", tasks: [this.timer, this.recovery, this.notice] });
     tasks.useMonitor(this);
   }
   useReceipts(reconciles: (tx: Tx, taskId: string, conversation: ConversationId, requestId: string) => Promise<boolean>): void {
@@ -168,6 +220,7 @@ export class WorkflowProgress {
       await this.scheduleIn(tx, run, task.state.state === "resolved" ? observedAt + CHECK_INTERVAL
         : Number.isFinite(wait) && wait > observedAt ? wait : run.deadline_at);
     }
+    clearIncident(aggregate);
   }
   async trackScheduledIn(tx: Tx, task: TaskRecord, occurrence: ScheduledOccurrence): Promise<void> {
     if (task.workflow === undefined && !task.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === occurrence.job.id)) {
@@ -213,18 +266,33 @@ export class WorkflowProgress {
           const entry = await tx.appendEntry(Evidence, ROOT_CONVERSATION_ID,
             { data: { task_id: null, job_id: null, episode: 0, checked_at: this.now(), blocker } });
           control.unavailable = { request_id: "workflow-monitor-unavailable:" + control.recovery_of,
-            conversation_id: ROOT_CONVERSATION_ID.toString(), evidence_id: entry.id.toString(), text: blocker };
+            conversation_id: ROOT_CONVERSATION_ID.toString(), evidence_id: entry.id.toString(), text: MONITOR_NOTICE };
         }
-        return { ...control.unavailable };
+        return { ...control.unavailable, text: MONITOR_NOTICE };
       }
       control.recovery_of = control.task;
       control.task = await tx.createTask(this.timer, {}, { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
       control.unavailable = null; return undefined;
     }, BACKGROUND_CONTEXT);
-    if (alert !== undefined) await this.publish(alert, null);
+    if (alert !== undefined) await this.publish(alert);
     this.session.resume();
   }
-  private async check(id: string, observedAt: number): Promise<Alert | undefined> {
+  private async stageIncidentIn(tx: Tx, aggregate: Aggregate, run: Run, observedAt: number, legacy: boolean, retained: Alert | null): Promise<void> {
+    aggregate.incident ??= { episode: legacy ? 0 : 1, active: true, notice: null };
+    const incident = aggregate.incident;
+    if (!incident.active) { incident.episode++; incident.active = true; incident.notice = null; }
+    // A legacy incident may already have a native publication. Adopt its first
+    // retained request rather than minting another notice for the same outage.
+    if (incident.notice !== null || incident.episode === 0 && retained === null) return;
+    const saved = incident.episode === 0 ? retained : run.alert;
+    if (saved === null) throw new Error("Workflow incident has no retained alert evidence");
+    const alert = { ...saved, text: progressNotice(run, observedAt), request_id: incident.episode === 0 ? saved.request_id
+      : "workflow-job-progress:" + JSON.stringify([run.job_id, incident.episode]) };
+    incident.notice = await tx.createTask(this.notice, { job_id: run.job_id, episode: incident.episode, task_id: run.task_id, title: run.title, alert,
+      progress: { status: run.status, admitted_at: run.admitted_at, last_progress_at: run.last_progress_at } },
+      { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
+  }
+  private async check(id: string, observedAt: number): Promise<void> {
     return this.session.commit(async tx => {
       const state = await tx.doc(Runs, id, null), run = state.run;
       if (run === null || !run.active) return;
@@ -239,7 +307,7 @@ export class WorkflowProgress {
           (native?.type === "input" && native.status === "done" || run.input_id !== null && native?.status === "unanswered" &&
             await this.reconciles?.(tx, id, conversationId, run.input_id) === true)) {
         aggregate.pending--; if (run.status === "overdue") aggregate.overdue--; if (run.status === "unavailable") aggregate.unavailable--;
-        run.active = false; await this.scheduleIn(tx, run, observedAt); return;
+        run.active = false; clearIncident(aggregate); await this.scheduleIn(tx, run, observedAt); return;
       }
       const latest = run.latest_entry;
       const newEntries = entries.items.filter(entry => latest === null || entry.id > latest);
@@ -252,12 +320,21 @@ export class WorkflowProgress {
         run.status = "normal"; run.blocker = null; run.last_progress_at = progressAt; run.deadline_at = progressAt + timeout(run);
         if (run.alert !== null) { run.episode++; run.alert = null; }
         aggregate.last_progress_at = Math.max(aggregate.last_progress_at ?? 0, progressAt);
+        clearIncident(aggregate);
       }
       const wait = task?.state.state === "waiting" && task.state.next_check !== null ? Date.parse(task.state.next_check) : NaN;
+      if (task !== undefined && !busy && untimedWait(task) && live.runFailure === undefined && !(native?.type === "input" && native.status === "unanswered")) {
+        if (run.status === "overdue") aggregate.overdue--; if (run.status === "unavailable") aggregate.unavailable--;
+        run.status = "normal"; run.blocker = null; run.recovery = null;
+        if (run.alert !== null) { run.episode++; run.alert = null; }
+        clearIncident(aggregate);
+        await this.scheduleIn(tx, run, observedAt + timeout(run)); return;
+      }
       if (task !== undefined && !busy && task.pending.length === 0 && Number.isFinite(wait) && wait > observedAt) {
         await this.scheduleIn(tx, run, wait); return;
       }
       if (observedAt < run.deadline_at) { await this.scheduleIn(tx, run, run.deadline_at); return; }
+      const legacy = aggregate.overdue + aggregate.unavailable > 0, retained = run.alert;
       const unavailable = task === undefined;
       if (run.status === "overdue") aggregate.overdue--; if (run.status === "unavailable") aggregate.unavailable--;
       run.status = unavailable ? "unavailable" : "overdue";
@@ -278,8 +355,9 @@ export class WorkflowProgress {
         const evidence = await tx.appendEntry(Evidence, conversationId,
           { data: { task_id: id, job_id: run.job_id, episode: run.episode, checked_at: observedAt, blocker: run.blocker } });
         run.alert = { request_id: `workflow-progress:${id}:${run.episode}`, conversation_id: run.conversation_id, evidence_id: evidence.id.toString(),
-          text: `${run.title} needs attention: ${run.blocker}. Last verified progress: ${new Date(run.last_progress_at).toISOString()}. Task: ${id}.` };
+          text: progressNotice(run, observedAt) };
       }
+      await this.stageIncidentIn(tx, aggregate, run, observedAt, legacy, retained);
       let recovery: Recovery | undefined;
       if (!unavailable && !busy && !failedRecovery) {
         if (originalFailure?.requestId !== undefined && live.runFailure !== undefined &&
@@ -300,14 +378,14 @@ export class WorkflowProgress {
         run.recovery = { identity: recovery.identity, task: nativeTask };
       }
       await this.scheduleIn(tx, run, observedAt + timeout(run));
-      return { ...run.alert };
     }, BACKGROUND_CONTEXT);
   }
-  private async unavailable(id: string, observedAt: number, error: unknown): Promise<Alert | undefined> {
+  private async unavailable(id: string, observedAt: number, error: unknown): Promise<void> {
     return this.session.commit(async tx => {
       const run = (await tx.doc(Runs, id, null)).run;
       if (run === null || !run.active) return;
       const aggregate = await tx.doc(Jobs, run.job_id, null);
+      const legacy = aggregate.overdue + aggregate.unavailable > 0, retained = run.alert;
       if (run.status === "overdue") aggregate.overdue--;
       if (run.status !== "unavailable") aggregate.unavailable++;
       run.status = "unavailable";
@@ -317,18 +395,16 @@ export class WorkflowProgress {
         const evidence = await tx.appendEntry(Evidence, ROOT_CONVERSATION_ID,
           { data: { task_id: id, job_id: run.job_id, episode: run.episode, checked_at: observedAt, blocker: run.blocker } });
         run.alert = { request_id: `workflow-progress:${id}:${run.episode}`, conversation_id: ROOT_CONVERSATION_ID.toString(),
-          evidence_id: evidence.id.toString(), text: `${run.title} needs attention: ${run.blocker}. Task: ${id}.` };
+          evidence_id: evidence.id.toString(), text: progressNotice(run, observedAt) };
       }
+      await this.stageIncidentIn(tx, aggregate, run, observedAt, legacy, retained);
       await this.scheduleIn(tx, run, observedAt + timeout(run));
-      return { ...run.alert };
     }, BACKGROUND_CONTEXT);
   }
-  private async publish(alert: Alert, id: string | null): Promise<void> {
+  private async publish(alert: Alert): Promise<void> {
     const root = await this.session.root(BACKGROUND_CONTEXT);
-    const run = id === null ? undefined : (await this.session.snapshot(Runs, id, BACKGROUND_CONTEXT))?.run ?? undefined;
     await root.submit({ type: "write", requestId: alert.request_id, entry: { kind: UserNoticeEntry.kind, data: {
-      task_id: id, source_conversation_id: alert.conversation_id, source_entry_id: alert.evidence_id,
-      text: alert.text, ...(run === undefined ? {} : { notice_origin: { job_id: run.job_id, title: run.title } }),
+      task_id: null, source_conversation_id: alert.conversation_id, source_entry_id: alert.evidence_id, text: alert.text,
     } } }, BACKGROUND_CONTEXT);
   }
   async status(jobId: string): Promise<JobProgress> {

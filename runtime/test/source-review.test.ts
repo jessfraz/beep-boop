@@ -13,12 +13,14 @@ import { openConversationDatabase } from "../src/conversation-database.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import type { ScheduledJobStatus } from "../src/generated/ScheduledJobStatus.js";
 import type { SourceEvent } from "../src/generated/SourceEvent.js";
+import type { SourceBatch } from "../src/generated/SourceBatch.js";
 import type { SourceReviewDecision } from "../src/generated/SourceReviewDecision.js";
 import type { TaskOutcome } from "../src/generated/TaskOutcome.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import { ConversationModels } from "../src/models.js";
 import { createGuidance } from "../src/guidance.js";
 import { SourceReviews, type SourceReviewOptions } from "../src/source-review.js";
-import { SourceJournal } from "../src/sources.js";
+import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { TaskStore, type HostCall, type SearchQuery } from "../src/tasks.js";
 import { UserNoticeEntry } from "../src/transcript.js";
 import { Executions } from "../src/tools.js";
@@ -71,6 +73,13 @@ function event(id: string, thread = id, text = "Retained source evidence", provi
   return { id, version: "v1", source: { provider, account: "example", thread_id: thread }, title: "Example " + id,
     text, occurred_at: Date.now() };
 }
+function packetEvidence(task: TaskRecord): Record<string, unknown>[] {
+  assert.equal(task.pending.length, 1);
+  const content = task.pending[0]?.content; assert.ok(content);
+  const evidence: unknown = JSON.parse(content.slice(content.lastIndexOf("\n\n") + 2));
+  assert.ok(Array.isArray(evidence));
+  return evidence.map((item: unknown) => { assert.ok(object(item)); return item; });
+}
 async function admit(journal: SourceJournal, events: SourceEvent[]): Promise<void> {
   const first = events[0]; assert.ok(first);
   const source = { provider: first.source.provider, account: first.source.account };
@@ -107,7 +116,7 @@ async function open(path: string, options: SourceReviewOptions = {}, workflows: 
   }, { workers: 2, ...options });
   registry.install(reviews.tools);
   await session.root(BACKGROUND_CONTEXT); await tasks.prepare(); await sources.prepare();
-  return { session, storage, tasks, sources, reviews, faux, bound };
+  return { session, storage, tasks, sources, reviews, faux, bound, registry, executions };
 }
 
 test("reserved email actor drains old and new mail across accounts while three Slack reviews are held", { timeout: 15_000 }, async () => {
@@ -538,6 +547,187 @@ test("retained GitHub decisions preserve their owner while configured workflow e
         "A shared resource cannot replace the explicitly selected configured workflow's actor");
       assert.deepEqual(await reopened.sources.events({ pending: true }), []);
     } finally { await reopened.session.close(BACKGROUND_CONTEXT); }
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("ordinary Slack proposals share one bounded workflow packet and replay keeps that exact admission after reopen", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-slack-workflow-batch-")), path = join(directory, "session.sqlite");
+  const job: ScheduledJobStatus = { job: { id: "brief-review", title: "Evidence brief", prompt: "Review current evidence under the configured policy.",
+    model: fixtureModel, timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "brief-owner" };
+  let app = await open(path, { maximumEntities: 4 }, [job]); const controller = new AbortController();
+  let proposals: SourceReviewDecision[] = [], reviewer = "";
+  const originals = Array.from({ length: 6 }, (_, index) => ({ ...event("ordinary-" + index, `CEXAMPLE:1700000000.${index}`,
+    "A complete ordinary service observation " + index), attention: "ordinary" } satisfies SourceEvent));
+  try {
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    assert.ok(job.task_id);
+    const owner = await app.tasks.create({ id: job.task_id, title: job.job.title, outcome: job.job.prompt,
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }] });
+    const ownerConversation = await app.tasks.conversation(owner.conversation_id);
+    await (await ownerConversation.submit({ type: "write", entry: { kind: "fixture.previous_work", model: [{ role: "user", content: "OLDER_WORKFLOW_TRANSCRIPT", timestamp: 1 }] } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    await admit(app.sources, originals);
+    app.faux.setResponses([input => { proposals = groups(input).map(group => routed([group], { job_id: job.job.id }));
+      assert.equal(proposals.length, 4); return answer(proposals, "batch-all-proposals"); },
+    async input => { toolResult(input); reviewer = (await app.reviews.diagnostics()).active_reviews[0]?.conversation_id ?? ""; return fauxAssistantMessage(""); }]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const packets = (await app.tasks.list()).filter(task => task.workflow?.job.id === job.job.id);
+    assert.equal(packets.length, 1, "One claim must batch ordinary threads across separate routing proposals");
+    const batch = packets[0]; assert.ok(batch); assert.match(batch.workflow?.work_key ?? "", /^source-batch:/u);
+    const evidence = packetEvidence(batch), keys = evidence.map(item => item.key);
+    assert.equal(evidence.length, 4); assert.equal(batch.sources.length, 4); assert.notEqual(batch.conversation_id, owner.conversation_id);
+    assert.doesNotMatch(batch.pending[0]?.content ?? "", /OLDER_WORKFLOW_TRANSCRIPT/u);
+    const originalsByKey = new Map((await app.sources.events({ limit: 20 })).map(record => [record.key, record.event]));
+    for (const item of evidence) { assert.equal(typeof item.key, "string"); assert.deepEqual(item.event, originalsByKey.get(String(item.key))); }
+    assert.deepEqual(new Set((await app.sources.events()).filter(record => record.decision?.type === "task").map(record => record.key)), new Set(keys));
+    assert.deepEqual(await app.reviews.apply(reviewer, "batch-all-proposals", proposals), { accounted: 4, superseded: 0 });
+    await app.session.close(BACKGROUND_CONTEXT);
+    app = await open(path, { maximumEntities: 4 }, [job]); app.tasks.wakeBackground = id => app.tasks.get(id);
+    assert.deepEqual(await app.tasks.get(batch.id), batch);
+    assert.deepEqual(await app.reviews.apply(reviewer, "batch-all-proposals", proposals), { accounted: 4, superseded: 0 });
+    await admit(app.sources, originals);
+    assert.equal((await app.tasks.list()).filter(task => task.workflow !== undefined).length, 1);
+    app.faux.setResponses([input => answer(groups(input).map(group => routed([group], { job_id: job.job.id })), "next-batch"), fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const later = (await app.tasks.list()).filter(task => task.workflow?.job.id === job.job.id && task.id !== batch.id);
+    assert.equal(later.length, 1); assert.equal(packetEvidence(later[0]!).length, 2);
+    assert.notEqual(later[0]?.conversation_id, batch.conversation_id); assert.notEqual(later[0]?.workflow?.work_key, batch.workflow?.work_key);
+    assert.deepEqual(await app.tasks.get(batch.id), batch, "A later claim cannot append to or mutate the first batch");
+    assert.equal((await app.tasks.get(owner.id)).pending.length, 0);
+    assert.deepEqual(await app.sources.events({ pending: true }), []);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("Slack batching preserves protected, unknown, tracked, user-owned, critical and email work", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-slack-batch-protection-"));
+  const normal: ScheduledJobStatus = { job: { id: "brief-review", title: "Evidence brief", prompt: "Review current evidence.", model: fixtureModel,
+    timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "brief-owner" };
+  const critical: ScheduledJobStatus = { ...normal, job: { ...normal.job, id: "urgent-review", priority: "critical" }, task_id: "urgent-owner" };
+  const app = await open(join(directory, "session.sqlite"), {}, [normal, critical]), controller = new AbortController();
+  const ordinary = (id: string, channel: string, text = "Complete ordinary source evidence") => ({ ...event(id, `${channel}:1700000000.1`, text), attention: "ordinary" } satisfies SourceEvent);
+  try {
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    const userSignal = ordinary("user-owned", "CUSER"), tracked = ordinary("tracked", "CTRACKED");
+    const user = await app.tasks.create({ id: "user-owner", title: "User-chosen work", outcome: "Preserve the current user request", sources: [userSignal.source] });
+    await app.tasks.enqueue(user.id, "Keep this current user decision.", "trusted-user-input", undefined, "steer", undefined, "cli");
+    const current = (await app.tasks.get(user.id)).pending[0]; assert.ok(current);
+    const existing = await app.tasks.create({ id: "tracked-owner", title: "Existing tracked work", outcome: "Preserve its scope", sources: [tracked.source] });
+    const sameThread = ordinary("mixed-ordinary", "CMIXED");
+    const signals: SourceEvent[] = [ordinary("ordinary-a", "CNOISEA"), ordinary("ordinary-b", "CNOISEB"),
+      { ...ordinary("direct", "DEXAMPLE"), attention: "direct" },
+      { ...ordinary("mention", "CMENTION", "Please check <@UEXAMPLE>"), attention: "mention" },
+      { ...ordinary("protected", "GPRIVATE"), attention: "protected" }, event("unknown", "CUNKNOWN:1700000000.1"),
+      ordinary("empty", "CEMPTY", ""), ordinary("resource", "CRESOURCE", "Current https://github.com/example/project/issues/42"),
+      sameThread, { ...ordinary("mixed-mention", "CMIXED", "Please check <@UEXAMPLE>"), source: sameThread.source, attention: "mention" },
+      userSignal, tracked, ordinary("critical-a", "CURGENTA"), ordinary("critical-b", "CURGENTB")];
+    await admit(app.sources, signals);
+    app.faux.setResponses([input => answer(groups(input).map(group => routed([group], group.originals.includes("user-owned") ? { task_id: user.id }
+      : { job_id: group.originals.some(id => id.startsWith("critical-")) ? critical.job.id : normal.job.id }))), fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const tasks = await app.tasks.list(), batches = tasks.filter(task => task.workflow?.work_key.startsWith("source-batch:"));
+    assert.equal(batches.length, 1); const batch = batches[0]; assert.ok(batch);
+    const evidence = packetEvidence(batch);
+    assert.deepEqual(new Set(evidence.map(item => object(item.event) ? item.event.id : null)), new Set(["ordinary-a", "ordinary-b"]));
+    const saved = await app.sources.events({ provider: "slack", limit: 30 });
+    for (const signal of signals.filter(signal => !signal.id.startsWith("ordinary-"))) {
+      const record = saved.find(record => record.event.id === signal.id); assert.ok(record?.decision?.type === "task");
+      assert.notEqual(record.decision.task_id, batch.id);
+    }
+    assert.deepEqual((await app.tasks.get(user.id)).pending[0], current); assert.equal((await app.tasks.get(user.id)).pending.length, 2);
+    assert.deepEqual(await app.tasks.get(existing.id), existing);
+    const urgent = tasks.filter(task => task.workflow?.job.id === critical.job.id);
+    assert.equal(urgent.length, 2); assert.ok(urgent.every(task => !task.workflow?.work_key.startsWith("source-batch:")));
+    const mail = [event("mail-a", "mail-a", "Important email evidence", "google"), event("mail-b", "mail-b", "Separate email evidence", "google")];
+    await admit(app.sources, mail);
+    app.faux.setResponses([input => answer(groups(input).map(group => routed([group], { job_id: normal.job.id }))), fauxAssistantMessage("")]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const email = (await app.tasks.list()).filter(task => task.sources.some(source => source.provider === "google"));
+    assert.equal(email.length, 2); assert.ok(email.every(task => !task.workflow?.work_key.startsWith("source-batch:")));
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("Slack batch chunks obey the native UTF-8 input bound without changing their exact originals", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-slack-batch-bytes-")), path = join(directory, "session.sqlite");
+  const job: ScheduledJobStatus = { job: { id: "brief-review", title: "Evidence brief", prompt: "Review exact current source evidence.", model: fixtureModel,
+    timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "brief-owner" };
+  let app = await open(path, {}, [job]); const controller = new AbortController();
+  try {
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    const model = app.tasks.inference.models.getModel("openai", "fixture"); assert.ok(model); model.contextWindow = 256 * 1024;
+    const originals = Array.from({ length: 3 }, (_, index) => ({ ...event("unicode-" + index, `CUNICODE:1700000000.${index}`, "🚀".repeat(8200)), attention: "ordinary" } satisfies SourceEvent));
+    await admit(app.sources, originals);
+    app.faux.setResponses([input => { assert.equal(groups(input).length, 3); return answer(groups(input).map(group => routed([group], { job_id: job.job.id }))); },
+      input => { toolResult(input); return fauxAssistantMessage(""); }]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const chunks = (await app.tasks.list()).filter(task => task.workflow?.job.id === job.job.id);
+    assert.equal(chunks.length, 3, "Two full Unicode bodies already exceed the native byte limit before their envelope");
+    for (const task of chunks) {
+      assert.match(task.workflow?.work_key ?? "", /^source-batch:/u);
+      assert.ok(Buffer.byteLength(task.pending[0]?.content ?? "") <= 65536);
+      assert.equal(packetEvidence(task).length, 1);
+    }
+    assert.deepEqual(new Set(chunks.flatMap(task => packetEvidence(task).map(item => object(item.event) ? item.event.id : null))), new Set(originals.map(event => event.id)));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, {}, [job]);
+    for (const chunk of chunks) assert.deepEqual(await app.tasks.get(chunk.id), chunk);
+    assert.deepEqual(new Set((await app.sources.events({ limit: 10 })).map(record => record.event.text)), new Set(originals.map(event => event.text)));
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const { encoding, body, provider, critical } of [
+  { encoding: "Unicode", body: "🧭".repeat(16384), provider: "slack", critical: false },
+  { encoding: "JSON escaping", body: "\u0000".repeat(65536), provider: "slack", critical: false },
+  { encoding: "legacy plain text", body: "x".repeat(1_500_000), provider: "slack", critical: false },
+  { encoding: "transport-sized JSON escaping", body: "\u0000".repeat(Math.floor((2 * 1024 * 1024 - 4096) / 6)), provider: "slack", critical: false },
+  { encoding: "protected critical email", body: "x".repeat(1_500_000), provider: "google", critical: true },
+]) test(`an oversized source original (${encoding}) gets a bounded preview and remains readable by the real worker after reopen`, { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-slack-batch-large-")), path = join(directory, "session.sqlite");
+  const job: ScheduledJobStatus = { job: { id: "brief-review", title: "Evidence brief", prompt: "Review exact current source evidence.", model: fixtureModel,
+    priority: critical ? "critical" : "normal", timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "brief-owner" };
+  let app = await open(path, {}, [job]); const controller = new AbortController();
+  try {
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    const large = { ...event("oversized-body", "CLARGE:1700000000.1", body, provider), attention: critical ? "protected" : "ordinary" } satisfies SourceEvent;
+    const batch: SourceBatch = { source: { provider, account: large.source.account }, events: [large], checkpoint: null, coverage: { status: "complete" } };
+    assert.ok(Buffer.byteLength(JSON.stringify(batch)) <= 2 * 1024 * 1024, "The original fits the existing serialized source transport contract");
+    await app.sources.admit(batch, null);
+    let routingError = "";
+    app.faux.setResponses([input => answer([routed(groups(input), { job_id: job.job.id })]),
+      input => { const reply = input.messages.findLast(message => message.role === "toolResult" && message.toolName === "review_sources"); assert.ok(reply?.role === "toolResult");
+        if (reply.isError) routingError = toolResult(input, "review_sources", true);
+        else toolResult(input); return fauxAssistantMessage(""); }]);
+    assert.equal(await app.reviews.review(0, controller.signal).catch(error => {
+      throw new Error("The original must be admitted without a retry loop: " + routingError, { cause: error });
+    }), true);
+    const record = (await app.sources.events({ limit: 10 })).find(record => record.event.id === large.id); assert.ok(record?.decision?.type === "task");
+    const packet = await app.tasks.get(record.decision.task_id), retained = packet.pending[0]; assert.ok(retained);
+    if (critical) {
+      assert.doesNotMatch(packet.workflow?.work_key ?? "", /^source-batch:/u);
+      assert.deepEqual(packet.sources, [large.source]);
+      const native = await app.tasks.conversation(packet.conversation_id);
+      await app.session.commit(async tx => {
+        assert.equal(await app.tasks.inference.workClassIn(tx, native), "critical");
+        assert.equal(await app.tasks.inference.workGroupIn(tx, native), job.job.id);
+      }, BACKGROUND_CONTEXT);
+    }
+    assert.ok(Buffer.byteLength(retained.content) <= 65536); assert.match(retained.content, /read_source_events/u);
+    const view = packetEvidence(packet)[0]; assert.ok(view && object(view.event));
+    assert.equal(view.key, record.key); assert.equal(view.text_complete, false); assert.equal(view.original_text_bytes, Buffer.byteLength(large.text));
+    assert.ok(typeof view.event.text === "string" && view.event.text.length < large.text.length);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(path, {}, [job]);
+    assert.deepEqual((await app.tasks.get(packet.id)).pending, packet.pending);
+    assert.deepEqual((await app.sources.originals([record.key]))[0]?.event, large);
+    const worker = createSourceTools(app.sources, app.executions).worker; app.registry.install(worker);
+    const conversation = await app.tasks.conversation(packet.conversation_id);
+    await app.tasks.inference.configure(conversation, fixtureModel, { extensions: [worker], instructions: "Read the exact retained original before acting." });
+    app.faux.setResponses([fauxAssistantMessage(fauxToolCall("read_source_events", { keys: [record.key], limit: 1 }), { stopReason: "toolUse" }),
+      input => { const output = toolResult(input, "read_source_events");
+        assert.ok(Buffer.byteLength(output) > 50 * 1024 && Buffer.byteLength(output) <= 4 * 1024 * 1024);
+        if (encoding.includes("escaping")) assert.ok(Buffer.byteLength(output) > 128 * 1024);
+        const reply: unknown = JSON.parse(output); assert.ok(object(reply) && Array.isArray(reply.events));
+        assert.equal(reply.complete, true); assert.equal(reply.cursor, null);
+        const original: unknown = reply.events[0]; assert.ok(object(original)); assert.deepEqual(original.event, large);
+        return fauxAssistantMessage("The exact original was read without losing its Unicode body."); }]);
+    const completed = await (await conversation.submit({ type: "input", requestId: retained.id, content: retained.content }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    assert.equal(completed.status, "done", JSON.stringify(completed).slice(0, 1800)); assert.equal(completed.requestId, retained.id);
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

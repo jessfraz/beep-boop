@@ -64,6 +64,15 @@ export class SourceNoisePolicy {
     // identity and name. Renamed/converted, private and unknown history stays protected.
     return hint?.attention === "ordinary" && hint.title === event.title;
   }
+  /** Batching needs positive current classification, including a real body.
+   * Older empty Slack originals may omit rich content and cannot establish safety. */
+  async canBatchIn(tx: Tx, record: SourceRecord, claimId: string): Promise<boolean> {
+    if ((record.attention ?? record.event.attention) !== "ordinary" || record.event.text.trim().length === 0 ||
+        record.work_resource !== undefined || sourceWorkResources(record.event).length > 0 || !await this.ordinaryIn(tx, record)) return false;
+    const entity = await this.journal.index.entityIn(tx, sourceEntityId(record));
+    return entity !== undefined && entity.claim_id === claimId && entity.owner_task_id === null &&
+      (await this.journal.tasks.sourceLinksIn(tx, [record.event.source], 1)).length === 0;
+  }
   async sweep(now = Date.now(), owns?: (tx: Tx) => Promise<boolean>): Promise<{ scanned: number; expired: number; coalesced: number; more: boolean }> {
     await this.journal.prepare();
     await this.journal.tasks.prepare();

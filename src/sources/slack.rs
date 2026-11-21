@@ -86,6 +86,10 @@ struct Message {
     thread_ts: Option<String>,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
+    #[serde(default)]
+    blocks: Vec<Block>,
     channel: Channel,
     edited: Option<Edited>,
 }
@@ -103,8 +107,315 @@ struct Edited {
     ts: String,
 }
 
+// Slack's top-level text is only a notification fallback when blocks are used.
+// Attachments and Block Kit contain the actual alert, mentions and work links.
+// https://docs.slack.dev/legacy/legacy-messaging/legacy-secondary-message-attachments/
+// https://docs.slack.dev/reference/block-kit/blocks/rich-text-block/
+#[derive(Deserialize)]
+struct Attachment {
+    fallback: Option<String>,
+    pretext: Option<String>,
+    author_name: Option<String>,
+    title: Option<String>,
+    title_link: Option<String>,
+    text: Option<String>,
+    image_url: Option<String>,
+    thumb_url: Option<String>,
+    #[serde(default)]
+    fields: Vec<AttachmentField>,
+    footer: Option<String>,
+    #[serde(default)]
+    blocks: Vec<Block>,
+}
+
+#[derive(Deserialize)]
+struct AttachmentField {
+    title: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TextObject {
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Block {
+    Section {
+        text: Option<TextObject>,
+        #[serde(default)]
+        fields: Vec<TextObject>,
+        accessory: Option<Box<Block>>,
+    },
+    Header {
+        text: TextObject,
+    },
+    Context {
+        elements: Vec<Block>,
+    },
+    Actions {
+        elements: Vec<Block>,
+    },
+    RichText {
+        elements: Vec<Block>,
+    },
+    RichTextSection {
+        elements: Vec<Block>,
+    },
+    RichTextList {
+        elements: Vec<Block>,
+    },
+    RichTextQuote {
+        elements: Vec<Block>,
+    },
+    RichTextPreformatted {
+        elements: Vec<Block>,
+    },
+    Text {
+        text: String,
+    },
+    PlainText {
+        text: String,
+    },
+    Mrkdwn {
+        text: String,
+    },
+    Markdown {
+        text: String,
+    },
+    Link {
+        url: String,
+        text: Option<String>,
+    },
+    AttachmentMention {
+        url: String,
+        text: Option<String>,
+    },
+    User {
+        user_id: String,
+    },
+    Usergroup {
+        usergroup_id: String,
+    },
+    Broadcast {
+        range: String,
+    },
+    Channel {
+        channel_id: String,
+    },
+    Emoji {
+        name: String,
+    },
+    Button {
+        text: TextObject,
+        url: Option<String>,
+    },
+    Image {
+        alt_text: String,
+        image_url: Option<String>,
+    },
+    Divider,
+    #[serde(other)]
+    Unknown,
+}
+
+const CONTENT_BYTES: usize = 64 * 1024;
+const CONTENT_PARTS: usize = 256;
+const CONTENT_DEPTH: usize = 12;
+const INCOMPLETE_CONTENT: &str =
+    "[Slack content incomplete: unsupported or bounded rich content; read the native message.]";
+
+struct MessageContent {
+    text: String,
+    parts: usize,
+    incomplete: bool,
+}
+
+impl MessageContent {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            parts: 0,
+            incomplete: false,
+        }
+    }
+
+    fn visit(&mut self, depth: usize) -> bool {
+        if self.parts == CONTENT_PARTS || depth > CONTENT_DEPTH {
+            self.incomplete = true;
+            return false;
+        }
+        self.parts += 1;
+        true
+    }
+
+    fn push(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let separator = usize::from(!self.text.is_empty());
+        let available = (CONTENT_BYTES - INCOMPLETE_CONTENT.len() - 1)
+            .saturating_sub(self.text.len() + separator);
+        let mut end = text.len().min(available);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < text.len() {
+            self.incomplete = true;
+        }
+        if end > 0 {
+            if separator > 0 {
+                self.text.push('\n');
+            }
+            self.text.push_str(&text[..end]);
+        }
+    }
+
+    fn blocks(&mut self, blocks: &[Block], depth: usize) {
+        for block in blocks {
+            if !self.visit(depth) {
+                break;
+            }
+            match block {
+                Block::Section {
+                    text,
+                    fields,
+                    accessory,
+                } => {
+                    if let Some(text) = text {
+                        self.push(&text.text);
+                    }
+                    for field in fields {
+                        if !self.visit(depth) {
+                            break;
+                        }
+                        self.push(&field.text);
+                    }
+                    if let Some(accessory) = accessory {
+                        self.blocks(std::slice::from_ref(accessory), depth + 1);
+                    }
+                }
+                Block::Header { text } => self.push(&text.text),
+                Block::Context { elements }
+                | Block::Actions { elements }
+                | Block::RichText { elements }
+                | Block::RichTextSection { elements }
+                | Block::RichTextList { elements }
+                | Block::RichTextQuote { elements }
+                | Block::RichTextPreformatted { elements } => self.blocks(elements, depth + 1),
+                Block::Text { text }
+                | Block::PlainText { text }
+                | Block::Mrkdwn { text }
+                | Block::Markdown { text } => self.push(text),
+                Block::Link { url, text } | Block::AttachmentMention { url, text } => {
+                    if let Some(text) = text {
+                        self.push(text);
+                    }
+                    self.push(url);
+                }
+                Block::User { user_id } => self.push(&format!("<@{user_id}>")),
+                Block::Usergroup { usergroup_id } => {
+                    self.push(&format!("<!subteam^{usergroup_id}>"));
+                }
+                Block::Broadcast { range } => self.push(&format!("<!{range}>")),
+                Block::Channel { channel_id } => self.push(&format!("<#{channel_id}>")),
+                Block::Emoji { name } => self.push(&format!(":{name}:")),
+                Block::Button { text, url } => {
+                    self.push(&text.text);
+                    if let Some(url) = url {
+                        self.push(url);
+                    }
+                }
+                Block::Image {
+                    alt_text,
+                    image_url,
+                } => {
+                    self.push(alt_text);
+                    if let Some(url) = image_url {
+                        self.push(url);
+                    }
+                    // Alt text is evidence, not the unseen image's full content.
+                    self.incomplete = true;
+                }
+                Block::Divider => {}
+                Block::Unknown => self.incomplete = true,
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.incomplete {
+            if !self.text.is_empty() {
+                self.text.push('\n');
+            }
+            self.text.push_str(INCOMPLETE_CONTENT);
+        }
+    }
+}
+
 impl Message {
-    fn attention(&self) -> SourceAttention {
+    fn content(&self) -> MessageContent {
+        let mut rich = MessageContent::new();
+        for attachment in &self.attachments {
+            if !rich.visit(0) {
+                break;
+            }
+            for text in [
+                &attachment.fallback,
+                &attachment.pretext,
+                &attachment.author_name,
+                &attachment.title,
+                &attachment.title_link,
+                &attachment.text,
+                &attachment.footer,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                rich.push(text);
+            }
+            for field in &attachment.fields {
+                if !rich.visit(0) {
+                    break;
+                }
+                if let Some(title) = &field.title {
+                    rich.push(title);
+                }
+                if let Some(value) = &field.value {
+                    rich.push(value);
+                }
+            }
+            for url in [&attachment.image_url, &attachment.thumb_url]
+                .into_iter()
+                .flatten()
+            {
+                rich.push(url);
+                rich.incomplete = true;
+            }
+            rich.blocks(&attachment.blocks, 0);
+        }
+        rich.blocks(&self.blocks, 0);
+        // Suppress only an exact whole-body notification mirror. Repeated
+        // sections and field values retain their order and meaning.
+        // Existing provider text remains lossless under the native page-size
+        // guard. Only newly extracted rich content uses the smaller budget.
+        let mut content = MessageContent {
+            text: self.text.clone(),
+            parts: rich.parts,
+            incomplete: rich.incomplete,
+        };
+        if !rich.text.is_empty() && rich.text != self.text {
+            if !content.text.is_empty() {
+                content.text.push('\n');
+            }
+            content.text.push_str(&rich.text);
+        }
+        content.finish();
+        content
+    }
+
+    fn attention(&self, content: &MessageContent) -> SourceAttention {
         // Any positive direct-message evidence wins over missing or conflicting
         // flags. Prefixes are only a conservative positive guard, never proof
         // that another conversation is ordinary.
@@ -119,9 +430,14 @@ impl Message {
         // mentions would require additional identity and group-membership reads.
         if ["<@", "<!subteam", "<!here", "<!channel", "<!everyone"]
             .iter()
-            .any(|prefix| self.text.contains(prefix))
+            .any(|prefix| content.text.contains(prefix))
         {
             return SourceAttention::Mention;
+        }
+        // Omitted or unsupported content cannot establish that an unseen
+        // mention or tracked resource is absent. Keep such messages lossless.
+        if content.incomplete {
+            return SourceAttention::Protected;
         }
         // Search omits is_im on ordinary public results. Slack documents DMs
         // and MPIMs as private, so explicit public evidence is sufficient;
@@ -245,13 +561,14 @@ impl SlackSource {
                 };
                 let title = format!("Slack: {channel}");
                 let occurred_at = message_millis(&message.ts);
-                let attention = Some(message.attention());
+                let content = message.content();
+                let attention = Some(message.attention(&content));
                 let legacy_version = message.edited.map_or(message.ts, |edited| edited.ts);
                 // Search can return edited text without an edited timestamp.
                 // Version the normalized immutable content, excluding cursors
                 // and other polling metadata.
                 let mut digest = Sha256::new();
-                for part in [&thread_id, &title, &message.text] {
+                for part in [&thread_id, &title, &content.text] {
                     digest.update((part.len() as u64).to_be_bytes());
                     digest.update(part.as_bytes());
                 }
@@ -268,7 +585,7 @@ impl SlackSource {
                         thread_id,
                     },
                     title,
-                    text: message.text,
+                    text: content.text,
                 })
             })
             .collect();
@@ -509,6 +826,203 @@ mod tests {
         serde_json::from_str::<AttentionEvent>(&serde_json::to_string(event).unwrap())
             .unwrap()
             .attention
+    }
+
+    fn rich_event(content: &str, channel: &str) -> SourceEvent {
+        let response = format!(
+            r#"{{"ok":true,"messages":{{"matches":[{{"ts":"1700000000.000001","text":"","channel":{{"id":"{channel}","name":"service-alerts","is_private":false}},{content}}}],"paging":{{"next_cursor":""}}}}}}"#
+        );
+        let source = source();
+        let batch = source.normalize(
+            output(&response),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        batch.events.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn native_rich_content_retains_attachment_alerts_and_block_work_links() {
+        let event = rich_event(
+            r#""attachments":[{"fallback":"Production service is unavailable","pretext":"Recovery needed","title":"Deployment failed","title_link":"https://github.com/example/service/issues/42","text":"Three workers cannot start","fields":[{"title":"Region","value":"example-west"}],"footer":"Monitor example"}],"blocks":[{"type":"section","text":{"type":"mrkdwn","text":"Owner has acknowledged the incident"},"fields":[{"type":"plain_text","text":"Severity: high"}]},{"type":"context","elements":[{"type":"mrkdwn","text":"Next check at 15:00"}]}]"#,
+            "CEXAMPLE",
+        );
+        for content in [
+            "Production service is unavailable",
+            "Recovery needed",
+            "Deployment failed",
+            "https://github.com/example/service/issues/42",
+            "Three workers cannot start",
+            "Region",
+            "example-west",
+            "Monitor example",
+            "Owner has acknowledged the incident",
+            "Severity: high",
+            "Next check at 15:00",
+        ] {
+            assert!(
+                event.text.contains(content),
+                "Missing rich evidence: {content}"
+            );
+        }
+        assert_eq!(attention(&event).as_deref(), Some("ordinary"));
+        let consumed: SourceEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(consumed.text, event.text);
+        assert_eq!(consumed.version, event.version);
+    }
+
+    #[test]
+    fn native_rich_content_protects_embedded_mentions_and_retains_resource_urls() {
+        for mention in [
+            r#"{"type":"user","user_id":"UEXAMPLE"}"#,
+            r#"{"type":"usergroup","usergroup_id":"SEXAMPLE"}"#,
+            r#"{"type":"broadcast","range":"here"}"#,
+        ] {
+            let content = format!(
+                r#""attachments":[{{"blocks":[{{"type":"rich_text","elements":[{{"type":"rich_text_list","elements":[{{"type":"rich_text_section","elements":[{{"type":"text","text":"Please review "}},{mention},{{"type":"link","url":"https://github.com/example/service/pull/42","text":"the fix"}}]}}]}}]}}]}}]"#
+            );
+            let event = rich_event(&content, "CEXAMPLE");
+            assert_eq!(attention(&event).as_deref(), Some("mention"));
+            assert!(event.text.contains("Please review"));
+            assert!(
+                event
+                    .text
+                    .contains("https://github.com/example/service/pull/42")
+            );
+            assert_eq!(
+                attention(&rich_event(&content, "DEXAMPLE")).as_deref(),
+                Some("direct")
+            );
+        }
+    }
+
+    #[test]
+    fn native_rich_content_preserves_repeated_fields_and_protects_legacy_images() {
+        let event = rich_event(
+            r#""attachments":[{"text":"Deployment gates","fields":[{"title":"Current","value":"Blocked"},{"title":"Required","value":"Blocked"}]}]"#,
+            "CEXAMPLE",
+        );
+        assert_eq!(
+            event.text,
+            "Deployment gates\nCurrent\nBlocked\nRequired\nBlocked"
+        );
+        let missing_value = rich_event(
+            r#""attachments":[{"text":"Deployment gates","fields":[{"title":"Current","value":"Blocked"},{"title":"Required"}]}]"#,
+            "CEXAMPLE",
+        );
+        assert_ne!(event.version, missing_value.version);
+        for field in ["image_url", "thumb_url"] {
+            let content = format!(
+                r#""attachments":[{{"fallback":"See the incident screenshot","{field}":"https://images.example.test/incident.png"}}]"#
+            );
+            let event = rich_event(&content, "CEXAMPLE");
+            assert!(
+                event
+                    .text
+                    .contains("https://images.example.test/incident.png")
+            );
+            assert!(event.text.contains("[Slack content incomplete"));
+            assert_eq!(attention(&event).as_deref(), Some("protected"));
+        }
+    }
+
+    #[test]
+    fn native_rich_content_preserves_existing_plaintext_beyond_the_rich_content_budget() {
+        let plain = "Original provider text. ".repeat(4_000);
+        let response = format!(
+            r#"{{"ok":true,"messages":{{"matches":[{{"ts":"1700000000.000001","text":{},"channel":{{"id":"CEXAMPLE","name":"example","is_private":false}},"attachments":[{{"text":"The current incident remains open"}}],"blocks":[{{"type":"rich_text","elements":[{{"type":"rich_text_section","elements":[{{"type":"user","user_id":"UEXAMPLE"}}]}}]}}]}}],"paging":{{"next_cursor":""}}}}}}"#,
+            serde_json::to_string(&plain).unwrap()
+        );
+        let source = source();
+        let batch = source.normalize(
+            output(&response),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        let event = &batch.events[0];
+        assert!(event.text.starts_with(&plain));
+        assert!(
+            event
+                .text
+                .ends_with("The current incident remains open\n<@UEXAMPLE>")
+        );
+        assert!(!event.text.contains("[Slack content incomplete"));
+        assert_eq!(attention(event).as_deref(), Some("mention"));
+    }
+
+    #[test]
+    fn native_rich_content_versions_change_only_with_normalized_evidence() {
+        let source = source();
+        let plain = source.normalize(
+            output(RESPONSE),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        let duplicated = RESPONSE.replace(
+            "\"text\":\"Review the board\"",
+            r#""text":"Review the board","blocks":[{"type":"section","text":{"type":"plain_text","text":"Review the board"}}]"#,
+        );
+        let duplicated = source.normalize(
+            output(&duplicated),
+            source.window(None, 1_700_000_000).unwrap(),
+        );
+        assert_eq!(plain.events[0].text, duplicated.events[0].text);
+        assert_eq!(plain.events[0].version, duplicated.events[0].version);
+        let first = rich_event(
+            r#""attachments":[{"text":"Three workers cannot start"}]"#,
+            "CEXAMPLE",
+        );
+        let repeat = rich_event(
+            r#""attachments":[{"text":"Three workers cannot start","color":"danger"}]"#,
+            "CEXAMPLE",
+        );
+        let changed = rich_event(
+            r#""attachments":[{"text":"All workers recovered"}]"#,
+            "CEXAMPLE",
+        );
+        assert_eq!(first.id, changed.id);
+        assert_eq!(first.source.thread_id, changed.source.thread_id);
+        assert_eq!(first.legacy_version, changed.legacy_version);
+        assert_eq!(first.version, repeat.version);
+        assert_ne!(first.version, changed.version);
+        let plain = rich_event(r#""blocks":[]"#, "CEXAMPLE");
+        assert_ne!(first.version, plain.version);
+        assert!(plain.text.is_empty());
+    }
+
+    #[test]
+    fn native_rich_content_discloses_bounds_and_protects_omitted_evidence() {
+        let long = "é".repeat(40_000);
+        let content = format!(
+            r#""attachments":[{{"text":{}}}],"blocks":[{{"type":"section","text":{{"type":"mrkdwn","text":"<@UEXAMPLE> needs the omitted detail"}}}}]"#,
+            serde_json::to_string(&long).unwrap()
+        );
+        let event = rich_event(&content, "CEXAMPLE");
+        assert!(event.text.len() <= 66_000);
+        assert!(event.text.contains("[Slack content incomplete"));
+        assert_ne!(attention(&event).as_deref(), Some("ordinary"));
+        assert_eq!(event.version, rich_event(&content, "CEXAMPLE").version);
+        let unknown = rich_event(
+            r#""blocks":[{"type":"future_example_block","secret":"unknown evidence"}]"#,
+            "CEXAMPLE",
+        );
+        assert!(unknown.text.contains("[Slack content incomplete"));
+        assert_eq!(attention(&unknown).as_deref(), Some("protected"));
+        let many = format!(
+            r#""blocks":[{{"type":"rich_text","elements":[{}]}}]"#,
+            std::iter::repeat_n(r#"{"type":"text","text":"Repeated status"}"#, 300)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut deep = r#"{"type":"user","user_id":"UEXAMPLE"}"#.to_owned();
+        for _ in 0..15 {
+            deep = format!(r#"{{"type":"rich_text_section","elements":[{deep}]}}"#);
+        }
+        for content in [many, format!(r#""blocks":[{deep}]"#)] {
+            let bounded = rich_event(&content, "CEXAMPLE");
+            assert!(bounded.text.contains("[Slack content incomplete"));
+            assert_ne!(attention(&bounded).as_deref(), Some("ordinary"));
+        }
     }
 
     #[test]
