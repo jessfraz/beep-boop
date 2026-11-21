@@ -618,6 +618,7 @@ export class SourceReviews {
           if (record?.decision === null) valid.add(key); else superseded++; }
       }
       const batchable = new Map<string, string | null>(), batches = new Map<string, WorkflowPacket>();
+      const outcomeWorkflows = new Map<string, Set<string>>();
       // Decide eligibility across the whole claim before admitting any work.
       // A protected/current-work proposal vetoes batching its other thread versions.
       for (const { proposal, keys } of expanded) {
@@ -646,9 +647,28 @@ export class SourceReviews {
         } else {
           routed += keys.length;
           if (proposal.task_id !== null && proposal.job_id !== null) throw new TaskError("Choose the existing task or its workflow, not conflicting owners");
-          const job = proposal.job_id === null ? workflows.find(item => item.task_id === proposal.task_id)
+          let job = proposal.job_id === null ? workflows.find(item => item.task_id === proposal.task_id)
             : workflows.find(item => item.job.id === proposal.job_id);
           if (proposal.job_id !== null && job === undefined) throw new TaskError("Unknown configured workflow");
+          if (records.some(record => record.outcome !== undefined)) {
+            // Results are continuations of owned work, not new occurrences.
+            // Explicit task routing must retain that recipient, even when it
+            // is the workflow owner. Other workflows may still act on a result.
+            if (proposal.task_id !== null) job = undefined;
+            else if (job !== undefined) for (const record of records) {
+              if (record.outcome === undefined) continue;
+              const id = record.outcome.task_id;
+              let owned = outcomeWorkflows.get(id);
+              if (owned === undefined) {
+                const task = await this.tasks.findIn(tx, id);
+                owned = new Set(task?.sources.filter(source => source.provider === "scheduled_jobs" && source.account === "local")
+                  .map(source => source.thread_id));
+                if (task?.workflow !== undefined) owned.add(task.workflow.job.id);
+                outcomeWorkflows.set(id, owned);
+              }
+              if (owned.has(job.job.id)) throw new TaskError("Workflow results must continue their existing task owner; select that task or dismiss handled progress instead of starting the same workflow again");
+            }
+          }
           const refs = [...new Map(records.filter(record => record.outcome === undefined).map(record => [sourceReference(record.event.source), record.event.source])).values()];
           const resource = proposal.work_url === null ? undefined : sourceWorkResource(proposal.work_url);
           if (proposal.work_url !== null && (resource === undefined || refs.length === 0 || refs.some(ref =>
@@ -712,9 +732,9 @@ export class SourceReviews {
           // Root progress is already in its own actor history. Child results
           // and evidence from other actors remain valid continuation inputs.
           const target = await this.tasks.findIn(tx, created.id);
-          if (target !== undefined && this.tasks.isRunning(target.id) && records.every(record =>
-            record.outcome?.task_id === target.id && record.outcome.conversation_id === target.conversation_id)) {
-            throw new TaskError("This running actor already owns its published progress; notify or dismiss it instead of feeding it back as new input");
+          if (target !== undefined && records.every(record => record.outcome?.task_id === target.id &&
+            record.outcome.conversation_id === target.conversation_id && record.outcome.state.state !== "failed")) {
+            throw new TaskError("This actor already owns its published progress; notify or dismiss it instead of feeding it back as new input");
           }
           owner.task_id = created.id;
           const inputId = `source-review:${digest([created.id, [...keys].sort()])}`;

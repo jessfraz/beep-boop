@@ -467,8 +467,6 @@ export function createAppTools(tasks: TaskStore, executions: Executions, jobs?: 
       const sender = await executions.sender(tasks, api.conversationId.toString());
       const task = await tasks.get(args.task_id);
       if (sender.type === "task" && sender.task_id === task.id) throw new TaskError("Use this task's existing child-agent tools");
-      const workflow = await workflowRequest(task, args.input, await api.memo("workflow_request", randomUUID(), context), args.attachments);
-      if (workflow !== undefined) return output(workflow);
       const inputId = await api.memo("input_id", randomUUID(), context);
       await tasks.enqueue(task.id, args.input, inputId, undefined, args.mode ?? "steer",
         await tasks.attachmentRefs(args.attachments), undefined, sender);

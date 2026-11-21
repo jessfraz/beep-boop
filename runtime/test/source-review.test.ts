@@ -550,6 +550,89 @@ test("retained GitHub decisions preserve their owner while configured workflow e
   } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("workflow results continue their existing owner without spawning the same workflow again", { timeout: 15_000 }, async () => {
+  for (const legacy of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), "agent-workflow-result-"));
+    const job: ScheduledJobStatus = { job: { id: "parcel-review", title: "Parcel review", prompt: "Handle current parcel evidence.",
+      priority: "critical", model: fixtureModel, timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" },
+      schedules: [], task_id: "parcel-owner" };
+    const app = await open(join(directory, "session.sqlite"), {}, [job]); const controller = new AbortController();
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    try {
+      const owner = await app.tasks.create({ id: "parcel-owner", title: job.job.title, outcome: job.job.prompt,
+        sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }] });
+      const worker = legacy ? await app.tasks.create({ id: "legacy-worker", title: "Legacy parcel review", outcome: "Retain the verified result",
+        sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.job.id }] }) : await app.tasks.create({ id: "parcel-worker", title: "One parcel", outcome: "Verify this parcel once",
+        execution: "coordinator", workflow: { job: job.job, owner_task_id: owner.id, work_key: "source:one-parcel" } });
+      const outcome: TaskOutcome = { task_id: worker.id, conversation_id: worker.conversation_id, entry_id: null, tool_call_id: null,
+        summary: "The parcel is saved. Retire its old missing-tracking check.", sources: worker.sources, state: { state: "progress" } };
+      await app.session.commit(tx => app.sources.recordIn(tx, outcome, false), BACKGROUND_CONTEXT);
+      app.faux.setResponses([
+        input => answer([routed(groups(input), { job_id: job.job.id })], "recursive-workflow"),
+        input => { assert.match(toolResult(input, "review_sources", true), /existing.*task|existing.*owner/iu);
+          return answer([routed(groups(input), { task_id: owner.id })], "existing-workflow-owner"); },
+        input => { toolResult(input); return fauxAssistantMessage(""); },
+      ]);
+      assert.equal(await app.reviews.review(0, controller.signal), true);
+      assert.equal((await app.tasks.list()).length, 2, "A result must not create another workflow actor");
+      assert.equal(app.faux.getPendingResponseCount(), 0);
+      const saved = await app.tasks.get(owner.id); assert.equal(saved.pending.length, 1);
+      assert.match(saved.pending[0]?.content ?? "", /Inspect these exact originals/u);
+      const records = await app.sources.events({ provider: "task_outcomes" }); assert.equal(records.length, 1);
+      assert.deepEqual(records[0]?.decision, { type: "task", task_id: owner.id });
+      assert.deepEqual(await app.sources.events({ pending: true }), []);
+    } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("idle actors do not wake for their own progress but retain explicit failure recovery", { timeout: 15_000 }, async () => {
+  for (const failed of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), "agent-owned-progress-"));
+    const app = await open(join(directory, "session.sqlite")); const controller = new AbortController();
+    app.tasks.wakeBackground = id => app.tasks.get(id);
+    try {
+      const owner = await app.tasks.create({ id: "existing-owner", title: "Existing work", outcome: "Preserve its evidence" });
+      await app.session.commit(tx => app.sources.recordIn(tx, { task_id: owner.id, conversation_id: owner.conversation_id,
+        entry_id: null, tool_call_id: null, summary: "Retained native result", sources: [],
+        state: failed ? { state: "failed", reason: "The owned execution failed before completion" } : { state: "progress" } }, false), BACKGROUND_CONTEXT);
+      app.faux.setResponses([input => answer([routed(groups(input), { task_id: owner.id })]),
+        input => { toolResult(input, "review_sources", !failed);
+          return failed ? fauxAssistantMessage("") : answer(dismissed(groups(input), "This actor already owns its recorded progress"), "dismiss-own-progress"); },
+        ...(failed ? [] : [((input: TranscriptContext) => { toolResult(input); return fauxAssistantMessage(""); })]),
+      ]);
+      assert.equal(await app.reviews.review(0, controller.signal), true);
+      assert.equal((await app.tasks.list()).length, 1);
+      assert.equal((await app.tasks.get(owner.id)).pending.length, failed ? 1 : 0);
+      assert.equal(app.faux.getPendingResponseCount(), 0);
+      assert.deepEqual(await app.sources.events({ pending: true }), []);
+    } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+test("a different workflow can act on a task result in a fresh packet", { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-cross-workflow-result-"));
+  const job: ScheduledJobStatus = { job: { id: "calendar-review", title: "Calendar review", prompt: "Reconcile the new travel dates.",
+    model: fixtureModel, timezone: "UTC", schedules: [], revision: "one", cwd: "/workspace/example" }, schedules: [], task_id: "calendar-owner" };
+  const app = await open(join(directory, "session.sqlite"), {}, [job]); const controller = new AbortController();
+  app.tasks.wakeBackground = id => app.tasks.get(id);
+  try {
+    const producer = await app.tasks.create({ id: "travel-owner", title: "Travel review", outcome: "Read the original booking",
+      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "travel-review" }] });
+    await app.session.commit(tx => app.sources.recordIn(tx, { task_id: producer.id, conversation_id: producer.conversation_id,
+      entry_id: null, tool_call_id: null, summary: "The requested booking has verified travel dates.", sources: producer.sources,
+      state: { state: "resolved", evidence: "The original booking supplies the verified dates." } }, false), BACKGROUND_CONTEXT);
+    app.faux.setResponses([input => answer([routed(groups(input), { job_id: job.job.id })]),
+      input => { toolResult(input); return fauxAssistantMessage(""); }]);
+    assert.equal(await app.reviews.review(0, controller.signal), true);
+    const records = await app.tasks.list(); assert.equal(records.length, 3);
+    const packet = records.find(task => task.workflow?.job.id === job.job.id); assert.ok(packet);
+    assert.equal(packet.workflow?.owner_task_id, job.task_id);
+    assert.equal(packet.pending.length, 1);
+    assert.equal((await app.tasks.get(producer.id)).pending.length, 0);
+    assert.deepEqual(await app.sources.events({ pending: true }), []);
+  } finally { controller.abort(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("ordinary Slack proposals share one bounded workflow packet and replay keeps that exact admission after reopen", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-slack-workflow-batch-")), path = join(directory, "session.sqlite");
   const job: ScheduledJobStatus = { job: { id: "brief-review", title: "Evidence brief", prompt: "Review current evidence under the configured policy.",
