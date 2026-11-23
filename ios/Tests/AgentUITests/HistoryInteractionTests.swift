@@ -824,6 +824,87 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertEqual(composer.value as? String, note)
   }
 
+  func testDraggingShortShellOutputScrollsEarlierConversation() async throws {
+    struct Input: Encodable {
+      let program = "printf"
+      let args = ["fixture"]
+      let cwd = "/workspace/project"
+    }
+    struct Output: Encodable {
+      let type = "process"
+      let exitCode = 0
+      enum CodingKeys: String, CodingKey {
+        case type, stdout, stderr, truncated
+        case exitCode = "exit_code"
+      }
+      let stdout = "A short command result."
+      let stderr = ""
+      let truncated = false
+    }
+    let output = Output()
+    let encoder = JSONEncoder()
+    let details = ToolDetails.available(
+      .init(
+        callId: "scroll-shell",
+        input: .text(
+          .init(
+            text: String(decoding: try encoder.encode(Input()), as: UTF8.self), truncated: false)),
+        name: "exec",
+        output: .text(
+          .init(text: String(decoding: try encoder.encode(output), as: UTF8.self), truncated: false)
+        ),
+        status: .finished))
+    let messages = (0..<30).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "shell-history-\(index)", finalChunk: true, role: .final,
+        text:
+          "Orchard section \(index). The inventory is ready for review and the next delivery can proceed once its label is checked."
+      )
+    }
+    let app = try await launchMessages(
+      messages + [
+        .init(
+          continuation: false, entryId: "scroll-shell-entry", finalChunk: true,
+          presentation: .command(.init(command: "printf fixture", durationMs: 12, exitCode: 0)),
+          role: .tool, text: output.stdout,
+          tool: .init(callId: "scroll-shell", name: "exec", status: .finished))
+      ], toolDetails: ["scroll-shell": details])
+    continueAfterFailure = true
+    let group = app.buttons["activity:tool:scroll-shell"]
+    XCTAssertTrue(group.waitForExistence(timeout: 5))
+    group.tap()
+    let command = app.buttons["activity-item:tool:scroll-shell"]
+    XCTAssertTrue(command.waitForExistence(timeout: 3))
+    command.tap()
+    XCTAssertTrue(app.staticTexts["Success"].waitForExistence(timeout: 5))
+    let latest = app.buttons["latest-messages"]
+    if latest.exists {
+      latest.tap()
+      XCTAssertTrue(latest.waitForNonExistence(timeout: 3))
+    }
+    let text = app.staticTexts[output.stdout]
+    XCTAssertTrue(text.isHittable)
+    guard
+      let leading = app.staticTexts.matching(
+        NSPredicate(format: "label BEGINSWITH %@", "Orchard section ")
+      ).allElementsBoundByIndex.first(where: { $0.isHittable })
+    else {
+      XCTFail("The conversation above the short command must be visible")
+      return
+    }
+    let retained = app.staticTexts.matching(
+      NSPredicate(format: "label == %@", leading.label)
+    ).firstMatch
+    let position = retained.frame.minY
+    let start = text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+    let end = start.withOffset(CGVector(dx: 0, dy: 150))
+    start.press(forDuration: 0.05, thenDragTo: end)
+    XCTAssertGreaterThan(
+      retained.frame.minY, position + 40,
+      "A short output must hand vertical drags to the conversation")
+    XCTAssertTrue(latest.exists)
+  }
+
   func testShellActivityKeepsOneCardLiteralOutputAndAFinalResult() async throws {
     struct Input: Encodable {
       let program = "printf"
