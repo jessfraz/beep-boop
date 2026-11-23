@@ -306,6 +306,8 @@ public struct MainChatView: View {
           Color.clear.frame(height: 1).id(TranscriptControlAnchor.latest)
         }
         .scrollTargetLayout()
+        // Short nested output must pass vertical gestures to the transcript.
+        .scrollBounceBehavior(.basedOnSize, axes: .vertical)
         .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
       }
       .accessibilityIdentifier("transcript")
