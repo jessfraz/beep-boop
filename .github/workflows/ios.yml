@@ -17,13 +17,19 @@ jobs:
   checks:
     name: Native checks (${{ matrix.phase }})
     runs-on: macos-latest
-    # Allow the full sequential UI suite, including real keyboard and app
-    # lifecycle interactions, to complete on hosted simulators.
-    timeout-minutes: ${{ matrix.phase == 'simulator-ui' && 60 || 30 }}
+    # Independent UI groups keep a retry from repeating every interaction
+    # on one simulator before its result bundle can finish.
+    timeout-minutes: ${{ startsWith(matrix.phase, 'simulator-ui') && 60 || 30 }}
     strategy:
       fail-fast: false
       matrix:
-        phase: [host, simulator-core, simulator-performance, simulator-ui]
+        phase:
+          - host
+          - simulator-core
+          - simulator-performance
+          - simulator-ui-controls
+          - simulator-ui-history
+          - simulator-ui-lifecycle
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Check Swift and iOS

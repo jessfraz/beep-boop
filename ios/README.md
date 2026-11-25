@@ -238,10 +238,14 @@ app build, package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
 Simulator UI checks use ad-hoc signing for real App Group entitlements; no
 Apple account or provisioning profile is needed.
-CI runs `host`, `simulator-core`, `simulator-performance` and `simulator-ui` in
-parallel; every phase must pass. The default local command runs all checks;
-`simulator` keeps the three simulator suites together for local use. Each
-simulator phase creates and removes its own device.
+CI runs `host`, `simulator-core`, `simulator-performance`, `simulator-ui-controls`,
+`simulator-ui-history` and `simulator-ui-lifecycle` in parallel; every phase must
+pass. UI groups keep retries within one group, with longer app-switch and
+keyboard interactions apart from the other history and control tests. New
+history tests join the history group automatically. The default local command
+runs all checks; `simulator` keeps the three simulator suites together and
+`simulator-ui` runs the complete UI suite. Each simulator phase creates and
+removes its own device.
 Failed simulator runs also retain PNG/text attachments and their native manifest
 in a separate `ios-failures-*` CI artifact, alongside the complete result bundle.
 Set `IOS_SIMULATOR_RUNTIME` to an exact identifier from
