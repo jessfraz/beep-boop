@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 const require = createRequire(import.meta.url);
 const packagePath = require.resolve("playwright-core/package.json");
 const metadata = JSON.parse(await readFile(packagePath, "utf8"));
-if (metadata.version !== "1.64.1") {
+if (metadata.version !== "1.65.1") {
   throw new Error("Review the native CDP initialization patch for this Playwright version");
 }
 
