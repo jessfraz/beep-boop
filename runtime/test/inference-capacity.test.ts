@@ -3,9 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { crc32, deflateSync } from "node:zlib";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type AssistantMessage, type TranscriptContext } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { configure, createRegistry, defineDoc, Harness, ProviderDoc } from "@earendil-works/pi-durable";
@@ -97,9 +98,9 @@ async function openControlled(capacity: InferenceCapacity) {
     { now: clock.now, random: () => 0 }, { capacity, workClass: async (_model, options) => workClasses.get(options.sessionId ?? "") ?? "foreground" });
   models.setProvider(quota.wrapProvider(provider));
   const model = models.getModel("openai", "fixture"); assert.ok(model);
-  const request = (id: string, workClass: InferenceClass, options: { text?: string; account?: string; output?: number } = {}) => {
+  const request = (id: string, workClass: InferenceClass, options: { text?: string; transcript?: TranscriptContext; account?: string; output?: number } = {}) => {
     workClasses.set(id, workClass); const controller = new AbortController(); controllers.set(id, controller);
-    const result = models.streamSimple(model, context(options.text), { sessionId: id, signal: controller.signal,
+    const result = models.streamSimple(model, options.transcript ?? context(options.text), { sessionId: id, signal: controller.signal,
       apiKey: options.account ?? "synthetic-account", maxTokens: options.output ?? 16 }).result();
     pending.push(result); return result;
   };
@@ -111,6 +112,61 @@ async function openControlled(capacity: InferenceCapacity) {
       await Promise.allSettled(pending); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
     } };
 }
+
+test("retained provider usage admits a reply despite large serialized history", async () => {
+  const app = await openControlled(new InferenceCapacity());
+  try {
+    const previous = fauxAssistantMessage("The previous review finished.");
+    previous.timestamp = START + 1;
+    previous.usage.input = 200_000; previous.usage.totalTokens = 200_000;
+    const transcript = normalizeContext({ messages: [
+      { role: "user", content: '"'.repeat(1_600_000), timestamp: START }, previous,
+      { role: "user", content: "Continue the current review.", timestamp: START + 2 },
+    ] });
+    let settled = false;
+    const reply = app.request("retained-chat", "foreground", { transcript, output: 128_000 }).then(result => { settled = true; return result; });
+    await pump(() => settled || app.active.has("retained-chat"));
+    if (!app.active.has("retained-chat")) assert.fail((await reply).errorMessage ?? "The retained chat never reached its provider");
+    app.release("retained-chat");
+    assert.equal((await reply).stopReason, "stop");
+  } finally { await app.close(); }
+});
+
+test("a supported image reaches the wrapped provider under ordinary model admission", async () => {
+  const app = await openControlled(new InferenceCapacity());
+  try {
+    const width = 1200, height = 900, header = Buffer.alloc(13);
+    header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header[8] = 8; header[9] = 2;
+    const chunk = (name: string, data: Buffer): Buffer => {
+      const body = Buffer.concat([Buffer.from(name), data]), size = Buffer.alloc(4), crc = Buffer.alloc(4);
+      size.writeUInt32BE(data.length); crc.writeUInt32BE(crc32(body));
+      return Buffer.concat([size, body, crc]);
+    };
+    const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", header),
+      chunk("IDAT", deflateSync(Buffer.alloc((width * 3 + 1) * height), { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
+    const transcript = normalizeContext({ messages: [{ role: "user", timestamp: START, content: [
+      { type: "text", text: "Review this image." }, { type: "image", data: png.toString("base64"), mimeType: "image/png" },
+    ] }] });
+    let settled = false;
+    const reply = app.request("image-chat", "foreground", { transcript, output: 4096 }).then(result => { settled = true; return result; });
+    await pump(() => settled || app.active.has("image-chat"));
+    if (!app.active.has("image-chat")) assert.fail((await reply).errorMessage ?? "The image never reached its provider");
+    app.release("image-chat"); assert.equal((await reply).stopReason, "stop");
+  } finally { await app.close(); }
+});
+
+test("an oversized context reports admission failure and preserves critical capacity", async () => {
+  const app = await openControlled(new InferenceCapacity());
+  try {
+    const result = await app.request("too-large", "foreground", { text: "work ".repeat(800_000) });
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage ?? "", /Model context exceeds ordinary capacity/u);
+    assert.deepEqual(app.starts, []);
+    const critical = app.request("protected-work", "critical");
+    await pump(() => app.active.has("protected-work")); app.release("protected-work");
+    assert.equal((await critical).stopReason, "stop");
+  } finally { await app.close(); }
+});
 
 test("spawned fresh work cannot consume source review, critical, email or interactive admission", async () => {
   const app = await openControlled(new InferenceCapacity());

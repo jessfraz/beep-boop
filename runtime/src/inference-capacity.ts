@@ -1,4 +1,5 @@
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
+import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import type { InferenceClass } from "./generated/InferenceClass.js";
 
 type Reservation = { requests: number; tokens: number };
@@ -31,12 +32,22 @@ function integer(value: number, name: string, minimum = 1): number {
 
 /** A conservative local working-set estimate, not a prediction of provider billing. */
 export function estimatedInferenceTokens(model: Model<Api>, context: TranscriptContext, options: SimpleStreamOptions): number {
-  const input = Math.ceil(Buffer.byteLength(JSON.stringify(context.messages)) / 3);
+  // Match Pi's context accounting: retained usage and images are not JSON bytes.
+  const input = estimateContextTokens(context).tokens;
   const output = options.maxTokens ?? model.maxTokens;
   const reasoning = options.reasoning;
   const thinking = reasoning === "minimal" || reasoning === "low" || reasoning === "medium" || reasoning === "high"
     ? options.thinkingBudgets?.[reasoning] : undefined;
   return integer(Math.max(1, input + Math.max(output, thinking ?? 0)), "Estimated inference tokens");
+}
+
+/** These fixed diagnostics are safe to publish without exposing provider errors. */
+export class InferenceCapacityError extends RangeError {
+  constructor(kind: "ordinary" | "critical") {
+    super(kind === "ordinary"
+      ? "Model context exceeds ordinary capacity; compact retained work before retrying"
+      : "Workflow context exceeds critical capacity; compact the current work packet before retrying");
+  }
 }
 
 /** Ephemeral resource admission only. Pi owns every queued/running generation
@@ -92,12 +103,12 @@ export class InferenceCapacity {
     const protectedTokens = protectedClasses.reduce((sum, reserved) => sum +
       (reserved === workClass || this.reserved[reserved].requests === 0 ? 0 : this.reserved[reserved].tokens), 0);
     if (protectedTokens > 0 && workClass !== "critical" && tokens > this.maxTokens - protectedTokens) {
-      throw new RangeError("Model context exceeds ordinary capacity; compact retained work before retrying");
+      throw new InferenceCapacityError("ordinary");
     }
     const otherCriticalReserve = group === undefined || this.reserved.critical.requests < 2 ? 0
       : Math.floor(this.reserved.critical.tokens / this.reserved.critical.requests);
     if (workClass === "critical" && tokens > this.reserved.critical.tokens + this.shared.tokens - otherCriticalReserve) {
-      throw new RangeError("Workflow context exceeds critical capacity; compact the current work packet before retrying");
+      throw new InferenceCapacityError("critical");
     }
     let account = this.accounts.get(accountId);
     if (account === undefined) {

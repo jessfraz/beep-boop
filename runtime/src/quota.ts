@@ -9,7 +9,7 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { defineDoc, defineDocFamily, defineEntry, ROOT_CONVERSATION_ID, type Harness, type SetTimer, type Tx } from "@earendil-works/pi-durable";
 import { UserNoticeEntry } from "./transcript.js";
 import type { InferenceClass } from "./generated/InferenceClass.js";
-import { estimatedInferenceTokens, type InferenceCapacity } from "./inference-capacity.js";
+import { estimatedInferenceTokens, InferenceCapacityError, type InferenceCapacity } from "./inference-capacity.js";
 
 type SavedOptions = Pick<SimpleStreamOptions, "reasoning" | "maxTokens" | "temperature" | "sessionId" | "transport" | "cacheRetention" | "toolChoice" | "thinkingBudgets" | "timeoutMs" | "deferred">;
 // Pi's tool-schema boundary is `object`; persisted schemas are strict JSON.
@@ -118,10 +118,11 @@ export class QuotaRecovery {
       if (!started && message.stopReason !== "error" && message.stopReason !== "aborted") emit({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
       output.push(message.stopReason === "error" || message.stopReason === "aborted"
         ? { type: "error", reason: message.stopReason, error: message } : { type: "done", reason: message.stopReason, message }); output.end();
-    }).catch(() => {
+    }).catch((error: unknown) => {
       const message: AssistantMessage = { role: "assistant", content: [], provider: model.provider, model: model.id, api: model.api,
         usage: zeroUsage(), timestamp: this.now(), stopReason: options.signal?.aborted ? "aborted" : "error",
-        errorMessage: options.signal?.aborted ? "Model request aborted" : "Could not read retained model availability state; work is preserved." };
+        errorMessage: options.signal?.aborted ? "Model request aborted" : error instanceof InferenceCapacityError
+          ? error.message : "Could not read retained model availability state; work is preserved." };
       output.push({ type: "error", reason: message.stopReason === "aborted" ? "aborted" : "error", error: message }); output.end();
     });
     return output;
