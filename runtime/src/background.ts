@@ -31,8 +31,9 @@ type Trigger = { key: BackgroundTriggerKey; generation: number; revision: string
 type QueuedWork = { key: BackgroundTriggerKey; work: BackgroundWork };
 type JobPreparation = { type: "replay"; receipt: JobRunReceipt } | { type: "admit" };
 type RunReference = { task: NativeTaskId<null>; request_id: string; schedule_id: string; scheduled_at: number; revision: string; actor_task_id?: string; recovery_of?: NativeTaskId };
+// Recovery identity outlives its active slot without replacing a newer last run.
 type Lane = { id: string; active: NativeTaskId<null> | null; pending: QueuedWork[]; actor_task_id: string | null;
-  active_runs?: NativeTaskId<null>[]; last_run?: RunReference };
+  active_runs?: NativeTaskId<null>[]; last_run?: RunReference; recoveries?: RunReference[] };
 type State = { triggers: Trigger[]; lanes: Lane[]; jobs: ScheduledJob[] };
 const State = defineDoc<State>({ kind: "agent.background", scope: "session", version: 1,
   initial: () => ({ triggers: [], lanes: [], jobs: [] }), checkpointWhen: () => true });
@@ -59,6 +60,9 @@ function laneId(value: BackgroundTriggerKey): string {
   return value.type === "builtin" ? key(value) : JSON.stringify([value.type, value.job_id]);
 }
 function same(left: BackgroundTriggerKey, right: BackgroundTriggerKey): boolean { return key(left) === key(right); }
+function runReference(lane: Lane | undefined, task: NativeTaskId): RunReference | undefined {
+  return lane?.last_run?.task === task ? lane.last_run : lane?.recoveries?.find(reference => reference.task === task);
+}
 function terminal(): NextTaskState<BackgroundCheckpoint, null> {
   return { status: "terminal", outcome: { status: "completed", result: null } };
 }
@@ -182,16 +186,19 @@ export class BackgroundScheduler {
                 let actorId = await runtime.memo<string>("job_actor_task_id", context);
                 if (actorId === undefined) {
                   // Work admitted before actor reuse still owns its original task.
-                  const legacy = await this.session.commit(async (tx) =>
-                    (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, context);
-                  const candidate = occurrence.task_id ?? legacy ?? await this.actorCandidate(occurrence.job);
+                  const retained = await this.session.commit(async (tx) => {
+                    const legacy = (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id;
+                    const lane = (await tx.doc(State)).lanes.find(lane => lane.id === laneId(input.key));
+                    return { legacy, actor: runReference(lane, runtime.taskId)?.actor_task_id };
+                  }, context);
+                  const candidate = occurrence.task_id ?? retained.actor ?? retained.legacy ?? await this.actorCandidate(occurrence.job);
                   const created = await this.session.commit(async (tx) => {
                     const state = await tx.doc(State);
                     const created = occurrence.task_id === undefined
-                      ? await this.actorIn(tx, state, occurrence.job, candidate, legacy !== undefined)
+                      ? await this.actorIn(tx, state, occurrence.job, candidate, retained.legacy !== undefined || retained.actor !== undefined)
                       : await this.freshActorIn(tx, state, occurrence);
-                    const reference = state.lanes.find((lane) => lane.id === laneId(input.key))?.last_run;
-                    if (reference?.task === runtime.taskId) reference.actor_task_id = created.id;
+                    const reference = runReference(state.lanes.find((lane) => lane.id === laneId(input.key)), runtime.taskId);
+                    if (reference !== undefined) reference.actor_task_id = created.id;
                     return created;
                   }, context);
                   if (created.native !== undefined) this.tasks.rememberConversation(created.native);
@@ -235,12 +242,12 @@ export class BackgroundScheduler {
     });
     registry.install({ name: "background", tasks: [this.task] });
   }
-  private async createWorkIn(tx: Tx, work: QueuedWork): Promise<NativeTaskId<null>> {
+  private async createWorkIn(tx: Tx, work: QueuedWork, latest = true): Promise<NativeTaskId<null>> {
     // Work is conversation-owned, so replacing its timer cannot abort an admitted run.
     const task = await tx.createTask(this.task, { type: "work", ...work }, {
       ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true,
     });
-    if (work.work.type === "job" || work.work.type === "manual_job") {
+    if (latest && (work.work.type === "job" || work.work.type === "manual_job")) {
       const occurrence = work.work.occurrence;
       // Retain only a lookup reference. Pi remains authoritative for timing,
       // lifecycle and the exact submission's answer, including after reopen.
@@ -296,7 +303,7 @@ export class BackgroundScheduler {
     const lane = this.laneIn(state, JSON.stringify(["job", job.id]));
     const id = legacy ? candidate : lane.actor_task_id ?? candidate;
     const previous = await this.tasks.findIn(tx, id);
-    if (previous !== undefined && !previous.sources.some((source) => source.provider === "scheduled_jobs" &&
+    if (previous !== undefined && !(legacy && previous.workflow?.job.id === job.id) && !previous.sources.some((source) => source.provider === "scheduled_jobs" &&
         source.account === "local" && source.thread_id === job.id)) throw new TaskError("This task is not owned by the scheduled job");
     if (previous === undefined && id !== scheduledTaskId("job:" + job.id)) throw new TaskError("The scheduled job's owned actor is unavailable; reconcile its existing task");
     const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
@@ -519,7 +526,7 @@ export class BackgroundScheduler {
     const occurrence = work.occurrence;
     if (occurrence === null || typeof occurrence !== "object" || Array.isArray(occurrence) || typeof occurrence.id !== "string") return;
     const requestId = occurrence.id;
-    const actorId = (lane?.last_run?.task === active ? lane.last_run.actor_task_id : undefined) ?? lane?.actor_task_id;
+    const actorId = runReference(lane, active)?.actor_task_id ?? lane?.actor_task_id;
     if (actorId === null || actorId === undefined) return;
     const conversationId = await this.session.commit(async tx => {
       const actor = await this.tasks.findIn(tx, actorId);
@@ -643,17 +650,37 @@ export class BackgroundScheduler {
     if (!state?.jobs.some(job => job.id === id)) throw new TaskError("Unknown scheduled job");
     let recovered = await this.retryTimers(trigger => trigger.key.type === "job" && trigger.key.job_id === id);
     const lane = state.lanes.find(item => item.id === JSON.stringify(["job", id]));
-    const legacy = lane?.last_run === undefined && lane?.active != null ? await this.session.getTask(lane.active, BACKGROUND_CONTEXT) : undefined;
-    const legacyWork = legacy?.kind === "agent.background" ? retainedJobWork(legacy.input) : undefined;
-    const legacyOccurrence = legacyWork?.work.type === "job" || legacyWork?.work.type === "manual_job" ? legacyWork.work.occurrence : undefined;
-    const reference: RunReference | undefined = lane?.last_run ?? (lane?.active != null && legacyOccurrence !== undefined ? {
-      task: lane.active, request_id: legacyOccurrence.id, schedule_id: legacyOccurrence.schedule_id, scheduled_at: legacyOccurrence.scheduled_at,
-      revision: legacyOccurrence.job.revision, ...(lane.actor_task_id === null ? {} : { actor_task_id: lane.actor_task_id }),
-    } : undefined);
-    if (reference !== undefined) {
-      const previous = await this.session.getTask(reference.task, BACKGROUND_CONTEXT);
+    const candidates = new Set([lane?.last_run?.task, lane?.active, ...(lane?.active_runs ?? [])]);
+    recovered ||= (lane?.recoveries?.length ?? 0) > 0;
+    for (const native of candidates) {
+      if (native == null) continue;
+      const previous = await this.session.getTask(native, BACKGROUND_CONTEXT);
       const work = previous?.kind === "agent.background" ? retainedJobWork(previous.input) : undefined;
-      const actorId = reference.actor_task_id ?? lane?.actor_task_id;
+      if (work === undefined || work.work.type !== "job" && work.work.type !== "manual_job") continue;
+      const occurrence = work.work.occurrence;
+      const saved = runReference(lane, native);
+      const memoActor = previous?.memos?.job_actor_task_id;
+      const capturedActor = typeof memoActor === "string" ? memoActor : saved?.actor_task_id ?? occurrence.task_id;
+      // The lane's canonical owner may have changed since this occurrence.
+      // Older work used the occurrence-derived task before actor memos existed.
+      let actorId = capturedActor ?? await this.session.commit(async tx =>
+        (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, BACKGROUND_CONTEXT);
+      if (actorId === undefined && lane?.actor_task_id != null) {
+        const canonicalId = lane.actor_task_id;
+        const conversationId = await this.session.commit(async tx => (await this.tasks.findIn(tx, canonicalId))?.conversation_id, BACKGROUND_CONTEXT);
+        if (conversationId !== undefined) {
+          const conversation = await this.tasks.conversation(conversationId);
+          const original = await this.session.commit(tx => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
+          // A current canonical actor is a candidate only when Pi proves it
+          // retains this exact occurrence, never because it owns the lane now.
+          if (original?.type === "input") actorId = canonicalId;
+        }
+      }
+      const reference: RunReference = { ...(saved ?? { task: native, request_id: occurrence.id, schedule_id: occurrence.schedule_id,
+        scheduled_at: occurrence.scheduled_at, revision: occurrence.job.revision }), ...(actorId == null ? {} : { actor_task_id: actorId }) };
+      if (reference.recovery_of !== undefined && (previous?.state.status !== "terminal" || previous.state.outcome.status === "completed")) {
+        recovered = true; continue;
+      }
       const actor = actorId === undefined || actorId === null ? undefined : await this.tasks.get(actorId);
       const conversation = actor === undefined ? undefined : await this.tasks.conversation(actor.conversation_id);
       const original = conversation === undefined ? undefined : await this.session.commit(tx =>
@@ -663,13 +690,14 @@ export class BackgroundScheduler {
       const checkpoint = previous?.state.status === "sleeping" ? previous.state.checkpoint : undefined;
       const retainedFailure = object(checkpoint) && checkpoint.phase === "execute" && typeof checkpoint.attempt === "number" &&
         Number.isSafeInteger(checkpoint.attempt) && checkpoint.attempt > 0;
-      if (work !== undefined && (interrupted || terminalWork || retainedFailure)) {
-        if ((work.work.type !== "job" && work.work.type !== "manual_job") || work.work.occurrence.id !== reference.request_id ||
+      if (interrupted || terminalWork || retainedFailure) {
+        if (work.work.occurrence.id !== reference.request_id ||
             work.key.type !== "job" || work.key.job_id !== id) throw new TaskError("The interrupted job's ownership changed");
-        if (interrupted && actor !== undefined && conversation !== undefined) {
-          if (actor.workflow?.job.id !== id && !actor.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === id)) {
-            throw new TaskError("The interrupted input is not owned by this job");
-          }
+        if (actor === undefined) throw new TaskError("The interrupted job's original actor is unavailable; reconcile its retained work");
+        if (actor.workflow?.job.id !== id && !actor.sources.some(source => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === id)) {
+          throw new TaskError("The interrupted input is not owned by this job");
+        }
+        if (interrupted && conversation !== undefined) {
           const recoveryId = "scheduled-recovery:" + original.id;
           const recovery = await this.session.commit(tx => tx.submissionByRequest(conversation.id, recoveryId), BACKGROUND_CONTEXT);
           if (recovery === undefined && !actor.pending.some(input => input.id === recoveryId)) await this.tasks.enqueue(actor.id,
@@ -680,22 +708,29 @@ export class BackgroundScheduler {
         }
         const retired = await this.session.commit(async tx => {
           const current = await tx.doc(State), target = current.lanes.find(item => item.id === JSON.stringify(["job", id]));
-          if (target?.last_run?.task !== reference.task && !(target?.last_run === undefined && target?.active === reference.task)) {
-            if (target?.last_run?.recovery_of === (reference.recovery_of ?? reference.task)) return undefined;
+          const recoveryOf = reference.recovery_of ?? reference.task;
+          const admitted = target?.recoveries?.find(reference => reference.recovery_of === recoveryOf);
+          if (admitted !== undefined && admitted.task !== reference.task) return undefined;
+          const latest = target?.last_run?.task === reference.task;
+          if (!latest && target?.active !== reference.task && !target?.active_runs?.includes(reference.task)) {
+            if (target?.last_run?.recovery_of === recoveryOf) return undefined;
             throw new TaskError("The interrupted job changed before recovery admission");
           }
           if (target === undefined) throw new TaskError("The interrupted job lane is unavailable");
-          if (target.last_run?.recovery_of !== undefined && previous?.state.status !== "terminal") return undefined;
           const independent = target.active_runs?.includes(reference.task) === true;
           if (!independent && target.active !== null && target.active !== reference.task) throw new TaskError("Another occurrence now owns the job lane");
-          const replacement = await this.createWorkIn(tx, work);
+          const publishLatest = latest || target.last_run === undefined;
+          const replacement = await this.createWorkIn(tx, work, publishLatest);
           if (independent) target.active_runs = (target.active_runs ?? []).map(native => native === reference.task ? replacement : native);
           else target.active = replacement;
-          target.last_run = { ...reference, task: replacement, recovery_of: reference.recovery_of ?? reference.task };
+          const recovery: RunReference = { ...reference, task: replacement, recovery_of: recoveryOf };
+          target.recoveries = [...(target.recoveries ?? []).filter(reference => reference.recovery_of !== recoveryOf), recovery];
+          if (publishLatest) target.last_run = recovery;
           return previous?.state.status === "terminal" ? undefined : reference.task;
         }, BACKGROUND_CONTEXT);
         if (retired !== undefined) await this.session.abortTask(retired, BACKGROUND_CONTEXT);
         recovered = true;
+        break;
       } else if (reference.recovery_of !== undefined) recovered = true;
     }
     if (!recovered) throw new TaskError("This job has no interrupted run or timer to retry");
