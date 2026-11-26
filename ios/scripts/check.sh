@@ -3,7 +3,7 @@ set -euo pipefail
 
 phase=${1:-all}
 usage() {
-  printf 'Usage: %s [all|host|simulator|simulator-core|simulator-performance|simulator-ui]\n' "$0" >&2
+  printf 'Usage: %s [all|host|simulator|simulator-core|simulator-performance|simulator-ui|simulator-ui-controls|simulator-ui-history|simulator-ui-lifecycle]\n' "$0" >&2
 }
 if (( $# > 1 )); then
   usage
@@ -14,7 +14,7 @@ case "$phase" in
   all|host|simulator) ;;
   simulator-core) suites=(core) ;;
   simulator-performance) suites=(performance) ;;
-  simulator-ui) suites=(rendering) ;;
+  simulator-ui|simulator-ui-controls|simulator-ui-history|simulator-ui-lifecycle) suites=(rendering) ;;
   *) usage; exit 64 ;;
 esac
 
@@ -25,6 +25,34 @@ run_dir=$(mktemp -d "$repo_root/target/ios-validation/run.XXXXXX")
 printf 'Native validation output: %s\n' "$run_dir"
 printf 'Native validation phase: %s\n' "$phase"
 performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
+# These longer interactions own app switches, suspension and the system
+# keyboard. The other history tests remain a complementary group, so newly
+# added tests still run without updating this list.
+ui_lifecycle_tests=(
+  testPagedHistoryKeepsFollowingTheLiveTailWhileTypingAndSending
+  testForegroundAndRelaunchKeepNewTypingWithoutRestoringSentText
+  testSendClearsVisibleTextAfterReturningToTheForeground
+  testSendClearsAnUnacceptedAutocorrectionAndKeepsNewIdenticalTyping
+  testSendClearsVisibleTextAfterActualSuspension
+  testSendClearsTheFocusedDraftImmediatelyAfterAnAppSwitch
+  testShareExtensionSavesAnUnsentDraftAndHostImportsItOnceAfterRelaunch
+  testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer
+)
+ui_options=(-test-timeouts-enabled YES)
+case "$phase" in
+  simulator-ui-controls) ui_options+=(-skip-testing:AgentUITests/HistoryInteractionTests) ;;
+  simulator-ui-history)
+    ui_options+=(-only-testing:AgentUITests/HistoryInteractionTests)
+    for test in "${ui_lifecycle_tests[@]}"; do
+      ui_options+=("-skip-testing:AgentUITests/HistoryInteractionTests/$test")
+    done
+    ;;
+  simulator-ui-lifecycle)
+    for test in "${ui_lifecycle_tests[@]}"; do
+      ui_options+=("-only-testing:AgentUITests/HistoryInteractionTests/$test")
+    done
+    ;;
+esac
 if [[ "$phase" == all || "$phase" == host ]]; then
   plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
     "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist" \
@@ -197,7 +225,8 @@ for suite in "${suites[@]}"; do
       # supplies real entitlements without an Apple account or profile.
       xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
-        -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
+        -parallel-testing-enabled NO -derivedDataPath "$run_dir/app" \
+        "${ui_options[@]}" \
         -retry-tests-on-failure -test-iterations 2 -test-repetition-relaunch-enabled YES \
         -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" \
         CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= test
