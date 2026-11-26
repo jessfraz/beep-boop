@@ -50,7 +50,7 @@ test("native SQLite compaction preserves published identities and interrupted st
     const db = new DatabaseSync(path, { allowExtension: true });
     const extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension); db.loadExtension(extension);
     const projection = () => ({
-      chunks: db.prepare("SELECT c.id,c.entry_id,c.ordinal,c.text,c.source_refs,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id ORDER BY c.id").all(),
+      chunks: db.prepare("SELECT c.id,c.entry_id,c.ordinal,c.text,c.source_set,v.embedding FROM chunks c JOIN chunk_vectors v ON v.rowid=c.id ORDER BY c.id").all(),
       checkpoints: db.prepare("SELECT * FROM conversations ORDER BY id").all(),
       staging: db.prepare("SELECT * FROM staging ORDER BY conversation_id,entry_id,part").all(),
     });

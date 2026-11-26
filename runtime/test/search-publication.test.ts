@@ -206,8 +206,8 @@ test("incremental publication retains unchanged rowids, vectors and corrected pr
   const cachedOnly: Embed = async () => { throw new Error("Published document embeddings must survive reopen and be reused"); };
   async function* stream(items: SearchRecord[]): AsyncIterable<SearchRecord> { yield* items; }
   function published(conversation = "owner") {
-    return reader.prepare(`SELECT c.id,c.entry_id,c.ordinal,c.part,c.source_refs,v.embedding FROM chunks c
-      JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? ORDER BY c.ordinal,c.part`).all(conversation).map((row) => {
+    return reader.prepare(`SELECT c.id,c.entry_id,c.ordinal,c.part,s.refs AS source_refs,v.embedding FROM chunks c
+      JOIN source_sets s ON s.id=c.source_set JOIN chunk_vectors v ON v.rowid=c.id WHERE c.conversation_id=? ORDER BY c.ordinal,c.part`).all(conversation).map((row) => {
       assert.ok(typeof row.id === "number" && typeof row.entry_id === "string"
         && typeof row.ordinal === "number" && typeof row.part === "number" && typeof row.source_refs === "string");
       assert.ok(row.embedding instanceof Uint8Array);
@@ -268,9 +268,9 @@ test("incremental publication retains unchanged rowids, vectors and corrected pr
     const retained = entry(afterCorrection, "retained");
     assert.equal(retained.ordinal, 7);
     assert.equal(retained.source_refs, JSON.stringify(["issue:synthetic:42", "mail:synthetic:corrected"]));
-    assert.deepEqual(reader.prepare("SELECT ref FROM source_refs WHERE chunk_id=? ORDER BY ref").all(retained.id)
+    assert.deepEqual(reader.prepare("SELECT r.ref FROM source_set_refs r JOIN chunk_source_sets c ON c.set_id=r.set_id WHERE c.chunk_id=? ORDER BY ref").all(retained.id)
       .map((row) => row.ref), ["issue:synthetic:42", "mail:synthetic:corrected"]);
-    assert.equal(reader.prepare("SELECT count(*) AS count FROM source_refs WHERE ref=?").get("mail:synthetic:original")?.count, 0);
+    assert.equal(reader.prepare("SELECT count(*) AS count FROM source_set_refs WHERE ref=?").get("mail:synthetic:original")?.count, 0);
     assert.deepEqual(entry(afterCorrection, "revised").embedding, Buffer.from(new Float32Array([0, 1, 0]).buffer));
     assert.deepEqual((await index.search("Oscilloscope", undefined, [], 8, "keyword")).candidates, []);
     assert.equal((await index.search("Calibration", undefined, [], 8, "keyword")).candidates[0]?.matches[0]?.entry_id, "revised");
@@ -280,7 +280,7 @@ test("incremental publication retains unchanged rowids, vectors and corrected pr
     const afterRemoval = published(), removed = entry(afterCorrection, "removed");
     assert.deepEqual(afterRemoval, afterCorrection.filter((record) => record.entry_id !== "removed"));
     assert.equal(reader.prepare("SELECT rowid FROM chunk_vectors WHERE rowid=?").get(removed.id), undefined);
-    assert.equal(reader.prepare("SELECT count(*) AS count FROM source_refs WHERE chunk_id=?").get(removed.id)?.count, 0);
+    assert.equal(reader.prepare("SELECT count(*) AS count FROM chunk_source_sets WHERE chunk_id=?").get(removed.id)?.count, 0);
     assert.deepEqual(reader.prepare("SELECT rowid AS id FROM chunk_vectors ORDER BY rowid").all().map((row) => row.id),
       reader.prepare("SELECT id FROM chunks ORDER BY id").all().map((row) => row.id));
     assert.deepEqual(published("anchor"), anchor);

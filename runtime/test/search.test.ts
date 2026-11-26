@@ -157,7 +157,7 @@ test("completed partial embedding batches survive reopen without publishing stal
     assert.deepEqual(index.checkpoint("large"), { watermark: "current", dirty: false });
     const db = new DatabaseSync(path);
     try {
-      assert.deepEqual(db.prepare("SELECT entry_id,text,source_refs FROM chunks WHERE conversation_id=? ORDER BY ordinal,part").all("large")
+      assert.deepEqual(db.prepare("SELECT c.entry_id,c.text,s.refs AS source_refs FROM chunks c JOIN source_sets s ON s.id=c.source_set WHERE conversation_id=? ORDER BY ordinal,part").all("large")
         .map((row) => [row.entry_id, row.text, row.source_refs]), current.map((row) => [row.entry_id, row.text, JSON.stringify(row.source_refs)]));
       assert.equal(db.prepare("SELECT count(*) AS count FROM staging").get()?.count, 0);
     } finally { db.close(); }
@@ -337,7 +337,7 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
       const run = db.prepare("SELECT run FROM staging WHERE conversation_id=? LIMIT 1").get("partial-plan")?.run;
       assert.ok(typeof run === "string");
       const plans = {
-        exact: db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT chunk_id FROM source_refs WHERE ref IN (?) LIMIT ?").all("mail:synthetic:10", 20),
+        exact: db.prepare("EXPLAIN QUERY PLAN SELECT DISTINCT c.chunk_id FROM source_set_refs r JOIN chunk_source_sets c ON c.set_id=r.set_id WHERE r.ref IN (?) LIMIT ?").all("mail:synthetic:10", 20),
         fts: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,rank AS value FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?").all('"maintenance"', 20),
         dense: db.prepare("EXPLAIN QUERY PLAN SELECT rowid AS id,distance AS value FROM chunk_vectors WHERE embedding MATCH ? AND k=? ORDER BY distance").all(new Uint8Array(new Float32Array([1, 0, 0]).buffer), 20),
         publishedCacheBefore: publishedBefore,
@@ -346,8 +346,8 @@ test("bounded Unicode chunks retain entry provenance and representative queries 
         publishedDelete: db.prepare("EXPLAIN QUERY PLAN DELETE FROM chunks WHERE conversation_id=?").all("representative"),
         stagingBeforeHashIndex: before,
         stagingCache: db.prepare("EXPLAIN QUERY PLAN " + stagedCache).all("partial-plan", ...hashes),
-        stagingPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_refs)
-          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_refs FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).all("partial-plan", run),
+        stagingPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunks(conversation_id,entry_id,ordinal,part,hash,text,source_set)
+          SELECT conversation_id,entry_id,ordinal,part,hash,text,source_set FROM staging WHERE conversation_id=? AND run=? ORDER BY ordinal,part`).all("partial-plan", run),
         vectorPublish: db.prepare(`EXPLAIN QUERY PLAN INSERT INTO chunk_vectors(rowid,embedding)
           SELECT c.id,s.embedding FROM staging s JOIN chunks c ON c.conversation_id=s.conversation_id AND c.entry_id=s.entry_id AND c.part=s.part
           WHERE s.conversation_id=? AND s.run=?`).all("partial-plan", run),

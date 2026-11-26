@@ -39,6 +39,7 @@ test("task search retains every source across indexing and reopen for a conversa
     const records: SearchRecord[] = []; for await (const record of tasks.records(task.conversation_id)) records.push(record);
     assert.ok(records.length >= 16); assert.ok(records.some((record) => Buffer.byteLength(record.text) > 4096));
     assert.ok(records.every((record) => record.source_refs.length === sources.length));
+    assert.ok(records.every(record => Object.isFrozen(record.source_refs) && record.source_refs === records[0]?.source_refs));
     const watermark = records.at(-1)?.entry_id; assert.ok(watermark);
     const expectedEntries = new Set(records.map((record) => record.entry_id));
     let index = new SearchIndex(path);
@@ -68,11 +69,12 @@ test("task search retains every source across indexing and reopen for a conversa
     const db = new DatabaseSync(path);
     try {
       const chunks = db.prepare("SELECT count(*) AS count FROM chunks").get()?.count; assert.ok(typeof chunks === "number" && chunks > records.length);
-      assert.equal(db.prepare("SELECT count(*) AS count FROM source_refs").get()?.count, chunks * refs.length);
-      const query = "SELECT DISTINCT chunk_id AS id FROM source_refs WHERE ref IN (?) LIMIT ?";
+      assert.equal(db.prepare("SELECT count(*) AS count FROM source_set_refs").get()?.count, refs.length);
+      assert.equal(db.prepare("SELECT count(*) AS count FROM source_sets").get()?.count, 1);
+      const query = "SELECT DISTINCT c.chunk_id AS id FROM source_set_refs r JOIN chunk_source_sets c ON c.set_id=r.set_id WHERE r.ref IN (?) LIMIT ?";
       const plan = db.prepare("EXPLAIN QUERY PLAN " + query).all(refs.at(-1)!, 80);
       assert.ok(db.prepare(query).all(refs.at(-1)!, 80).length > 0);
-      t.diagnostic(JSON.stringify({ chunks, source_rows: chunks * refs.length, exact_query_plan: plan }));
+      t.diagnostic(JSON.stringify({ chunks, source_rows: refs.length, exact_query_plan: plan }));
     } finally { db.close(); }
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
