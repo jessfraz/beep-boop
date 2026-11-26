@@ -252,6 +252,9 @@ public struct MainChatView: View {
   private var userScrolling: Bool {
     scrollPhase == .tracking || scrollPhase == .interacting || scrollPhase == .decelerating
   }
+  private var canFollowLatest: Bool {
+    followsLatest && !userScrolling && scenePhase == .active && model.connection == .connected
+  }
   private var transcript: some View {
     let items = model.transcriptItems
     return ScrollViewReader { scroll in
@@ -353,12 +356,12 @@ public struct MainChatView: View {
       }
       // Ending a touch can make following eligible without a new model update.
       .task(
-        id: followsLatest && !userScrolling
+        id: canFollowLatest
           ? TranscriptFollowRequest(revision: model.revision, viewport: viewportSize) : nil
       ) {
-        guard followsLatest && !userScrolling else { return }
+        guard canFollowLatest else { return }
         await Task.yield()
-        if !Task.isCancelled && followsLatest && !userScrolling {
+        if !Task.isCancelled && canFollowLatest {
           scrollToLatest(scroll)
         }
       }
@@ -395,9 +398,9 @@ public struct MainChatView: View {
       .accessibilityLabel("Beep Boop is working")
   }
   private func scrollToLatest(_ scroll: ScrollViewProxy) {
-    // Keep status changes inside the actual last row so pending native scrolls
-    // cannot point to a row removed when a reply finishes or the app suspends.
-    if let last = model.transcriptItems.last {
+    // Only target actual message rows. A separate trailing status or sentinel
+    // can leave UIKit with a stale index when connection teardown removes rows.
+    if scenePhase == .active, let last = model.transcriptItems.last {
       scroll.scrollTo(last.id, anchor: .bottom)
     }
   }
