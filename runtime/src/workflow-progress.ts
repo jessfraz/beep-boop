@@ -74,6 +74,7 @@ export class WorkflowProgress {
   private readonly recovery;
   private readonly notice;
   private reconciles: ((tx: Tx, taskId: string, conversation: ConversationId, requestId: string) => Promise<boolean>) | undefined;
+  private prepareReceipts: ((taskId: string, conversation: ConversationId, requestId: string, signal: AbortSignal) => Promise<void>) | undefined;
   constructor(private readonly session: Harness, registry: Registry, private readonly tasks: TaskStore,
     private readonly now: () => number = Date.now) {
     this.notice = defineTask<{ job_id: string; episode: number; task_id: string; title: string; alert: Alert; progress?: NoticeProgress }, { phase: "publish"; attempt: number }, null>({
@@ -112,8 +113,8 @@ export class WorkflowProgress {
         const due = await this.deadlines.range(session, "due", { before: timeKey(observedAt + 1, ""), limit: BATCH });
         for (const item of due) {
           runtime.signal.throwIfAborted();
-          try { await this.check(item.value.id, observedAt); }
-          catch (error) { await this.unavailable(item.value.id, observedAt, error); }
+          try { await this.check(item.value.id, observedAt, runtime.signal); }
+          catch (error) { if (runtime.signal.aborted) throw error; await this.unavailable(item.value.id, observedAt, error); }
         }
         const next = await this.deadlines.range(session, "due", { limit: 1 });
         await runtime.commit(async tx => {
@@ -168,8 +169,10 @@ export class WorkflowProgress {
     registry.install({ name: "workflow-progress", tasks: [this.timer, this.recovery, this.notice] });
     tasks.useMonitor(this);
   }
-  useReceipts(reconciles: (tx: Tx, taskId: string, conversation: ConversationId, requestId: string) => Promise<boolean>): void {
+  useReceipts(reconciles: (tx: Tx, taskId: string, conversation: ConversationId, requestId: string) => Promise<boolean>,
+    prepare?: (taskId: string, conversation: ConversationId, requestId: string, signal: AbortSignal) => Promise<void>): void {
     this.reconciles = reconciles;
+    this.prepareReceipts = prepare;
   }
   async ownsLegacy(task: TaskRecord): Promise<boolean> {
     const run = (await this.session.snapshot(Runs, task.id, BACKGROUND_CONTEXT))?.run;
@@ -292,7 +295,12 @@ export class WorkflowProgress {
       progress: { status: run.status, admitted_at: run.admitted_at, last_progress_at: run.last_progress_at } },
       { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
   }
-  private async check(id: string, observedAt: number): Promise<void> {
+  private async check(id: string, observedAt: number, signal: AbortSignal): Promise<void> {
+    const retained = (await this.session.snapshot(Runs, id, BACKGROUND_CONTEXT))?.run;
+    if (retained?.active && retained.input_id !== null) {
+      await this.prepareReceipts?.(id, nativeConversation(retained.conversation_id), retained.input_id, signal);
+    }
+    signal.throwIfAborted();
     return this.session.commit(async tx => {
       const state = await tx.doc(Runs, id, null), run = state.run;
       if (run === null || !run.active) return;

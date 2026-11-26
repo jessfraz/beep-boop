@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { defineDoc, defineDocFamily, defineExtension, defineTool, LiveDoc, ROOT_CONVERSATION_ID, type Conversation,
@@ -12,10 +13,12 @@ import type { SourceRef } from "./generated/SourceRef.js";
 import type { SourceState } from "./generated/SourceState.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
+import type { TaskInputReconciliation } from "./generated/TaskInputReconciliation.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions, reviewSourceReferences, reviewTaskState, reviewTaskStatus } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
+import { OrderedIndex } from "./ordered-index.js";
 import { SourceIndex, type SourceRecord } from "./source-index.js";
 import { SourceMetrics } from "./source-metrics.js";
 import { rememberSlackAttentionIn } from "./source-policy.js";
@@ -46,6 +49,10 @@ const Sources = defineDoc<Journal>({
 type Control = Omit<Journal, "events"> & { initialized: boolean; settlement_cursor?: string };
 const Control = defineDoc<Control>({ kind: "agent.source.control", scope: "session", version: 1,
   initial: () => ({ initialized: false, sources: [outcomeState()], conversation_id: null, active: null }), checkpointWhen: () => true });
+const Reconciliations = defineDocFamily<{ cursor: string | null; target?: string | null; complete: boolean }, null>({
+  kind: "agent.source.reconciliation.migration", scope: "session", family: true, version: 1,
+  initial: () => ({ cursor: null, complete: false }), checkpointWhen: () => true,
+});
 // Retained only for reads while upgrading a pre-projection database.
 const Related = defineDocFamily<{ keys: string[] }, null>({ kind: "agent.source.related", scope: "session", family: true, version: 1,
   initial: () => ({ keys: [] }), checkpointWhen: () => false });
@@ -103,6 +110,7 @@ export async function validateSourceRun(session: Harness, conversation: Conversa
 export class SourceJournal {
   private triaging = false;
   private readonly records = new PartitionedRecords<StoredEvent>("agent.source.event", false);
+  private readonly reconciliations = new OrderedIndex<TaskInputReconciliation>("agent.source.reconciliation.receipts");
   readonly index: SourceIndex;
   private preparing: Promise<void> | undefined;
   constructor(readonly session: Harness, readonly tasks: TaskStore, private readonly executions?: Executions) {
@@ -225,6 +233,7 @@ export class SourceJournal {
       source: { ...OUTCOMES, thread_id: outcome.task_id }, title: "Task " + outcome.state.state,
       text: JSON.stringify(outcome), occurred_at: Date.now() };
     const key = eventKey(event);
+    await this.rememberReconciliationIn(tx, outcome, key);
     if (await this.sourceRecordIn(tx, key) !== undefined) return;
     for await (const page of this.relatedPagesIn(tx, "outcome:" + JSON.stringify([outcome.task_id, outcome.conversation_id]), true)) for (const record of page) {
       if (record.decision === null && record.outcome !== undefined && record.outcome.task_id === outcome.task_id &&
@@ -243,23 +252,65 @@ export class SourceJournal {
     const state = { ...outcomeState(), checked_at: Date.now() };
     if (previous === undefined) journal.sources.push(state); else Object.assign(previous, state);
   }
-  /** Check the exact successful recovery without changing the unanswered native input. */
+  private async rememberReconciliationIn(tx: Tx, outcome: TaskOutcome, key: string): Promise<void> {
+    const receipt = outcome.reconciliation;
+    if (outcome.entry_id === null || outcome.tool_call_id === null || receipt === undefined || receipt.recovery_inputs.length === 0) return;
+    await this.reconciliations.setIn(tx, JSON.stringify([outcome.task_id, outcome.conversation_id, receipt.original.request_id]), key, receipt);
+  }
+  /** Legacy outcomes can contain large originals. Project one per commit, then
+   * yield so native idle-document eviction runs before the next bounded read. */
+  async prepareReconciliations(taskId: string, conversationId: ConversationId, requestId: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.prepare();
+    const identity = JSON.stringify([taskId, conversationId.toString()]);
+    for (;;) {
+      signal?.throwIfAborted();
+      const complete = await this.session.commit(async tx => {
+        const original = await tx.submissionByRequest(conversationId, requestId);
+        if (original?.type !== "input" || original.status !== "unanswered") return true;
+        const progress = await tx.doc(Reconciliations, identity, null);
+        if (progress.complete) return true;
+        const related = "outcome:" + identity;
+        progress.target ??= (await this.index.relatedIn(tx, related, { reverse: true, limit: 1 }))[0]?.order ?? null;
+        if (progress.target === null) { progress.complete = true; return true; }
+        const next = (await this.index.relatedIn(tx, related, { limit: 1,
+          ...(progress.cursor === null ? {} : { after: progress.cursor }) }))[0];
+        if (next === undefined || next.order > progress.target) { progress.complete = true; return true; }
+        const record = await this.sourceRecordIn(tx, next.key);
+        if (record?.outcome === undefined || record.outcome.task_id !== taskId || record.outcome.conversation_id !== conversationId.toString()) {
+          throw new TaskError("Recovery receipt history is incomplete");
+        }
+        await this.rememberReconciliationIn(tx, record.outcome, record.key);
+        progress.cursor = next.order; progress.complete = next.order === progress.target;
+        return progress.complete;
+      }, BACKGROUND_CONTEXT);
+      if (complete) return;
+      await setImmediate(undefined, { signal });
+    }
+  }
+  /** Prepare legacy receipts before entering the caller's transaction. Only
+   * compact identities and native settlement are read on its atomic boundary. */
   async reconcilesIn(tx: Tx, taskId: string, conversationId: ConversationId, requestId: string): Promise<boolean> {
     const original = await tx.submissionByRequest(conversationId, requestId);
     if (original?.type !== "input" || original.status !== "unanswered") return false;
-    for await (const page of this.relatedPagesIn(tx, "outcome:" + JSON.stringify([taskId, conversationId.toString()]), false)) for (const { outcome } of page) {
-      const receipt = outcome?.reconciliation;
-      if (outcome?.task_id !== taskId || outcome.conversation_id !== conversationId.toString() ||
-          outcome.entry_id === null || outcome.tool_call_id === null || receipt === undefined ||
-          receipt.original.request_id !== requestId || receipt.original.submission_id !== original.id.toString() ||
-          receipt.recovery_inputs.length === 0) continue;
-      let done = true;
-      for (const input of receipt.recovery_inputs) {
-        const recovery = await tx.submissionByRequest(conversationId, input.request_id);
-        if (recovery?.type !== "input" || recovery.status !== "done" || recovery.id.toString() !== input.submission_id) { done = false; break; }
+    const identity = JSON.stringify([taskId, conversationId.toString()]);
+    let position: string | undefined;
+    for (;;) {
+      const page = await this.reconciliations.rangeIn(tx, JSON.stringify([taskId, conversationId.toString(), requestId]),
+        { limit: 32, ...(position === undefined ? {} : { after: position }) });
+      for (const { value: receipt } of page) {
+        if (receipt.original.request_id !== requestId || receipt.original.submission_id !== original.id.toString() || receipt.recovery_inputs.length === 0) continue;
+        let done = true;
+        for (const input of receipt.recovery_inputs) {
+          const recovery = await tx.submissionByRequest(conversationId, input.request_id);
+          if (recovery?.type !== "input" || recovery.status !== "done" || recovery.id.toString() !== input.submission_id) { done = false; break; }
+        }
+        if (done) return true;
       }
-      if (done) return true;
+      if (page.length < 32) break;
+      position = page.at(-1)?.key;
     }
+    if (!(await tx.doc(Reconciliations, identity, null)).complete) throw new TaskError("Prepare retained recovery receipts before checking their settlement");
     return false;
   }
   async deliveredIn(tx: Tx, outcome: TaskOutcome): Promise<void> {

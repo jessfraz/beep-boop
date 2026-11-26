@@ -261,7 +261,8 @@ for (const scenario of ["resolved", "waiting", "preliminary notice", "already de
     const directory = await mkdtemp(join(tmpdir(), "agent-manual-recorded-result-")), clock = new FakeClock();
     const app = await openScheduled(directory, "original", clock), job = exampleJob();
     const monitor = new WorkflowProgress(app.session, app.registry, app.tasks, clock.now);
-    monitor.useReceipts((tx, id, conversation, request) => app.sources.reconcilesIn(tx, id, conversation, request));
+    monitor.useReceipts((tx, id, conversation, request) => app.sources.reconcilesIn(tx, id, conversation, request),
+      (id, conversation, request, signal) => app.sources.prepareReconciliations(id, conversation, request, signal));
     const scheduler = new BackgroundScheduler(app.session, app.registry, app.tasks, {
       plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {},
       triageSources: async () => {}, collectResources: async () => {}, indexHistory: async () => {},

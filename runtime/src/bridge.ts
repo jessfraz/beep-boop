@@ -186,7 +186,8 @@ async function openApplication(): Promise<Application> {
   const executions = new Executions();
   await executions.prepareRecovery(harness);
   const sources = new SourceJournal(harness, tasks, executions);
-  progress.useReceipts((tx, id, conversation, request) => sources.reconcilesIn(tx, id, conversation, request));
+  progress.useReceipts((tx, id, conversation, request) => sources.reconcilesIn(tx, id, conversation, request),
+    (id, conversation, request, signal) => sources.prepareReconciliations(id, conversation, request, signal));
   await startup.run("source_migration", () => sources.prepare());
   const tools = createAppTools(tasks, executions, () => background);
   const guidance = createGuidance(executions); registry.install(guidance);
