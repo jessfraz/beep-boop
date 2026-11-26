@@ -127,6 +127,41 @@ test("the main profile exposes usable inventory and explicit compact or full tas
   } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("native conversation status exposes verified task progress without its history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-conversation-status-")), app = await open(directory);
+  let release = () => {};
+  try {
+    const task = await app.tasks.create({ title: "Completed mail review", outcome: "PRIVATE_WORKFLOW_INSTRUCTIONS", model: fixtureModel });
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    await conversation.submit({ type: "write", entry: { kind: "fixture.evidence", model: [{ role: "user", content: "PRIVATE_ORIGINAL_HISTORY", timestamp: 1 }] } }, BACKGROUND_CONTEXT);
+    const root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
+    await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
+    const summary = "Four pitches were moved and verified. ".repeat(160);
+    const state = { state: "resolved", evidence: "Verified the exact mailbox changes. ".repeat(140) } satisfies TaskRecord["state"];
+    let compact: unknown, full: unknown;
+    app.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_task", { task_id: task.id, summary, state }), { stopReason: "toolUse" }),
+      () => fauxAssistantMessage(fauxToolCall("read_task", { conversation_id: task.conversation_id, include_history: false }), { stopReason: "toolUse" }),
+      (input) => {
+        compact = JSON.parse(toolResult(input, "read_task"));
+        return fauxAssistantMessage(fauxToolCall("read_task", { conversation_id: task.conversation_id, include_history: true }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        full = JSON.parse(toolResult(input, "read_task"));
+        return fauxAssistantMessage("The verified result is available without rereading history.");
+      },
+    ]);
+    assert.equal((await (await root.submit({ type: "input", content: "Read the completed conversation's status." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+    const saved = await app.tasks.get(task.id); assert.ok(object(compact));
+    assert.deepEqual(compact.task, { id: task.id, conversation_id: task.conversation_id, title: task.title, title_complete: true,
+      summary: saved.summary, summary_complete: true, state: { state: "resolved", evidence: state.evidence.slice(0, 4000) },
+      state_complete: false, updated_at: saved.updated_at });
+    assert.equal("history" in compact, false); assert.equal("originals" in compact, false);
+    assert.equal(JSON.stringify(compact).includes("PRIVATE_"), false);
+    assert.ok(object(full)); assert.ok(typeof full.history === "string"); assert.match(full.history, /PRIVATE_ORIGINAL_HISTORY/);
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("record_task confirms the saved state without replaying retained child evidence", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-record-confirmation-")); let app = await open(directory);
   let release = () => {};
@@ -156,7 +191,7 @@ test("record_task confirms the saved state without replaying retained child evid
     const state = { state: "waiting", actor: "Supplier reply", next_check: null } satisfies TaskRecord["state"];
     const root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
     await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
-    let confirmation: string | undefined, recorded: TaskRecord | undefined, read: unknown;
+    let confirmation: string | undefined, recorded: TaskRecord | undefined, read: unknown, conversationStatus: unknown;
     app.faux.setResponses([
       fauxAssistantMessage(fauxToolCall("record_task", { task_id: command.task_id, summary: "Waiting for the verified reply.",
         state, sources: [source] }), { stopReason: "toolUse" }),
@@ -166,6 +201,10 @@ test("record_task confirms the saved state without replaying retained child evid
       },
       (input) => {
         read = JSON.parse(toolResult(input, "read_task"));
+        return fauxAssistantMessage(fauxToolCall("read_task", { conversation_id: child.conversation_id, include_history: false }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        conversationStatus = JSON.parse(toolResult(input, "read_task"));
         return fauxAssistantMessage("The saved state and original evidence remain available.");
       },
     ]);
@@ -179,6 +218,11 @@ test("record_task confirms the saved state without replaying retained child evid
     assert.equal(recorded.summary, "Waiting for the verified reply."); assert.deepEqual(recorded.sources, [source]);
     assert.equal(recorded.outcome, before.outcome); assert.deepEqual(recorded.agents, before.agents); assert.deepEqual(recorded.pending, before.pending);
     assert.ok(object(read)); assert.deepEqual(read.task, recorded); assert.equal(read.history, childHistory);
+    assert.ok(object(conversationStatus)); assert.ok(object(conversationStatus.task)); assert.equal(conversationStatus.task.id, command.task_id);
+    const savedChild = recorded.agents.find(agent => agent.id === child.id); assert.ok(savedChild);
+    assert.deepEqual(conversationStatus.agent, { id: child.id, conversation_id: child.conversation_id, title: child.title, title_complete: true,
+      summary: childSummary, summary_complete: true, state: { state: "done" }, state_complete: true, updated_at: savedChild.updated_at });
+    assert.equal("history" in conversationStatus, false);
     release(); release = () => {}; await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.tasks.get(command.task_id);
     assert.deepEqual(reopened.state, state); assert.deepEqual(reopened.sources, [source]); assert.deepEqual(reopened.agents, before.agents);
