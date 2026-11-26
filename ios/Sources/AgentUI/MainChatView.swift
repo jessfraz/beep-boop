@@ -26,6 +26,7 @@ public struct MainChatView: View {
   @State private var sourceDetails = false
   @State private var followsLatest = true
   @State private var scrollPhase = ScrollPhase.idle
+  @State private var viewportSize = CGSize.zero
   @State private var atTop = false
   @State private var latestVisible = true
   @State private var presentedLatest = false
@@ -261,7 +262,7 @@ public struct MainChatView: View {
               .frame(maxWidth: .infinity).padding(.vertical, 32)
           }
           ForEach(items) { item in
-            Group {
+            VStack(alignment: .leading, spacing: 18) {
               switch item {
               case .message(let row):
                 MessageRow(
@@ -273,6 +274,7 @@ public struct MainChatView: View {
                   group: group, expansion: $activityExpansion, details: loadDetails,
                   onExpand: { followsLatest = false })
               }
+              if model.busy && item.id == items.last?.id { working }
             }
             .id(item.id)
             .scrollBounceBehavior(.basedOnSize, axes: .vertical)
@@ -281,16 +283,7 @@ public struct MainChatView: View {
             .listRowInsets(EdgeInsets(top: 9, leading: 16, bottom: 9, trailing: 16))
           }
 
-          if model.busy {
-            HStack(spacing: 8) {
-              ProgressView().controlSize(.mini)
-              Text("Working…").font(.footnote).foregroundStyle(.secondary)
-            }.frame(maxWidth: .infinity, alignment: .leading)
-              .accessibilityLabel("Beep Boop is working")
-          }
-          Color.clear.frame(height: 1).id(TranscriptControlAnchor.latest)
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden).listRowInsets(EdgeInsets())
+          if model.busy && items.isEmpty { working }
         } header: {
           if model.canLoadEarlier {
             Button {
@@ -302,7 +295,6 @@ public struct MainChatView: View {
               }
             }
             .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
-            .id(TranscriptControlAnchor.earlier)
             .onScrollVisibilityChange(threshold: 0.1) { visible in
               // Initial/live-tail layout is not an instruction to page backward.
               if visible && presentedLatest && !followsLatest { requestHistory() }
@@ -350,25 +342,30 @@ public struct MainChatView: View {
       }
       .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
         TranscriptEdges(
+          size: geometry.containerSize,
           top: geometry.contentOffset.y + geometry.contentInsets.top <= 80,
           latest: geometry.visibleRect.maxY >= geometry.contentSize.height - 1 / displayScale)
       } action: { _, current in
+        viewportSize = current.size
         atTop = current.top
         latestVisible = current.latest
         if current.latest && !model.rows.isEmpty { presentedLatest = true }
       }
       // Ending a touch can make following eligible without a new model update.
-      .task(id: followsLatest && !userScrolling ? model.revision : nil) {
+      .task(
+        id: followsLatest && !userScrolling
+          ? TranscriptFollowRequest(revision: model.revision, viewport: viewportSize) : nil
+      ) {
         guard followsLatest && !userScrolling else { return }
         await Task.yield()
         if !Task.isCancelled && followsLatest && !userScrolling {
-          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+          scrollToLatest(scroll)
         }
       }
       .onChange(of: notifications?.openedTarget) { _, target in
         if target != nil {
           followsLatest = true
-          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+          scrollToLatest(scroll)
         }
       }
       .overlay(alignment: .bottomTrailing) {
@@ -377,9 +374,9 @@ public struct MainChatView: View {
             followsLatest = true
             historyRequest = .latest(UUID())
             if reduceMotion {
-              scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+              scrollToLatest(scroll)
             } else {
-              withAnimation { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+              withAnimation { scrollToLatest(scroll) }
             }
           }
           .accessibilityIdentifier("latest-messages")
@@ -388,6 +385,20 @@ public struct MainChatView: View {
           .clipShape(Capsule()).padding()
         }
       }
+    }
+  }
+  private var working: some View {
+    HStack(spacing: 8) {
+      ProgressView().controlSize(.mini)
+      Text("Working…").font(.footnote).foregroundStyle(.secondary)
+    }.frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityLabel("Beep Boop is working")
+  }
+  private func scrollToLatest(_ scroll: ScrollViewProxy) {
+    // Keep status changes inside the actual last row so pending native scrolls
+    // cannot point to a row removed when a reply finishes or the app suspends.
+    if let last = model.transcriptItems.last {
+      scroll.scrollTo(last.id, anchor: .bottom)
     }
   }
   private func requestHistory() {
@@ -639,14 +650,14 @@ public struct MainChatView: View {
 // End visibility belongs to the viewport, not to a lazy one-pixel child.
 // Allow one display pixel for native content-size rounding at the end.
 private struct TranscriptEdges: Equatable {
+  let size: CGSize
   let top: Bool
   let latest: Bool
 }
 
-// Controls remain scroll-addressable without sharing transcript row identity.
-private enum TranscriptControlAnchor: Hashable {
-  case earlier
-  case latest
+private struct TranscriptFollowRequest: Equatable {
+  let revision: Int
+  let viewport: CGSize
 }
 
 private enum HistoryNavigation: Hashable {
