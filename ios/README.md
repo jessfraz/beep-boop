@@ -70,14 +70,15 @@ required for sharing on a phone; an unsigned build does not establish that.
   publication. Rendering and incoming pages
   are bounded; display truncation does not alter coordinator history.
 - Startup reads a bounded recent page. Scrolling to the top loads earlier
-  conversation while preserving the visible position. Tool-only pages are
+  conversation into the native list. Tool-only pages are
   coalesced until dialogue appears, with an eight-page, 500-row, 4 MiB batch
   limit; **Load earlier messages** remains available. At most 500 rows and
   4 MiB of display text remain in memory. The coordinator retains full history.
   **Latest** returns to a fresh recent page, retaining concurrent replies and
   pending messages. It stays available if paging evicted recent history;
   otherwise it disappears at the bottom. Live output stays at the bottom through
-  keyboard and composer size changes; scrolling up preserves the reading position.
+  keyboard and composer size changes. Dragging pauses automatic following;
+  live updates preserve the older reading position.
 - Consecutive tool calls and summaries share a compact disclosure. Progress
   messages stay visible. Expand activity to read every supplied summary or
   inspect a command's arguments, output, errors and status.

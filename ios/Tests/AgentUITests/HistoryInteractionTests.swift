@@ -238,7 +238,7 @@ final class HistoryInteractionTests: XCTestCase {
     app.launchArguments += ["-notificationsEnabled", "NO"]
     app.launch()
     addTeardownBlock { @MainActor in app.terminate() }
-    let transcript = app.scrollViews["transcript"]
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
     XCTAssertTrue(transcript.waitForExistence(timeout: 5))
     let recent = app.staticTexts.matching(NSPredicate(format: "label == %@", dialogue(24, 19)))
       .firstMatch
@@ -351,6 +351,107 @@ final class HistoryInteractionTests: XCTestCase {
     }
   }
 
+  func testSlowDragTakesControlOfTheLiveTranscriptWhileAReplyStreams() async throws {
+    let messages = (0..<10).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "drag-\(index)", finalChunk: true, role: .final,
+        text:
+          "Orchard section \(index). The inventory is ready for review. Each crate has a recorded destination and the next delivery can proceed once its label is checked."
+      )
+    }
+    let peer = InteractionPeer()
+    let longReply = (0..<40).map { index in
+      "Orchard paragraph \(index). This report keeps each crate's destination available for review and records the next step before its label is printed."
+    }.joined(separator: "\n\n")
+    let app = try await launchMessages(
+      messages + [
+        .init(
+          continuation: false, entryId: "long-report", finalChunk: true, role: .final,
+          text: longReply)
+      ], peer: peer)
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
+    XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+    try await peer.beginReply("The inventory review is in progress. ")
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 3))
+    let leading = try XCTUnwrap(
+      app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Orchard paragraph "))
+        .allElementsBoundByIndex.first { $0.isHittable && $0.frame.minY >= transcript.frame.minY })
+    let retained = app.staticTexts.matching(NSPredicate(format: "label == %@", leading.label))
+      .firstMatch
+    let position = retained.frame.minY
+    let stream = Task.detached {
+      // Start output after the finger lands, then keep it arriving during the drag.
+      try await Task.sleep(for: .seconds(1))
+      for index in 0..<160 {
+        try Task.checkCancellation()
+        try await peer.beginReply("Crate \(index) has a verified destination. ")
+        // Model output continues arriving while the native finger gesture owns the screen.
+        try await Task.sleep(for: .milliseconds(30))
+      }
+    }
+    defer { stream.cancel() }
+    let start = transcript.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+    let end = transcript.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7))
+    start.press(
+      forDuration: 0.1, thenDragTo: end, withVelocity: XCUIGestureVelocity(rawValue: 150),
+      thenHoldForDuration: 0.1)
+    XCTAssertTrue(app.buttons["latest-messages"].exists)
+    XCTAssertEqual(
+      retained.frame.minY, position + end.screenPoint.y - start.screenPoint.y, accuracy: 40,
+      "A slow drag must move the report with the finger, without jumping to a message boundary")
+    try await stream.value
+    let readingPosition = retained.frame.minY
+    try await peer.reply("The inventory review is complete.", id: "drag-complete")
+    XCTAssertTrue(app.buttons["Stop response"].waitForNonExistence(timeout: 3))
+    XCTAssertEqual(
+      retained.frame.minY, readingPosition, accuracy: 2,
+      "Completing the reply must preserve the position chosen by the drag")
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "slow-drag-preserves-reading-position-during-stream"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+  }
+
+  func testShortTouchDoesNotLeaveACompletedReplyBehind() async throws {
+    let messages = (0..<30).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "touch-\(index)", finalChunk: true, role: .final,
+        text:
+          "Inventory section \(index). Each crate has a recorded destination and a checked label.")
+    }
+    let peer = InteractionPeer()
+    let app = try await launchMessages(messages, peer: peer)
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
+    XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+    try await peer.beginReply("The inventory review is in progress. ")
+    XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 3))
+    XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 3))
+    let lastParagraph = "The final inventory entry is confirmed."
+    let finalText =
+      (0..<30).map { index in
+        "Checked inventory section \(index). The next crate has a verified destination and a recorded shipping label."
+      }.joined(separator: "\n\n") + "\n\n" + lastParagraph
+    let held = app.staticTexts[messages.last!.text]
+    XCTAssertTrue(held.isHittable)
+    let point = held.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint
+    let touch = app.coordinate(withNormalizedOffset: .zero)
+      .withOffset(CGVector(dx: point.x, dy: point.y))
+    let finish = Task.detached {
+      // Deliver the final reply around a short native touch.
+      try await Task.sleep(for: .milliseconds(150))
+      try await peer.reply(finalText, id: "stationary-touch-final")
+    }
+    defer { finish.cancel() }
+    // Stay below the native message context-menu duration.
+    touch.press(forDuration: 0.2)
+    try await finish.value
+    XCTAssertTrue(app.buttons["Stop response"].waitForNonExistence(timeout: 3))
+    try await eventually(description: "completed reply after releasing the native touch") {
+      app.staticTexts[lastParagraph].isHittable && !app.buttons["latest-messages"].exists
+    }
+  }
+
   func testRotationKeepsTheLiveTailAndOlderReadingPosition() async throws {
     let paragraph =
       "The orchard inventory is ready for review. Each crate has a recorded destination and the next delivery can proceed once the remaining labels are checked."
@@ -363,7 +464,7 @@ final class HistoryInteractionTests: XCTestCase {
     let app = try await launchMessages(messages, peer: peer)
     continueAfterFailure = true
     defer { XCUIDevice.shared.orientation = .portrait }
-    let transcript = app.scrollViews["transcript"]
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
     let latest = app.staticTexts.matching(
       NSPredicate(format: "label == %@", messages.last!.text)
     ).firstMatch
@@ -1305,7 +1406,7 @@ final class HistoryInteractionTests: XCTestCase {
     app.launchArguments += ["-notificationsEnabled", "NO"]
     app.launch()
     defer { app.terminate() }
-    let transcript = app.scrollViews["transcript"]
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
     XCTAssertTrue(transcript.waitForExistence(timeout: 5))
     XCTAssertTrue(app.staticTexts[recent.last!.text].waitForExistence(timeout: 5))
     XCTAssertTrue(app.buttons["latest-messages"].waitForNonExistence(timeout: 5))
@@ -1327,17 +1428,15 @@ final class HistoryInteractionTests: XCTestCase {
     let heldRequests = await peer.cursors()
     XCTAssertEqual(
       heldRequests, ["one"], "Scrolling during a pending page started another request")
-    let settledAnchor = group.frame
     await peer.release("one")
     try await eventually {
       await peer.cursors() == ["one", "two", "three"]
         && app.buttons["Load earlier messages"].isEnabled
     }
-    XCTAssertEqual(
-      group.frame.minY, settledAnchor.minY, accuracy: 2,
-      "Prepending history moved the visible group")
+    XCTAssertTrue(group.isHittable, "Native history insertion must retain the visible group")
+    XCTAssertTrue(app.buttons["latest-messages"].isHittable)
     XCTAssertEqual(group.frame.height, anchor.height, accuracy: 2)
-    XCTAssertTrue(app.staticTexts[earlier].exists)
+    XCTAssertTrue(app.staticTexts[earlier].isHittable)
     let receipt = XCTAttachment(screenshot: app.screenshot())
     receipt.name = "tool-heavy-history-preserves-visible-group"
     receipt.lifetime = .keepAlways

@@ -73,11 +73,15 @@ marketing version. Let Xcode Cloud increment it afterwards. Switching from a
 manual build to Cloud build `1` without changing the marketing version can
 collide with an existing upload.
 
-Verify the first main-branch build in App Store Connect: the required tests and
+Verify every main-branch delivery in App Store Connect: the required tests and
 archive must pass, the commit must match the intended push, the TestFlight
 build must say **Internal**, and the selected private group must receive it.
 Hook presence alone does not establish that the account's workflow is enabled
 or that a signed upload succeeded.
+
+Check Xcode Cloud usage when a build is cancelled without an upload. Quota
+exhaustion cancels builds before they reach TestFlight. Restore build quota,
+start a fresh build from the intended main commit, and verify its upload.
 
 Apple references:
 
