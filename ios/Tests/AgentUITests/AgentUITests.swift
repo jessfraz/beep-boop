@@ -153,8 +153,7 @@ final class AgentUITests: XCTestCase {
     replace(composer, with: draft)
     XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
     XCTAssertTrue(app.staticTexts["No messages yet"].exists)
-    let transcript = app.scrollViews.containing(.staticText, identifier: "No messages yet")
-      .firstMatch
+    let transcript = app.descendants(matching: .any).matching(identifier: "transcript").firstMatch
     XCTAssertTrue(transcript.waitForExistence(timeout: 3))
     capture("transcript-before-drag", app: app)
     // The scroll view's accessibility frame includes the overlaid composer.
