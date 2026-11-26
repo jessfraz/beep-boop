@@ -116,16 +116,17 @@ async function requestedResult(occurrence: ScheduledOccurrence, conversation: Co
 }
 
 async function reconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
-  conversation: ConversationId, requestId: string): Promise<boolean> {
+  conversation: ConversationId, requestId: string, signal: AbortSignal): Promise<boolean> {
+  await sources.prepareReconciliations(id, conversation, requestId, signal);
   // A successful exact recovery settles that input while the actor can continue
   // other work. Resolving the whole task still requires quiescence.
   return session.commit(async (tx) => await sources.reconcilesIn(tx, id, conversation, requestId) ||
     (await tasks.canSettleScheduledIn(tx, id, conversation) && await tasks.canReleaseIn(tx, id)), BACKGROUND_CONTEXT);
 }
 
-async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {
+async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string, signal: AbortSignal): Promise<void> {
   const conversation = await tasks.conversation((await tasks.get(id)).conversation_id);
-  if (!await reconciledTask(session, tasks, sources, id, conversation.id, requestId)) {
+  if (!await reconciledTask(session, tasks, sources, id, conversation.id, requestId, signal)) {
     throw new TaskError("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
   }
 }
@@ -135,14 +136,14 @@ async function requireReconciledTask(session: Harness, tasks: TaskStore, sources
 async function recoverScheduledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string,
   requestId: string, signal: AbortSignal): Promise<void> {
   const task = await tasks.get(id), conversation = await tasks.conversation(task.conversation_id);
-  if (await reconciledTask(session, tasks, sources, id, conversation.id, requestId)) return;
+  if (await reconciledTask(session, tasks, sources, id, conversation.id, requestId, signal)) return;
   const original = await session.commit(tx => tx.submissionByRequest(conversation.id, requestId), BACKGROUND_CONTEXT);
   if (original?.type === "input" && original.status === "unanswered") {
     const explicitId = "scheduled-recovery:" + original.id;
     const explicit = await session.commit(tx => tx.submissionByRequest(conversation.id, explicitId), BACKGROUND_CONTEXT);
     const explicitPending = task.pending.some(input => input.id === explicitId);
     const quota = original.reason === "model_error" && typeof original.detail === "string" && isQuotaExhaustion(original.detail);
-    if (!quota && explicit === undefined && !explicitPending) { await requireReconciledTask(session, tasks, sources, id, requestId); return; }
+    if (!quota && explicit === undefined && !explicitPending) { await requireReconciledTask(session, tasks, sources, id, requestId, signal); return; }
     if (signal.aborted) throw new TaskError("Scheduled work stopped with the coordinator; its admission is retained");
     const recoveryId = explicit !== undefined || explicitPending ? explicitId : "quota-recovery:" + original.id;
     const recovery = recoveryId === explicitId ? explicit : await session.commit(tx => tx.submissionByRequest(conversation.id, recoveryId), BACKGROUND_CONTEXT);
@@ -156,7 +157,7 @@ async function recoverScheduledTask(session: Harness, tasks: TaskStore, sources:
     // automatic attempt after an abort, unrelated error or missing reconciliation.
     if (recovery === undefined || recovery.status === "queued" || recovery.status === "placed") await tasks.runBackground(id, signal);
   }
-  await requireReconciledTask(session, tasks, sources, id, requestId);
+  await requireReconciledTask(session, tasks, sources, id, requestId, signal);
 }
 
 /** Every new occurrence owns a fresh actor; replay and recovery retain only
@@ -217,7 +218,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
       const observed = revision;
       submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
       if (submission?.status === "unanswered") {
-        await requireReconciledTask(session, tasks, sources, id, occurrence.id);
+        await requireReconciledTask(session, tasks, sources, id, occurrence.id, signal);
         await requestedResult(occurrence, conversation, tasks, id); return;
       }
       if (submission?.status === "done") { await requestedResult(occurrence, conversation, tasks, id); return; }

@@ -22,7 +22,8 @@ function object(value: unknown): value is Record<string, unknown> {
 async function open(directory: string, clock: FakeClock) {
   const app = await openScheduled(directory, "original", clock);
   const progress = new WorkflowProgress(app.session, app.registry, app.tasks, clock.now);
-  progress.useReceipts((tx, id, conversation, request) => app.sources.reconcilesIn(tx, id, conversation, request));
+  progress.useReceipts((tx, id, conversation, request) => app.sources.reconcilesIn(tx, id, conversation, request),
+    (id, conversation, request, signal) => app.sources.prepareReconciliations(id, conversation, request, signal));
   return { ...app, progress };
 }
 async function work(app: Awaited<ReturnType<typeof open>>, job: ScheduledJob, key: string, ownerId?: string) {
