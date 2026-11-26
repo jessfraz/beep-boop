@@ -953,6 +953,7 @@ export class TaskStore {
     const conversation = await this.conversation(conversationId);
     const refs = (task?.sources ?? []).map(sourceReference);
     if (imported !== undefined) refs.push(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
+    Object.freeze(refs);
     const revisions = new Map<string, RevisionView>();
     for await (const entries of this.historyPages(conversation, { order: "ascending" })) {
       for (const entry of entries) {

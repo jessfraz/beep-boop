@@ -10,15 +10,16 @@ import type { EmbeddingSpace } from "./generated/EmbeddingSpace.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import { mutatePublished, type SearchMutation, type StagedChunk } from "./search-mutations.js";
 import { candidateRanks, useCandidates } from "./search-candidates.js";
+import { prepareSourceSets, sourceReferences, sourceSet, sourceSetsPending, type SourceSet } from "./search-sources.js";
 
-export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: string[]; gaps?: string[] };
+export type SearchRecord = { entry_id: string; ordinal: number; text: string; source_refs: readonly string[]; gaps?: string[] };
 export type SearchWatermark = { conversation_id: string; watermark: string };
 export type SearchMatch = { entry_id: string; text: string; source_refs: string[] };
 export type SearchCandidate = { conversation_id: string; score: number; matches: SearchMatch[] };
 export type SearchResult = { candidates: SearchCandidate[]; gaps: string[] };
 export type Embed = (texts: string[], purpose: EmbeddingPurpose) => Promise<EmbeddingBatch>;
 type Row = Record<string, SQLOutputValue>;
-type Chunk = SearchRecord & { part: number; hash: string };
+type Chunk = Omit<SearchRecord, "source_refs"> & { part: number; hash: string; source_set: string };
 type RankedChunk = { id: number; value: number };
 const CHUNKER = "message-utf8-2048-overlap-256-v4";
 const SOURCE_PROJECTION = "observed-source-revisions-v2";
@@ -29,11 +30,6 @@ function string(row: Row, key: string): string {
 }
 function number(row: Row, key: string): number {
   const value = row[key]; if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Invalid search ${key}`); return value;
-}
-function refs(value: string): string[] {
-  const decoded: unknown = JSON.parse(value);
-  if (!Array.isArray(decoded) || !decoded.every((item): item is string => typeof item === "string")) throw new Error("Invalid search provenance");
-  return decoded;
 }
 function space(value: unknown): EmbeddingSpace {
   if (value === null || typeof value !== "object" || Array.isArray(value) ||
@@ -47,16 +43,15 @@ function space(value: unknown): EmbeddingSpace {
   return { id: value.id, model_revision: value.model_revision, model_digest: value.model_digest,
     dimensions: value.dimensions, pooling: value.pooling, normalization: value.normalization, instruction_version: value.instruction_version };
 }
-function* chunks(record: SearchRecord): Generator<Chunk> {
+function* chunks(record: SearchRecord, source_set: string): Generator<Chunk> {
   if (record.entry_id.length === 0 || !Number.isSafeInteger(record.ordinal) || record.ordinal < 0) throw new Error("Invalid search record identity");
-  const source_refs = [...new Set(record.source_refs)].sort();
-  if (source_refs.some((ref) => ref.length === 0 || ref.length > 2048)) throw new Error("Invalid search source references");
   const bytes = Buffer.from(record.text); let part = 0;
   for (let start = 0; start < bytes.length;) {
     let end = Math.min(start + 2048, bytes.length);
     while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
     const text = bytes.subarray(start, end).toString("utf8");
-    if (text.trim().length > 0) yield { ...record, text, source_refs, part: part++, hash: createHash("sha256").update(CHUNKER + "\0" + text).digest("hex") };
+    if (text.trim().length > 0) yield { entry_id: record.entry_id, ordinal: record.ordinal, text, source_set,
+      part: part++, hash: createHash("sha256").update(CHUNKER + "\0" + text).digest("hex") };
     if (end === bytes.length) break;
     start = end - 256;
     while ((bytes[start]! & 0xc0) === 0x80) start += 1;
@@ -152,12 +147,10 @@ export class SearchIndex {
       CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, watermark TEXT NOT NULL DEFAULT '', dirty INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL, hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL,
+        entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL, hash TEXT NOT NULL, text TEXT NOT NULL, source_set TEXT NOT NULL,
         UNIQUE(conversation_id,entry_id,part));
       CREATE INDEX IF NOT EXISTS chunks_text_hash ON chunks(hash);
       DROP INDEX IF EXISTS chunks_hash;
-      CREATE TABLE IF NOT EXISTS source_refs(ref TEXT NOT NULL, chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE, PRIMARY KEY(ref,chunk_id));
-      CREATE INDEX IF NOT EXISTS refs_chunk ON source_refs(chunk_id);
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text,content='chunks',content_rowid='id');
       CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES(new.id,new.text); END;
       CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES('delete',old.id,old.text); END;`);
@@ -168,8 +161,9 @@ export class SearchIndex {
     if (!this.db.prepare("PRAGMA table_info(staging)").all().some((row) => string(row, "name") === "conversation_id")) this.db.exec("DROP TABLE IF EXISTS staging");
     this.db.exec(`CREATE TABLE IF NOT EXISTS staging(conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
       run TEXT NOT NULL, entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, part INTEGER NOT NULL,
-      hash TEXT NOT NULL, text TEXT NOT NULL, source_refs TEXT NOT NULL, embedding BLOB NOT NULL, PRIMARY KEY(conversation_id,entry_id,part));
+      hash TEXT NOT NULL, text TEXT NOT NULL, source_set TEXT NOT NULL, embedding BLOB NOT NULL, PRIMARY KEY(conversation_id,entry_id,part));
       CREATE INDEX IF NOT EXISTS staging_hash ON staging(conversation_id,hash);`);
+    prepareSourceSets(this.db);
     const saved = this.db.prepare("SELECT value FROM metadata WHERE key='space'").get();
     if (saved !== undefined) {
       this.space = space(JSON.parse(string(saved, "value")));
@@ -191,7 +185,7 @@ export class SearchIndex {
       this.db.exec("PRAGMA query_only=ON");
       // Existing projections prepare their derived candidates off the caller's
       // event loop. Readers keep the exact path until preparation commits.
-      if (this.space !== undefined) this.publisher = new IndexWorker("./search-publisher.js", this.source, "History publication");
+      if (this.space !== undefined || sourceSetsPending(this.db)) this.publisher = new IndexWorker("./search-publisher.js", this.source, "History publication");
     }
   }
   close(): Promise<void> {
@@ -235,6 +229,8 @@ export class SearchIndex {
       await this.markDirty(conversation_id);
       const revision = number(this.db.prepare("SELECT revision FROM conversations WHERE id=?").get(conversation_id)!, "revision");
       const run = randomUUID(); let pending: Chunk[] = []; const gaps = new Set<string>();
+      const immutable = new WeakMap<readonly string[], SourceSet>(), announced = new Set<string>();
+      let sources: SourceSet[] = [];
       const stage = async () => {
         if (pending.length === 0) return;
         const batch = pending; pending = [];
@@ -261,9 +257,10 @@ export class SearchIndex {
         const staged: StagedChunk[] = batch.map((chunk) => {
           const embedding = cached.get(chunk.hash);
           if (embedding === undefined) throw new Error("Search batch has no embedding");
-          return { entry_id: chunk.entry_id, ordinal: chunk.ordinal, part: chunk.part, hash: chunk.hash, text: chunk.text, source_refs: chunk.source_refs, embedding };
+          return { entry_id: chunk.entry_id, ordinal: chunk.ordinal, part: chunk.part, hash: chunk.hash, text: chunk.text, source_set: chunk.source_set, embedding };
         });
-        await this.publish({ type: "stage", conversation_id, run, chunks: staged });
+        await this.publish({ type: "stage", conversation_id, run, chunks: staged, sources });
+        sources = [];
         // Cache hits need no model I/O. Keep queued chat requests moving
         // between durable batches instead of monopolizing the event loop.
         await setImmediate();
@@ -272,7 +269,15 @@ export class SearchIndex {
       // become visible; cached rows removed from the source keep their old tag.
       for await (const record of records) {
         for (const gap of record.gaps ?? []) gaps.add(gap);
-        for (const chunk of chunks(record)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
+        // Generic producers may mutate and reuse their arrays between yields.
+        // Only explicitly frozen arrays can retain an identity-based result.
+        let set = immutable.get(record.source_refs);
+        if (set === undefined) {
+          set = sourceSet(record.source_refs);
+          if (Object.isFrozen(record.source_refs)) immutable.set(record.source_refs, set);
+        }
+        if (!announced.has(set.id)) { sources.push(set); announced.add(set.id); }
+        for (const chunk of chunks(record, set.id)) { pending.push(chunk); if (pending.length === BATCH) await stage(); }
       }
       await stage();
       await this.publish({ type: "publish", conversation_id, run, watermark, revision, gaps: [...gaps], vectors: this.space !== undefined });
@@ -335,6 +340,8 @@ export function readPublished(db: DatabaseSync, input: PublishedSearch): SearchR
     const exactIds = new Set<number>();
     const dirty = db.prepare("SELECT count(*) AS count FROM conversations WHERE dirty<>0").get();
     if (dirty !== undefined && number(dirty, "count") > 0) gaps.push(`${number(dirty, "count")} conversations await indexing`);
+    const provenancePending = sourceSetsPending(db);
+    if (provenancePending) gaps.push("History source provenance migration is in progress");
     gaps.push(...input.gaps);
     try {
       if (input.vector !== null) {
@@ -351,7 +358,13 @@ export function readPublished(db: DatabaseSync, input: PublishedSearch): SearchR
     // while the writable owner publishes a replacement on another thread.
     const exact = [...new Set([...source_refs, query.trim()])].filter((ref) => ref.length > 0 && ref.length <= 2048).slice(0, 64);
     if (exact.length > 0) {
-      const matches = db.prepare(`SELECT DISTINCT chunk_id AS id FROM source_refs WHERE ref IN (${exact.map(() => "?").join(",")}) LIMIT ?`).all(...exact, take).map((row) => number(row, "id"));
+      const parameters = exact.map(() => "?").join(",");
+      const current = `SELECT c.chunk_id AS id FROM source_set_refs r JOIN chunk_source_sets c ON c.set_id=r.set_id WHERE r.ref IN (${parameters})`;
+      const legacy = provenancePending && db.prepare("SELECT 1 FROM sqlite_schema WHERE name='source_refs'").get() !== undefined;
+      const matches = db.prepare(legacy
+        ? `SELECT DISTINCT id FROM (${current} UNION ALL SELECT r.chunk_id AS id FROM source_refs r
+          WHERE r.ref IN (${parameters}) AND NOT EXISTS (SELECT 1 FROM chunk_source_sets c WHERE c.chunk_id=r.chunk_id)) LIMIT ?`
+        : `SELECT DISTINCT id FROM (${current}) LIMIT ?`).all(...exact, ...(legacy ? exact : []), take).map((row) => number(row, "id"));
       for (const id of matches) exactIds.add(id);
     }
     const tokens = query.match(/[\p{L}\p{N}_]+/gu)?.slice(0, 32) ?? [];
@@ -371,17 +384,35 @@ export function readPublished(db: DatabaseSync, input: PublishedSearch): SearchR
     // Exact source identity outranks either search mode.
     rank([...exactIds].sort((left, right) => (scores.get(right) ?? 0) - (scores.get(left) ?? 0) || left - right), 3);
     if (scores.size === 0) return { candidates: [], gaps };
-    const rows = db.prepare(`SELECT id,conversation_id,entry_id,text,source_refs FROM chunks WHERE id IN (${[...scores].map(() => "?").join(",")})`).all(...scores.keys());
-    const candidates = new Map<string, SearchCandidate>();
+    const rows = db.prepare(`SELECT id,conversation_id,entry_id FROM chunks WHERE id IN (${[...scores].map(() => "?").join(",")})`).all(...scores.keys());
+    const candidates = new Map<string, { conversation_id: string; score: number; matches: { id: number; entry_id: string }[] }>();
     for (const row of rows.sort((left, right) => (scores.get(number(right, "id")) ?? 0) - (scores.get(number(left, "id")) ?? 0))) {
       const id = string(row, "conversation_id"); let candidate = candidates.get(id);
       if (candidate === undefined) { candidate = { conversation_id: id, score: scores.get(number(row, "id")) ?? 0, matches: [] }; candidates.set(id, candidate); }
       const entry_id = string(row, "entry_id");
       if (candidate.matches.length < 3 && !candidate.matches.some((match) => match.entry_id === entry_id)) {
-        candidate.matches.push({ entry_id, text: string(row, "text"), source_refs: refs(string(row, "source_refs")) });
+        candidate.matches.push({ id: number(row, "id"), entry_id });
       }
     }
-    const selected = [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit);
+    const ranked = [...candidates.values()].sort((left, right) => right.score - left.score).slice(0, limit);
+    const references = new Map<string, string[]>();
+    const ids = ranked.flatMap(candidate => candidate.matches.map(match => match.id));
+    const hydrated = new Map(db.prepare(`SELECT id,text,source_set FROM chunks WHERE id IN (${ids.map(() => "?").join(",")})`).all(...ids)
+      .map(row => [number(row, "id"), row]));
+    const sets = [...new Set([...hydrated.values()].map(row => string(row, "source_set")).filter(set => !set.startsWith("[")))];
+    if (sets.length > 0) for (const row of db.prepare(`SELECT id,refs FROM source_sets WHERE id IN (${sets.map(() => "?").join(",")})`).all(...sets)) {
+      references.set(string(row, "id"), sourceReferences(string(row, "refs")));
+    }
+    const selected: SearchCandidate[] = ranked.map(candidate => ({ ...candidate, matches: candidate.matches.map(match => {
+      const row = hydrated.get(match.id); if (row === undefined) throw new Error("Missing published search chunk");
+      const set = string(row, "source_set");
+      let refs = references.get(set);
+      if (refs === undefined) {
+        if (!set.startsWith("[")) throw new Error("Missing published search provenance");
+        refs = sourceReferences(set); references.set(set, refs);
+      }
+      return { entry_id: match.entry_id, text: string(row, "text"), source_refs: refs };
+    }) }));
     if (selected.length > 0) for (const row of db.prepare(`SELECT gaps FROM conversations WHERE id IN (${selected.map(() => "?").join(",")})`).all(...selected.map((candidate) => candidate.conversation_id))) {
       const coverage: unknown = JSON.parse(string(row, "gaps"));
       if (!Array.isArray(coverage) || !coverage.every((gap): gap is string => typeof gap === "string")) throw new Error("Invalid indexed source coverage");

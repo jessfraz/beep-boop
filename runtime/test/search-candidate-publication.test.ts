@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { backfillCandidates, candidateRanks } from "../src/search-candidates.js";
 import { mutatePublished } from "../src/search-mutations.js";
 import { SearchIndex, type Embed, type SearchRecord } from "../src/search.js";
+import { sourceSet } from "../src/search-sources.js";
 
 class ObservedDatabase extends DatabaseSync {
   readonly statements: StatementSync[] = [];
@@ -47,8 +48,9 @@ test("candidate batches resume their durable cursor, roll back cancellation and 
     const query = vector.map(value => -value);
     const queryBytes = new Uint8Array(new Float32Array(query).buffer);
     mutatePublished(database, { type: "dirty", conversation_id: "replacement" });
-    mutatePublished(database, { type: "stage", conversation_id: "replacement", run: "two", chunks: [0, 1].map(ordinal => ({
-      entry_id: `replacement-${ordinal}`, ordinal, part: 0, hash: `replacement-${ordinal}`, text: `Replacement ${ordinal}`, source_refs: ["synthetic:replacement"],
+    const sources = sourceSet(["synthetic:replacement"]);
+    mutatePublished(database, { type: "stage", conversation_id: "replacement", run: "two", sources: [sources], chunks: [0, 1].map(ordinal => ({
+      entry_id: `replacement-${ordinal}`, ordinal, part: 0, hash: `replacement-${ordinal}`, text: `Replacement ${ordinal}`, source_set: sources.id,
       embedding: new Uint8Array(new Float32Array(query.map((value, position) => ordinal === 1 && position === 0 ? -value : value)).buffer),
     })) });
     mutatePublished(database, { type: "publish", conversation_id: "replacement", run: "two", watermark: "two", revision: 0, gaps: [], vectors: true });
@@ -58,7 +60,7 @@ test("candidate batches resume their durable cursor, roll back cancellation and 
     assert.deepEqual(ranked, expected, "The real binary candidate query must rerank retained floats exactly for both separated semantic matches");
     assert.deepEqual(ranked.map(row => {
       const id = row.id; assert.ok(typeof id === "number");
-      return { ...database.prepare("SELECT entry_id,text,source_refs FROM chunks WHERE id=?").get(id) };
+      return { ...database.prepare("SELECT c.entry_id,c.text,s.refs AS source_refs FROM chunks c JOIN source_sets s ON s.id=c.source_set WHERE c.id=?").get(id) };
     }), [
       { entry_id: "replacement-0", text: "Replacement 0", source_refs: '["synthetic:replacement"]' },
       { entry_id: "replacement-1", text: "Replacement 1", source_refs: '["synthetic:replacement"]' },
