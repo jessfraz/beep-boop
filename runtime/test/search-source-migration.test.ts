@@ -6,7 +6,8 @@ import { constants, DatabaseSync, type StatementSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { SearchIndex, readPublished, type Embed, type SearchRecord } from "../src/search.js";
-import { backfillSourceSets, prepareSourceSets, sourceSetsPending } from "../src/search-sources.js";
+import { mutatePublished } from "../src/search-mutations.js";
+import { backfillSourceSets, prepareSourceSets, sourceSet, sourceSetsPending } from "../src/search-sources.js";
 
 const references = Object.freeze(Array.from({ length: 128 }, (_, ordinal) => `invented:thread-${ordinal}`));
 const embed: Embed = async texts => ({ space: { id: "legacy-source-sets", model_revision: "fixture", model_digest: "fixture",
@@ -61,6 +62,30 @@ class ObservedDatabase extends DatabaseSync {
   override prepare(sql: string): StatementSync { const statement = super.prepare(sql); this.statements.push(statement); return statement; }
 }
 
+test("partial source migration keeps write volume proportional to shared members and converted chunks", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-migration-writes-")), path = join(directory, "search.sqlite");
+  const refs = Object.freeze(Array.from({ length: 2048 }, (_, ordinal) => `invented:resource-${ordinal}`));
+  let db: DatabaseSync | undefined;
+  try {
+    await legacy(path, { count: 96, refs, staged: 0 }); db = open(path); prepareSourceSets(db);
+    const changes = () => {
+      const value = db?.prepare("SELECT total_changes() AS n").get()?.n; assert.ok(typeof value === "number"); return value;
+    };
+    const owners = () => {
+      const value = db?.prepare("SELECT count(*) AS n FROM chunk_source_sets").get()?.n; assert.ok(typeof value === "number"); return value;
+    };
+    for (let batch = 0; batch < 2; batch++) {
+      const before = changes(), previous = owners();
+      assert.equal(backfillSourceSets(db, () => false), true);
+      const converted = owners() - previous, writes = changes() - before;
+      assert.ok(converted > 0 && converted <= 32);
+      const budget = (batch === 0 ? refs.length : 0) + 4 * converted + 4;
+      t.diagnostic(JSON.stringify({ batch, converted, writes, budget }));
+      assert.ok(writes <= budget, `A partial batch wrote ${writes} rows for ${converted} chunks and ${refs.length} shared members; budget ${budget}`);
+    }
+  } finally { db?.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("legacy source sets migrate in resumable bounded transactions while exact provenance and all cached vectors remain intact", async t => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-migration-")), path = join(directory, "search.sqlite");
   let db: DatabaseSync | undefined;
@@ -105,6 +130,41 @@ test("legacy source sets migrate in resumable bounded transactions while exact p
     assert.equal(result.gaps.includes("History source provenance migration is in progress"), false);
     capturePlans();
     t.diagnostic(JSON.stringify({ legacyPublicationPlan: before, actualMigrationAndReadPlans: [...plans.values()] }));
+  } finally { db?.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("publication during migration suppresses retained stale references and deleted chunks still release their legacy owners", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-migration-publication-")), path = join(directory, "search.sqlite");
+  let db: DatabaseSync | undefined;
+  try {
+    await legacy(path, { count: 64, staged: 0 }); db = open(path); prepareSourceSets(db);
+    assert.equal(backfillSourceSets(db, () => false), true);
+    const retained = db.prepare(`SELECT c.id,c.entry_id,c.ordinal,c.part,c.hash,c.text,v.embedding FROM chunks c
+      JOIN chunk_vectors v ON v.rowid=c.id ORDER BY c.id LIMIT 1`).get();
+    assert.ok(retained && typeof retained.id === "number" && typeof retained.entry_id === "string"
+      && typeof retained.ordinal === "number" && typeof retained.part === "number" && typeof retained.hash === "string"
+      && typeof retained.text === "string" && retained.embedding instanceof Uint8Array);
+    const corrected = sourceSet(["invented:corrected"]);
+    mutatePublished(db, { type: "stage", conversation_id: "invented", run: "corrected", sources: [corrected], chunks: [{
+      entry_id: retained.entry_id, ordinal: retained.ordinal, part: retained.part, hash: retained.hash, text: retained.text,
+      source_set: corrected.id, embedding: retained.embedding,
+    }] });
+    const revision = db.prepare("SELECT revision FROM conversations WHERE id='invented'").get()?.revision; assert.ok(typeof revision === "number");
+    mutatePublished(db, { type: "publish", conversation_id: "invented", run: "corrected", watermark: "corrected", revision, gaps: [], vectors: true });
+    assert.equal(sourceSetsPending(db), true);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM source_refs").get()?.n, references.length,
+      "Deleting obsolete chunks must cascade their legacy references while the retained chunk keeps its deferred rows");
+    const lookup = (ref: string) => readPublished(db!, { query: "", vector: null, space: null, source_refs: [ref], limit: 8, mode: "keyword", gaps: [] });
+    assert.deepEqual(lookup(references[0]!).candidates, [], "Converted ownership must suppress the retained obsolete exact-source match");
+    assert.deepEqual(lookup("invented:corrected").candidates[0]?.matches, [{
+      entry_id: retained.entry_id, text: retained.text, source_refs: ["invented:corrected"],
+    }]);
+    assert.deepEqual(db.prepare("SELECT id FROM chunks").all().map(row => row.id), [retained.id]);
+    assert.deepEqual(db.prepare("SELECT embedding FROM chunk_vectors WHERE rowid=?").get(retained.id)?.embedding, retained.embedding);
+    while (backfillSourceSets(db, () => false)) { /* Finish the retained generation without rewriting its vector. */ }
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE name='source_refs'").get(), undefined);
+    assert.equal(db.prepare("PRAGMA foreign_key_check").all().length, 0);
+    assert.deepEqual(lookup("invented:corrected").gaps, []);
   } finally { db?.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

@@ -75,9 +75,6 @@ export function backfillSourceSets(database: DatabaseSync, canceled: () => boole
     requireOpen();
     const update = database.prepare(`UPDATE ${table} SET source_set=? WHERE ${key}=?`);
     const owner = database.prepare("INSERT OR REPLACE INTO chunk_source_sets(chunk_id,set_id) VALUES(?,?)");
-    // This table exists only while upgrading the former expanded projection.
-    const legacyRefs = table === "chunks" && database.prepare("SELECT 1 FROM sqlite_schema WHERE name='source_refs'").get() !== undefined
-      ? database.prepare("DELETE FROM source_refs WHERE chunk_id=?") : undefined;
     let next = cursor, bytes = 0;
     for (const row of database.prepare(`SELECT ${key} AS id,source_set FROM ${table} WHERE ${key}>? ORDER BY ${key} LIMIT ?`).iterate(cursor, BATCH)) {
       requireOpen();
@@ -92,15 +89,16 @@ export function backfillSourceSets(database: DatabaseSync, canceled: () => boole
         internSourceSet(database, interned);
         set = interned.id; update.run(set, row.id);
       }
-      if (table === "chunks") { owner.run(row.id, set); legacyRefs?.run(row.id); }
+      if (table === "chunks") owner.run(row.id, set);
       next = row.id;
       if (bytes >= BYTES) break;
     }
     const more = database.prepare(`SELECT 1 FROM ${table} WHERE ${key}>? LIMIT 1`).get(next) !== undefined;
     const state = more ? `${table}:${next}` : table === "chunks" ? "staging:0" : "ready";
     if (state === "ready") {
-      // Converted rows now contain short IDs; this index never copies legacy
-      // megabyte arrays. Expanded associations were removed with each owner.
+      // Converted owners already suppress their legacy lookup rows. Drop the
+      // expanded projection once instead of deleting its rows for every chunk.
+      // The staging index now contains only short IDs rather than legacy arrays.
       database.exec("DROP TABLE IF EXISTS source_refs; CREATE INDEX IF NOT EXISTS staging_source_set ON staging(source_set)");
     }
     database.prepare("UPDATE metadata SET value=? WHERE key=?").run(state, STATE);
