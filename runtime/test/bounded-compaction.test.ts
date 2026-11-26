@@ -6,27 +6,34 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
-import { AgentDoc, CompactionEntry, createRegistry, defineExtension, Harness, UsageDoc } from "@earendil-works/pi-durable";
+import { AgentDoc, CompactionEntry, createRegistry, defineDocFamily, defineExtension, Harness, UsageDoc } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { ConversationModels } from "../src/models.js";
 import { fixtureModel } from "./model.js";
+import type { CompactionFailure } from "../src/compaction.js";
+import { SqlTrace } from "./fixtures/state-storage.js";
 
 const WINDOW = 8192;
-async function open(directory: string, window = WINDOW) {
+async function open(directory: string, window = WINDOW, trace = new SqlTrace()) {
   const models = createModels(), registry = createRegistry();
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture", contextWindow: window, maxTokens: 512 }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
   const inference = new ConversationModels(models, undefined, registry);
   const owned = defineExtension({ name: "owned_tools" }), excluded = defineExtension({ name: "excluded_tools" });
   registry.install(owned); registry.install(excluded);
-  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))), {
+  const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
+  const session = await Harness.open(await SqliteStorage.open(trace.database(database)), {
     models, registry, identity: { attribution: null }, settings: { compaction: { enabled: false, keepRecentTokens: 0 }, retry: { enabled: false } },
   }, BACKGROUND_CONTEXT);
   inference.bind(session);
   const root = await session.root(BACKGROUND_CONTEXT);
   await inference.configure(root, fixtureModel, { extensions: [owned] });
-  return { session, root, inference, faux };
+  return { session, root, inference, faux, database, trace };
 }
+const Failures = defineDocFamily<{ failure: CompactionFailure | null }, null>({
+  kind: "agent.compaction.failure", scope: "conversation", family: true, version: 1, history: "latest", fork: "initial",
+  initial: () => ({ failure: null }), checkpointWhen: () => true,
+});
 function text(context: TranscriptContext): string {
   return context.messages.map((message) => message.role === "system" || message.role === "user"
     ? typeof message.content === "string" ? message.content : message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n") : "").join("\n");
@@ -172,5 +179,74 @@ test("reopening interrupted native compaction reuses completed fragments and the
     const after = await app.session.snapshot(UsageDoc, app.root.id, BACKGROUND_CONTEXT);
     assert.ok((after?.models["openai/fixture"]?.totalTokens ?? 0) > (before?.models["openai/fixture"]?.totalTokens ?? 0));
     assert.equal((await app.root.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter(CompactionEntry.is).length, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const sensitive of [false, true]) test(`failed compaction retains a ${sensitive ? "redacted bounded" : "complete"} private error receipt and reuses paid fragments after reopen`, { timeout: 15_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-compaction-failure-")); let app = await open(directory);
+  const secrets = ["fixture bearer secret", "fixture password with spaces", "fixture-api-key", "fixture-refresh-token",
+    "fixture-client-secret", "fixture-basic-secret", "fixture-url-password", "ghp_" + "x".repeat(36), "sk-" + "x".repeat(64),
+    "fixture-cookie-first", "fixture-cookie-second", "fixture-set-cookie-first", "fixture-set-cookie-second"];
+  const actualError = "Unsupported parameter max_output_tokens; provider rejected the bounded checkpoint.";
+  const prefix = actualError + " " + JSON.stringify({ Authorization: "Bearer " + secrets[0], password: secrets[1], api_key: secrets[2],
+    refreshToken: secrets[3], client_secret: secrets[4], header: "Basic " + secrets[5],
+    url: `https://operator:${secrets[6]}@example.invalid/`, github: secrets[7] }) + "\n" +
+    `Cookie: sid=${secrets[9]}; cf_clearance=${secrets[10]}\nSet-Cookie: sid=${secrets[11]}; refresh=${secrets[12]}; Path=/\n`;
+  const error = sensitive ? prefix + "x".repeat(4089 - Buffer.byteLength(prefix)) + " " + secrets[8] + "🦊漢字".repeat(1000) : actualError;
+  const requests: string[] = []; let charged = 0;
+  const observeUsage = () => {
+    const complete = app.inference.models.completeSimple.bind(app.inference.models);
+    app.inference.models.completeSimple = async (model, context, options) => {
+      const message = await complete(model, context, options); charged += message.usage.totalTokens; return message;
+    };
+  };
+  try {
+    await seed(app); observeUsage(); app.trace.enabled = true;
+    const respond: Parameters<typeof app.faux.setResponses>[0][number] = context => {
+      requests.push(text(context));
+      return requests.length === 1 ? fauxAssistantMessage("Paid completed fragment EFFECT_ONCE.")
+        : fauxAssistantMessage("", { stopReason: "error", errorMessage: error });
+    };
+    app.faux.setResponses(Array.from({ length: 80 }, () => respond));
+    const task = await app.root.compact(undefined, BACKGROUND_CONTEXT);
+    const failed = await app.session.waitForTask(task, BACKGROUND_CONTEXT);
+    assert.equal(failed.state.outcome.status, "failed"); assert.equal(requests.length, 2);
+    const receipt = (await app.session.snapshot(Failures, app.root.id, task.toString(), BACKGROUND_CONTEXT))?.failure;
+    assert.ok(receipt, "The failed bounded fragment must retain its original error before Pi's fallback replaces it");
+    assert.equal(receipt.task_id, task.toString()); assert.match(receipt.fragment_key, /^[a-f0-9]{64}$/u);
+    assert.equal(receipt.provider, "openai"); assert.equal(receipt.model, "fixture"); assert.equal(receipt.stop_reason, "error");
+    const detail = receipt.error.detail; assert.ok(detail); assert.ok(detail.startsWith(actualError));
+    assert.equal(receipt.error.source_bytes, Buffer.byteLength(error));
+    assert.equal(receipt.error.retained_bytes, Buffer.byteLength(detail));
+    assert.ok(receipt.error.retained_bytes <= 4096); assert.equal(receipt.error.truncated, sensitive);
+    assert.equal(receipt.error.credentials_redacted, sensitive);
+    assert.equal(receipt.error.redacted_bytes > receipt.error.retained_bytes, sensitive);
+    assert.ok(!detail.includes("�"));
+    for (const [index, secret] of secrets.entries()) assert.ok(!detail.includes(secret), `Synthetic credential form ${index} must be redacted`);
+    assert.ok(!detail.includes("sk-"), "A credential crossing the truncation boundary cannot leave its prefix behind");
+    if (!sensitive) assert.equal(detail, actualError);
+    assert.ok(!JSON.stringify(receipt).includes("FIRST_MARKER"), "Failure metadata must not copy its source fragment");
+    const usage = (await app.session.snapshot(UsageDoc, app.root.id, BACKGROUND_CONTEXT))?.models["openai/fixture"];
+    assert.ok(usage); assert.equal(usage.totalTokens, charged); assert.ok(charged > 0);
+    const plans = await app.trace.report(app.database);
+    assert.ok(plans.every(sample => !sample.plan.some(detail => detail.startsWith("SCAN documents") || detail.startsWith("SCAN document_revisions"))));
+    t.diagnostic(JSON.stringify({ failure_bytes: receipt.error.retained_bytes,
+      plans: plans.filter(sample => sample.sql.trim().startsWith("SELECT") && sample.sql.includes("document")).map(sample => sample.plan) }));
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); observeUsage();
+    assert.deepEqual((await app.session.snapshot(Failures, app.root.id, task.toString(), BACKGROUND_CONTEXT))?.failure, receipt);
+    assert.deepEqual((await app.session.snapshot(UsageDoc, app.root.id, BACKGROUND_CONTEXT))?.models["openai/fixture"], usage);
+    const repeated: string[] = [];
+    const finish: Parameters<typeof app.faux.setResponses>[0][number] = context => {
+      repeated.push(text(context)); return fauxAssistantMessage("Merged retained checkpoint EFFECT_ONCE.");
+    };
+    app.faux.setResponses(Array.from({ length: 80 }, () => finish));
+    const retry = await app.root.compact(undefined, BACKGROUND_CONTEXT);
+    assert.equal((await app.session.waitForTask(retry, BACKGROUND_CONTEXT)).state.outcome.status, "completed");
+    assert.ok(requests[0]); assert.ok(requests[1]);
+    assert.equal(repeated.includes(requests[0]), false, "A committed paid fragment must not be requested again");
+    assert.equal(repeated.includes(requests[1]), true, "Retry must resume the failed uncached fragment");
+    assert.equal((await app.session.snapshot(UsageDoc, app.root.id, BACKGROUND_CONTEXT))?.models["openai/fixture"]?.totalTokens, charged);
+    assert.equal(await app.session.snapshot(Failures, app.root.id, retry.toString(), BACKGROUND_CONTEXT), undefined);
+    assert.deepEqual((await app.session.snapshot(Failures, app.root.id, task.toString(), BACKGROUND_CONTEXT))?.failure, receipt);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

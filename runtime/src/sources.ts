@@ -70,8 +70,8 @@ function sameEvent(left: SourceEvent, right: SourceEvent): boolean {
     left.source.thread_id === right.source.thread_id && left.title === right.title && left.text === right.text;
 }
 
-/** Outcome references are retained in full in the journal. Reviewers need the
- * published result and provenance, not every source ever linked to its actor. */
+/** Outcome references remain complete in the journal. Model-facing reads need
+ * the published result and provenance, not the actor's entire source history. */
 export function sourceReviewRecord(record: StoredEvent): StoredEvent {
   const outcome = record.outcome;
   if (outcome === undefined) return record;
@@ -836,13 +836,13 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
     // One original fits the existing 2 MiB serialized source-page budget.
     // Leave bounded room for its retained decision and the reader's envelope.
     outputLimits: { maxBytes: 4 * 1024 * 1024 },
-    description: "Read one bounded page of retained evidence and task links. Review views bound task-outcome references with source_count/sources_complete; exact originals remain retained. Follow cursor while complete is false, including empty filtered pages. Completion describes this retained scan, not upstream provider coverage. Filter by account/thread or exact keys before acting.",
+    description: "Read one bounded page of retained evidence and task links. Task outcomes bound references, summary and state with completeness metadata; ordinary source content is unchanged. For exact original turns, use read_task with conversation_id, entry_ids, include_history:true and offset. Follow cursor while complete is false, including empty filtered pages. Completion describes this retained scan, not upstream provider coverage. Filter by account/thread or exact keys before acting.",
     parameters: Type.Object({ keys: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })), provider: Type.Optional(Type.String()),
       account: Type.Optional(Type.String()), thread_id: Type.Optional(Type.String()), query: Type.Optional(Type.String()),
       pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), cursor: Type.Optional(Type.String()) }),
-    async execute(args, api) {
-      const page = await journal.eventPage(args), role = executions.role(api.conversationId.toString());
-      return output(role === "triage" || role === "review" ? { ...page, events: page.events.map(sourceReviewRecord) } : page);
+    async execute(args) {
+      const page = await journal.eventPage(args);
+      return output({ ...page, events: page.events.map(sourceReviewRecord) });
     } });
   const notifyUser = defineTool({ name: "notify_user", replay: "safe",
     description: "Publish a brief useful update or necessary user question to the main chat while work continues. Stay quiet for routine progress or receipts; do not request approval again for already authorized work.",

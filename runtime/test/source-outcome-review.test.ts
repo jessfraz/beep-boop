@@ -189,6 +189,54 @@ test("large task outcomes and all review status fallbacks retain bounded views a
   } finally { controller.abort(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("worker and main source pages bound large outcomes without losing cursors, mail or originals", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-outcome-page-")), app = await openScheduled(directory);
+  try {
+    const mail = { id: "delivery-update", version: "original", source: { provider: "google", account: "mail-example", thread_id: "delivery" },
+      title: "Delivery update", text: "Complete original delivery details. ".repeat(500) };
+    await app.sources.admit({ source: { provider: "google", account: "mail-example" }, events: [mail],
+      checkpoint: { value: "retained-mail" }, coverage: { status: "complete" } }, null);
+    const retainedMail = (await app.sources.events({ provider: "google" }))[0]; assert.ok(retainedMail);
+    const refs = Array.from({ length: 592 }, (_, index) => ({ provider: "google", account: "mail-example", thread_id: `${index}-` + "x".repeat(4000) }));
+    const owner = await app.tasks.create({ title: "Published progress", outcome: "Retain the complete source snapshot", sources: refs, model: fixtureModel });
+    const original = await publish(app, owner, "Verified result with exact provenance.", "outcome-page-proof");
+    assert.ok(Buffer.byteLength(original.event.text) > 2_000_000);
+    const keys = [original.key, retainedMail.key];
+    for (const role of ["worker", "main"]) {
+      const conversation = role === "main" ? await app.session.root(BACKGROUND_CONTEXT)
+        : await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+      await app.tasks.inference.configure(conversation, fixtureModel, { extensions: [role === "main" ? app.sourceTools.main : app.sourceTools.worker] });
+      await conversation.configure({ compaction: { enabled: false } }, BACKGROUND_CONTEXT);
+      const unbind = app.executions.bind(conversation.id.toString(), { ...(role === "worker" ? { role: "worker" } : {}),
+        cwd: "/workspace/example", hosts: [], model: fixtureModel, async call() { throw new Error("A source read cannot execute host effects"); } });
+      const read = async (cursor?: string) => {
+        let body = "";
+        app.faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("read_source_events", { keys, limit: 1, ...(cursor === undefined ? {} : { cursor }) }), { stopReason: "toolUse" }),
+          input => { body = toolText(input, "read_source_events"); return fauxAssistantMessage(""); },
+        ]);
+        const result = await (await conversation.submit({ type: "input", content: "Read one exact source page." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+        assert.equal(result.status, "done", JSON.stringify(result));
+        assert.ok(Buffer.byteLength(body) < 40_000, `${role} source pages must bound outcome references before serialization`);
+        return parsed(body);
+      };
+      try {
+        const first = await read(); assert.equal(first.complete, false);
+        assert.ok(Array.isArray(first.events)); const item = first.events[0];
+        assert.ok(object(item) && object(item.outcome)); assert.equal(item.key, original.key);
+        assert.equal(item.outcome.source_count, refs.length); assert.equal(item.outcome.sources_complete, false);
+        assert.equal(item.outcome.entry_id, original.outcome?.entry_id); assert.equal(item.outcome.tool_call_id, original.outcome?.tool_call_id);
+        assert.equal(item.outcome.original_bytes, Buffer.byteLength(original.event.text));
+        assert.ok(typeof first.cursor === "string");
+        const second = await read(first.cursor); assert.equal(second.complete, true); assert.equal(second.cursor, null);
+        assert.ok(Array.isArray(second.events)); assert.deepEqual(second.events[0], retainedMail);
+      } finally { unbind(); }
+    }
+    assert.deepEqual((await app.sources.originals(keys)).find(record => record.key === original.key), original);
+    assert.deepEqual((await app.tasks.get(owner.id)).sources, refs);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a completed child result can continue its busy parent without being mistaken for root self-feedback", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-child-outcome-review-")), app = await openScheduled(directory);
   const held = gate(), started = gate(), controller = new AbortController(); let running: Promise<void> | undefined;
