@@ -101,6 +101,7 @@ export function reviewSourceReferences(sources: readonly SourceRef[]) {
 
 export function reviewTaskState(state: TaskOutcomeState): { state: TaskOutcomeState; state_complete: boolean };
 export function reviewTaskState(state: TaskRecord["state"]): { state: TaskRecord["state"]; state_complete: boolean };
+export function reviewTaskState(state: TaskRecord["state"] | TaskOutcomeState): { state: TaskRecord["state"] | TaskOutcomeState; state_complete: boolean };
 export function reviewTaskState(state: TaskRecord["state"] | TaskOutcomeState): { state: TaskRecord["state"] | TaskOutcomeState; state_complete: boolean } {
   if (state.state === "waiting") return { state: { ...state, actor: state.actor.slice(0, 4000),
     next_check: state.next_check?.slice(0, 4000) ?? null }, state_complete: state.actor.length <= 4000 && (state.next_check?.length ?? 0) <= 4000 };
@@ -117,6 +118,12 @@ export function reviewTaskStatus(task: TaskRecord) {
     worker: { state: task.worker.state }, ...reviewSourceReferences(task.sources),
     pending: task.pending.slice(0, 32).map(input => ({ id: input.id })),
     pending_count: task.pending.length, pending_complete: task.pending.length <= 32, agent_count: task.agents.length };
+}
+function conversationTaskStatus(task: TaskRecord | TaskAgentRecord) {
+  const state = task.state;
+  return { id: task.id, conversation_id: task.conversation_id, title: task.title.slice(0, 4000), title_complete: task.title.length <= 4000,
+    summary: task.summary.slice(-4000), summary_complete: task.summary.length <= 4000,
+    ...(state.state === "done" ? { state, state_complete: true } : reviewTaskState(state)), updated_at: task.updated_at };
 }
 function agentOutput(name: string, args: ToolCall["arguments"], sender: string, value: TaskRecord | TaskAgentRecord[], targetAgentId?: string): ToolExecutionResult {
   const details: MessageContent = { role: "tool", text: "", presentation: agentPresentation({ name, arguments: args }, sender, value, targetAgentId) };
@@ -366,8 +373,11 @@ export function createAppTools(tasks: TaskStore, executions: Executions, jobs?: 
         const includeHistory = args.include_history !== false;
         if (args.conversation_id !== undefined) {
           if (args.agent_id !== undefined) throw new TaskError("A conversation already identifies its exact history");
+          const owner = await tasks.findOwner(args.conversation_id);
           const imported = await tasks.saved(args.conversation_id);
           return output({ conversation_id: args.conversation_id, imported: imported === undefined ? null : importedSummary(imported),
+            task: owner === undefined ? undefined : conversationTaskStatus(owner.task),
+            agent: owner?.agent === undefined ? undefined : conversationTaskStatus(owner.agent),
             history: includeHistory && args.entry_ids === undefined ? await tasks.readConversation(args.conversation_id) : undefined,
             originals: includeHistory && args.entry_ids !== undefined ? await tasks.originals(args.conversation_id, args.entry_ids, args.offset) : undefined });
         }
